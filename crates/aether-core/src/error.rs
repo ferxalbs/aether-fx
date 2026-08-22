@@ -16,6 +16,12 @@ pub enum CoreError {
     /// The caller needs to authorize an operation before it can proceed.
     #[error("permission required for {operation}: {class}")]
     PermissionRequired { operation: String, class: String },
+    /// A caller supplied a permit that does not authorize the requested operation.
+    #[error("permission denied for {operation}: {reason}")]
+    PermissionDenied { operation: String, reason: String },
+    /// A bounded runtime resource reached its configured capacity.
+    #[error("{resource} limit reached ({limit})")]
+    ResourceLimit { resource: String, limit: usize },
     /// The operation was cancelled by the user.
     #[error("operation cancelled")]
     Cancelled,

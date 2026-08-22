@@ -54,6 +54,7 @@ version = "0.1.0"
 dependencies = [
  "aether-core",
  "rustix",
+ "serde_json",
  "unicode-segmentation",
  "unicode-width",
  "windows-sys 0.61.2",
@@ -77,6 +78,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

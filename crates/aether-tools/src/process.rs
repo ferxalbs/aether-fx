@@ -1,17 +1,17 @@
-use std::{process::Stdio, time::Duration};
+use std::{process::Stdio, sync::Arc, time::Duration};
 
-use aether_core::{PermissionClass, ToolCallId};
+use aether_core::{CancellationFlag, CoreError, PermissionClass, ToolCallId, ToolExecutionContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    time::timeout,
+    time::sleep,
 };
 
-use crate::{
-    common::{MAX_PROCESS_READ_BYTES, ProcessEntry, ToolInternalError, Workspace, bounded_limit},
-    shell::read_bounded,
+use crate::common::{
+    MAX_PROCESS_READ_BYTES, PROCESS_STREAM_BUFFER_BYTES, ProcessHandle, ToolInternalError,
+    Workspace, bounded_limit, resolve_existing_blocking,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -56,32 +56,33 @@ pub struct ProcessOutput {
     pub eof: Option<bool>,
     pub truncated: Option<bool>,
     pub timed_out: Option<bool>,
+    pub buffered_bytes: Option<usize>,
+    pub dropped_bytes: Option<u64>,
 }
 
 pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: ProcessInput = match workspace.parse(&input) {
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
-    if let Err(error) = workspace.authorize(
-        PermissionClass::ProcessPersistent,
-        "control persistent process",
-        None,
-        input,
-    ) {
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "process", PermissionClass::ProcessPersistent)
+    {
         return workspace.result_error(call_id, error);
     }
+    let cancellation = context.cancellation().clone();
     match parsed.operation {
-        ProcessOperation::Start => start(workspace, call_id, parsed).await,
-        ProcessOperation::Read => read(workspace, call_id, parsed).await,
-        ProcessOperation::Write => write(workspace, call_id, parsed).await,
-        ProcessOperation::Signal => signal(workspace, call_id, parsed).await,
-        ProcessOperation::Kill => kill(workspace, call_id, parsed).await,
-        ProcessOperation::Status => status(workspace, call_id, parsed).await,
+        ProcessOperation::Start => start(workspace, call_id, parsed, cancellation).await,
+        ProcessOperation::Read => read(workspace, call_id, parsed, cancellation).await,
+        ProcessOperation::Write => write(workspace, call_id, parsed, cancellation).await,
+        ProcessOperation::Signal => signal(workspace, call_id, parsed, cancellation).await,
+        ProcessOperation::Kill => kill(workspace, call_id, parsed, cancellation).await,
+        ProcessOperation::Status => status(workspace, call_id, parsed, cancellation).await,
     }
 }
 
@@ -89,7 +90,11 @@ async fn start(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: ProcessInput,
+    cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
+    }
     let program = match input.program {
         Some(value) if !value.is_empty() => value,
         _ => {
@@ -107,7 +112,7 @@ async fn start(
         );
     }
     let (cwd_display, cwd) = match input.cwd.as_deref() {
-        Some(path) => match workspace.resolve_existing(path) {
+        Some(path) => match resolve_existing_blocking(workspace, path.to_owned()).await {
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error),
         },
@@ -118,6 +123,9 @@ async fn start(
             call_id,
             ToolInternalError::Input("process cwd is not a directory".to_owned()),
         );
+    }
+    if cancellation.is_cancelled() {
+        return workspace.result_error(call_id, ToolInternalError::Core(CoreError::Cancelled));
     }
     let mut command = Command::new(&program);
     command
@@ -131,17 +139,41 @@ async fn start(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error.into()),
     };
-    let entry = ProcessEntry {
-        stdin: child.stdin.take(),
-        stdout: child.stdout.take(),
-        stderr: child.stderr.take(),
-        child,
-        program,
-        args,
-        cwd,
+    let Some(stdout) = child.stdout.take() else {
+        return workspace.result_error(
+            call_id,
+            ToolInternalError::Input("process stdout is unavailable".to_owned()),
+        );
     };
+    let Some(stderr) = child.stderr.take() else {
+        return workspace.result_error(
+            call_id,
+            ToolInternalError::Input("process stderr is unavailable".to_owned()),
+        );
+    };
+    let stdout_buffer = Arc::new(crate::common::OutputBuffer::new(PROCESS_STREAM_BUFFER_BYTES));
+    let stderr_buffer = Arc::new(crate::common::OutputBuffer::new(PROCESS_STREAM_BUFFER_BYTES));
+    tokio::spawn(drain_stream(stdout, stdout_buffer.clone()));
+    tokio::spawn(drain_stream(stderr, stderr_buffer.clone()));
+    let stdin = child.stdin.take();
+    let handle = Arc::new(ProcessHandle {
+        child: tokio::sync::Mutex::new(child),
+        stdin: tokio::sync::Mutex::new(stdin),
+        stdout: stdout_buffer,
+        stderr: stderr_buffer,
+        program: program.clone(),
+        args: args.clone(),
+        cwd: cwd.clone(),
+    });
+    if cancellation.is_cancelled() {
+        handle.terminate().await;
+        return workspace.result_error(call_id, ToolInternalError::Core(CoreError::Cancelled));
+    }
     let process_id = workspace.allocate_process_id();
-    workspace.processes().lock().await.insert(process_id, entry);
+    if let Err(error) = workspace.processes().insert(process_id, handle.clone()) {
+        handle.terminate().await;
+        return workspace.result_error(call_id, error);
+    }
     aether_core::ToolResult::success_json(
         call_id,
         serde_json::json!(ProcessOutput {
@@ -153,15 +185,32 @@ async fn start(
             eof: None,
             truncated: None,
             timed_out: None,
+            buffered_bytes: Some(0),
+            dropped_bytes: Some(0),
         }),
         workspace.max_output_bytes(),
     )
+}
+
+async fn drain_stream<R>(mut reader: R, buffer: Arc<crate::common::OutputBuffer>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = [0_u8; 8192];
+    loop {
+        match reader.read(&mut bytes).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => buffer.push(&bytes[..count]),
+        }
+    }
+    buffer.mark_eof();
 }
 
 async fn read(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: ProcessInput,
+    cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
     let process_id = match input.process_id {
         Some(value) => value,
@@ -173,29 +222,77 @@ async fn read(
         }
     };
     let stream = input.stream.unwrap_or(ProcessStream::Stdout);
-    let max_bytes = bounded_limit(input.max_bytes, MAX_PROCESS_READ_BYTES);
+    // Leave room for JSON metadata and escaping so buffered_bytes/dropped_bytes remain visible
+    // even when the stream contains control characters.
+    let max_read_output = (workspace.max_output_bytes() / 8).max(1);
+    let max_bytes = bounded_limit(input.max_bytes, MAX_PROCESS_READ_BYTES.min(max_read_output));
     let timeout_duration =
         Duration::from_millis(input.timeout_ms.unwrap_or(1000).clamp(1, 600_000));
-    let mut processes = workspace.processes().lock().await;
-    let entry = match processes.get_mut(&process_id) {
-        Some(value) => value,
-        None => {
-            return workspace
-                .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
-        }
+    let Some(handle) = workspace.processes().get(process_id) else {
+        return workspace
+            .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
     };
-    let read_result = match stream {
-        ProcessStream::Stdout => {
-            read_once(entry.stdout.as_mut(), max_bytes, timeout_duration).await
-        }
-        ProcessStream::Stderr => {
-            read_once(entry.stderr.as_mut(), max_bytes, timeout_duration).await
-        }
+    let buffer = match stream {
+        ProcessStream::Stdout => handle.stdout.clone(),
+        ProcessStream::Stderr => handle.stderr.clone(),
     };
-    let value = match read_result {
-        Ok(value) => value,
-        Err(error) => return workspace.result_error(call_id, error),
-    };
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
+        let value = buffer.take(max_bytes);
+        if !value.bytes.is_empty() || value.eof {
+            return process_read_result(workspace, call_id, process_id, value, false);
+        }
+        let remaining = timeout_duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return process_read_result(
+                workspace,
+                call_id,
+                process_id,
+                crate::common::BufferedRead {
+                    bytes: Vec::new(),
+                    eof: false,
+                    dropped_bytes: value.dropped_bytes,
+                    buffered_bytes: value.buffered_bytes,
+                },
+                true,
+            );
+        }
+        let notified = buffer.notifier().notified();
+        if buffer.is_ready() {
+            continue;
+        }
+        tokio::select! {
+            _ = sleep(remaining.min(Duration::from_millis(10))) => {
+                if started.elapsed() >= timeout_duration {
+                return process_read_result(
+                    workspace,
+                    call_id,
+                    process_id,
+                    crate::common::BufferedRead {
+                        bytes: Vec::new(),
+                        eof: false,
+                        dropped_bytes: value.dropped_bytes,
+                        buffered_bytes: value.buffered_bytes,
+                    },
+                    true,
+                );
+                }
+            }
+            _ = notified => {}
+        }
+    }
+}
+
+fn process_read_result(
+    workspace: &Workspace,
+    call_id: ToolCallId,
+    process_id: u64,
+    value: crate::common::BufferedRead,
+    timed_out: bool,
+) -> aether_core::ToolResult {
     aether_core::ToolResult::success_json(
         call_id,
         serde_json::json!(ProcessOutput {
@@ -203,39 +300,22 @@ async fn read(
             operation: "read".to_owned(),
             running: None,
             exit_code: None,
-            data: Some(String::from_utf8_lossy(&value.0).into_owned()),
-            eof: Some(value.0.is_empty() && !value.2),
-            truncated: Some(value.1),
-            timed_out: Some(value.2),
+            data: Some(String::from_utf8_lossy(&value.bytes).into_owned()),
+            eof: Some(value.eof),
+            truncated: Some(false),
+            timed_out: Some(timed_out),
+            buffered_bytes: Some(value.buffered_bytes),
+            dropped_bytes: Some(value.dropped_bytes),
         }),
         workspace.max_output_bytes(),
     )
-}
-
-async fn read_once<R: AsyncRead + Unpin>(
-    reader: Option<&mut R>,
-    limit: usize,
-    timeout_duration: Duration,
-) -> Result<(Vec<u8>, bool, bool), ToolInternalError> {
-    let Some(reader) = reader else {
-        return Ok((Vec::new(), false, false));
-    };
-    let mut buffer = vec![0_u8; limit];
-    match timeout(timeout_duration, reader.read(&mut buffer)).await {
-        Ok(Ok(0)) => Ok((Vec::new(), false, false)),
-        Ok(Ok(count)) => {
-            buffer.truncate(count);
-            Ok((buffer, count == limit, false))
-        }
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Ok((Vec::new(), false, true)),
-    }
 }
 
 async fn write(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: ProcessInput,
+    cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
     let process_id = match input.process_id {
         Some(value) => value,
@@ -253,22 +333,30 @@ async fn write(
             ToolInternalError::Input("process write exceeds the bounded input limit".to_owned()),
         );
     }
-    let mut processes = workspace.processes().lock().await;
-    let entry = match processes.get_mut(&process_id) {
-        Some(value) => value,
-        None => {
-            return workspace
-                .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
-        }
+    let Some(handle) = workspace.processes().get(process_id) else {
+        return workspace
+            .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
     };
-    let Some(stdin) = entry.stdin.as_mut() else {
+    let mut stdin = handle.stdin.lock().await;
+    let Some(stdin) = stdin.as_mut() else {
         return workspace.result_error(
             call_id,
             ToolInternalError::Input("process stdin is unavailable".to_owned()),
         );
     };
-    if let Err(error) = stdin.write_all(data.as_bytes()).await {
-        return workspace.result_error(call_id, error.into());
+    let mut write_future = Box::pin(stdin.write_all(data.as_bytes()));
+    let write_result = loop {
+        if cancellation.is_cancelled() {
+            drop(write_future);
+            break Err(ToolInternalError::Core(CoreError::Cancelled));
+        }
+        tokio::select! {
+            result = &mut write_future => break result.map_err(ToolInternalError::Io),
+            _ = sleep(Duration::from_millis(10)) => {}
+        }
+    };
+    if let Err(error) = write_result {
+        return workspace.result_error(call_id, error);
     }
     aether_core::ToolResult::success_json(
         call_id,
@@ -281,6 +369,8 @@ async fn write(
             eof: None,
             truncated: Some(false),
             timed_out: Some(false),
+            buffered_bytes: None,
+            dropped_bytes: None,
         }),
         workspace.max_output_bytes(),
     )
@@ -290,22 +380,24 @@ async fn signal(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: ProcessInput,
+    cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
     if input.signal.as_deref() != Some("kill") {
         return workspace.result_error(
             call_id,
-            ToolInternalError::Core(aether_core::CoreError::Unsupported {
+            ToolInternalError::Core(CoreError::Unsupported {
                 operation: "only kill signal is supported in v0.1".to_owned(),
             }),
         );
     }
-    kill(workspace, call_id, input).await
+    kill(workspace, call_id, input, cancellation).await
 }
 
 async fn kill(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: ProcessInput,
+    cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
     let process_id = match input.process_id {
         Some(value) => value,
@@ -316,17 +408,14 @@ async fn kill(
             );
         }
     };
-    let mut entry = match workspace.processes().lock().await.remove(&process_id) {
-        Some(value) => value,
-        None => {
-            return workspace
-                .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
-        }
-    };
-    if let Err(error) = entry.child.kill().await {
-        return workspace.result_error(call_id, error.into());
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
     }
-    let _ = entry.child.wait().await;
+    let Some(handle) = workspace.processes().remove(process_id) else {
+        return workspace
+            .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
+    };
+    handle.terminate().await;
     aether_core::ToolResult::success_json(
         call_id,
         serde_json::json!(ProcessOutput {
@@ -338,6 +427,8 @@ async fn kill(
             eof: None,
             truncated: None,
             timed_out: None,
+            buffered_bytes: None,
+            dropped_bytes: None,
         }),
         workspace.max_output_bytes(),
     )
@@ -347,6 +438,7 @@ async fn status(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: ProcessInput,
+    cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
     let process_id = match input.process_id {
         Some(value) => value,
@@ -357,23 +449,24 @@ async fn status(
             );
         }
     };
-    let mut processes = workspace.processes().lock().await;
-    let entry = match processes.get_mut(&process_id) {
-        Some(value) => value,
-        None => {
-            return workspace
-                .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
-        }
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
+    }
+    let Some(handle) = workspace.processes().get(process_id) else {
+        return workspace
+            .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));
     };
-    let status = match entry.child.try_wait() {
+    let mut child = handle.child.lock().await;
+    let status = match child.try_wait() {
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error.into()),
     };
-    let command = if entry.args.is_empty() {
-        entry.program.clone()
+    let command = if handle.args.is_empty() {
+        handle.program.clone()
     } else {
-        format!("{} {}", entry.program, entry.args.join(" "))
+        format!("{} {}", handle.program, handle.args.join(" "))
     };
+    let buffered = handle.stdout.take(0);
     aether_core::ToolResult::success_json(
         call_id,
         serde_json::json!(ProcessOutput {
@@ -381,19 +474,13 @@ async fn status(
             operation: "status".to_owned(),
             running: Some(status.is_none()),
             exit_code: status.and_then(|value| value.code()),
-            data: Some(format!("command={command}; cwd={}", entry.cwd.display())),
+            data: Some(format!("command={command}; cwd={}", handle.cwd.display())),
             eof: None,
             truncated: None,
             timed_out: None,
+            buffered_bytes: Some(buffered.buffered_bytes),
+            dropped_bytes: Some(buffered.dropped_bytes),
         }),
         workspace.max_output_bytes(),
     )
-}
-
-#[allow(dead_code)]
-async fn _bounded_reader<R: AsyncRead + Unpin>(
-    reader: R,
-    limit: usize,
-) -> std::io::Result<crate::shell::BoundedBytes> {
-    read_bounded(reader, limit).await
 }

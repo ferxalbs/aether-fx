@@ -1,6 +1,6 @@
 use std::io;
 
-use aether_core::ToolCallId;
+use aether_core::{CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext};
 use globset::{Glob, GlobSetBuilder};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{
@@ -11,7 +11,9 @@ use regex_automata::meta::Regex as AutomataRegex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::{MAX_WALK_ENTRIES, Workspace};
+use crate::common::{
+    MAX_INPUT_BYTES, MAX_WALK_ENTRIES, ToolInternalError, Workspace, spawn_blocking_tool,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SearchInput {
@@ -45,12 +47,16 @@ struct SearchSink {
     path: String,
     matches: Vec<SearchMatch>,
     max_results: usize,
+    cancellation: CancellationFlag,
 }
 
 impl SearchSink {
-    fn push(&mut self, line: Option<u64>, kind: &str, bytes: &[u8]) -> bool {
+    fn push(&mut self, line: Option<u64>, kind: &str, bytes: &[u8]) -> io::Result<bool> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "search cancelled"));
+        }
         if self.matches.len() >= self.max_results {
-            return false;
+            return Ok(false);
         }
         let text = String::from_utf8_lossy(bytes).trim_end_matches(['\r', '\n']).to_owned();
         self.matches.push(SearchMatch {
@@ -59,7 +65,7 @@ impl SearchSink {
             kind: kind.to_owned(),
             text,
         });
-        true
+        Ok(true)
     }
 }
 
@@ -71,7 +77,7 @@ impl Sink for SearchSink {
         _: &grep_searcher::Searcher,
         mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
-        Ok(self.push(mat.line_number(), "match", mat.bytes()))
+        self.push(mat.line_number(), "match", mat.bytes())
     }
 
     fn context(
@@ -84,7 +90,7 @@ impl Sink for SearchSink {
             SinkContextKind::After => "after",
             SinkContextKind::Other => "context",
         };
-        Ok(self.push(context.line_number(), kind, context.bytes()))
+        self.push(context.line_number(), kind, context.bytes())
     }
 }
 
@@ -92,6 +98,7 @@ pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: SearchInput = match workspace.parse(&input) {
         Ok(value) => value,
@@ -100,17 +107,35 @@ pub(crate) async fn execute(
     if parsed.patterns.is_empty() || parsed.patterns.len() > 32 {
         return workspace.result_error(
             call_id,
-            crate::common::ToolInternalError::Input("search requires 1..=32 patterns".to_owned()),
+            ToolInternalError::Input("search requires 1..=32 patterns".to_owned()),
         );
+    }
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "search", PermissionClass::ReadOnly)
+    {
+        return workspace.result_error(call_id, error);
+    }
+    spawn_blocking_tool(workspace, call_id, &context, move |workspace, call_id, cancellation| {
+        execute_blocking(workspace, call_id, parsed, cancellation)
+    })
+    .await
+}
+
+fn execute_blocking(
+    workspace: Workspace,
+    call_id: ToolCallId,
+    parsed: SearchInput,
+    cancellation: CancellationFlag,
+) -> aether_core::ToolResult {
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
     }
     let regex = parsed.regex.unwrap_or(false);
     if regex {
         for pattern in &parsed.patterns {
             if let Err(error) = AutomataRegex::new(pattern) {
-                return workspace.result_error(
-                    call_id,
-                    crate::common::ToolInternalError::Pattern(error.to_string()),
-                );
+                return workspace
+                    .result_error(call_id, ToolInternalError::Pattern(error.to_string()));
             }
         }
     }
@@ -126,10 +151,7 @@ pub(crate) async fn execute(
     let matcher = match matcher {
         Ok(value) => value,
         Err(error) => {
-            return workspace.result_error(
-                call_id,
-                crate::common::ToolInternalError::Pattern(error.to_string()),
-            );
+            return workspace.result_error(call_id, ToolInternalError::Pattern(error.to_string()));
         }
     };
     let glob_set = match parsed.globs.as_ref() {
@@ -137,9 +159,7 @@ pub(crate) async fn execute(
             if globs.len() > 32 {
                 return workspace.result_error(
                     call_id,
-                    crate::common::ToolInternalError::Input(
-                        "search accepts at most 32 globs".to_owned(),
-                    ),
+                    ToolInternalError::Input("search accepts at most 32 globs".to_owned()),
                 );
             }
             let mut builder = GlobSetBuilder::new();
@@ -147,20 +167,16 @@ pub(crate) async fn execute(
                 match Glob::new(glob) {
                     Ok(value) => builder.add(value),
                     Err(error) => {
-                        return workspace.result_error(
-                            call_id,
-                            crate::common::ToolInternalError::Pattern(error.to_string()),
-                        );
+                        return workspace
+                            .result_error(call_id, ToolInternalError::Pattern(error.to_string()));
                     }
                 };
             }
             match builder.build() {
                 Ok(value) => Some(value),
                 Err(error) => {
-                    return workspace.result_error(
-                        call_id,
-                        crate::common::ToolInternalError::Pattern(error.to_string()),
-                    );
+                    return workspace
+                        .result_error(call_id, ToolInternalError::Pattern(error.to_string()));
                 }
             }
         }
@@ -187,13 +203,14 @@ pub(crate) async fn execute(
     let mut matches = Vec::new();
     let mut truncated = false;
     for result in walker.build() {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
         let entry = match result {
             Ok(value) => value,
             Err(error) => {
-                return workspace.result_error(
-                    call_id,
-                    crate::common::ToolInternalError::Input(error.to_string()),
-                );
+                return workspace
+                    .result_error(call_id, ToolInternalError::Input(error.to_string()));
             }
         };
         let path = entry.path();
@@ -217,15 +234,22 @@ pub(crate) async fn execute(
             .before_context(parsed.before_context.unwrap_or(0).min(20))
             .after_context(parsed.after_context.unwrap_or(0).min(20))
             .max_matches(Some(max_results.saturating_sub(matches.len()) as u64))
-            .heap_limit(Some(crate::common::MAX_INPUT_BYTES))
+            .heap_limit(Some(MAX_INPUT_BYTES))
             .binary_detection(BinaryDetection::quit(0));
         let mut sink = SearchSink {
             path: path_text,
             matches: Vec::new(),
             max_results: max_results.saturating_sub(matches.len()),
+            cancellation: cancellation.clone(),
         };
         let search_result = searcher.build().search_path(matcher.clone(), path, &mut sink);
         if let Err(error) = search_result {
+            if cancellation.is_cancelled() || error.kind() == io::ErrorKind::Interrupted {
+                return workspace.result_error(
+                    call_id,
+                    ToolInternalError::Core(aether_core::CoreError::Cancelled),
+                );
+            }
             return workspace.result_error(call_id, error.into());
         }
         matches.extend(sink.matches);
@@ -248,5 +272,21 @@ mod tests {
     #[test]
     fn literal_and_regex_modes_are_distinct() {
         assert!(AutomataRegex::new("a+b").is_ok());
+    }
+
+    #[test]
+    fn search_sink_observes_cancellation_during_matching() {
+        let cancellation = CancellationFlag::new();
+        let mut sink = SearchSink {
+            path: "file.txt".to_owned(),
+            matches: Vec::new(),
+            max_results: 8,
+            cancellation: cancellation.clone(),
+        };
+        cancellation.cancel();
+        assert_eq!(
+            sink.push(Some(1), "match", b"needle\n").unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 }

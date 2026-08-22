@@ -12,7 +12,7 @@ Verified on 2026-08-21 using Rust/Cargo `1.98.0`, `cargo info`, crates.io metada
 | thiserror | 2.0.20 | MIT OR Apache-2.0 | Typed library errors | No |
 | lexopt | 0.3.2 | MIT | Small OsString-aware CLI parser | Startup |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | Safe Unix terminal control | Terminal hot path |
-| windows-sys | 0.61.2 | MIT OR Apache-2.0 | Narrow Windows console FFI boundary | Terminal hot path |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 | Narrow Windows console and `ReplaceFileW` FFI boundaries | Terminal/filesystem hot path |
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 | Terminal cell width | Renderer hot path |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | Grapheme-safe input/rendering boundaries | Renderer/input |
 | ignore | 0.4.33 | Unlicense OR MIT | `.gitignore`-aware walking | Tool hot path |
@@ -26,6 +26,8 @@ Verified on 2026-08-21 using Rust/Cargo `1.98.0`, `cargo info`, crates.io metada
 | criterion | 0.8.2 | Apache-2.0 OR MIT | Reproducible local benchmarks | Benchmark only |
 
 The verified Rainy SDK is `rainy-sdk 0.6.14`. No `6.5.x` release was available, so AETHER does not fabricate that version or its APIs. The adapter is isolated so a later verified SDK generation can replace it.
+
+Phase 1 adds no new crate. The existing `windows-sys 0.61.2` dependency now enables `Win32_Storage_FileSystem` for native Windows replacement. No Git dependency or unpublished Rainy SDK version is used.
 
 ## Tooling baseline
 

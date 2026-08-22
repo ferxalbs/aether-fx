@@ -6,6 +6,8 @@ The SDK version that was requested as a future `6.5.x` release was not present i
 
 Model catalogs are lazy and cached by the adapter layer when the caller asks for them. Startup and the initial terminal prompt do not construct a Rainy client or perform a network request. `RAINY_API_KEY` is required only for an explicit inference/catalog operation.
 
+Normal inference uses deterministic model precedence in the binary: `--model`, then `AETHER_MODEL`, then a clear configuration error. The adapter does not use the first catalog item as an implicit model and does not fetch the catalog merely to validate a selected model. The `models` subcommand remains the explicit catalog-discovery path.
+
 Rainy's transport/retry behavior remains Rainy's/SDK's responsibility. AETHER emits semantic step IDs and does not blindly retry ambiguous tool/model operations. The verified 0.6.14 ResponsesRequest surface has no documented idempotency field, so AETHER does not invent one; the IDs remain the local semantic identity until an SDK contract exposes transport integration. Reasoning and continuation fields are opaque values; raw chain-of-thought is never rendered or exposed as a tool result.
 
 The catalog cache uses a bounded five-minute TTL. Bootstrap refreshes stale entries synchronously on an explicit catalog/model operation; stale-while-refresh background refresh is intentionally not enabled until its task lifetime and cancellation semantics are proven.

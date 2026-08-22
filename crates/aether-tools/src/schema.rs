@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use aether_core::tools::ToolFuture;
 use aether_core::{
-    PermissionClass, PermissionEngine, ToolDefinition, ToolExecutor, ToolInvocation, ToolResult,
+    BoundedText, PermissionClass, PermissionEngine, PermissionRequest, ToolDefinition,
+    ToolExecutionContext, ToolExecutor, ToolInvocation, ToolResult,
 };
 use serde_json::json;
 
@@ -44,17 +45,32 @@ impl ToolRegistry {
     }
 
     pub async fn dispatch(&self, invocation: ToolInvocation) -> ToolResult {
+        let context = match self.context_for(&invocation) {
+            Ok(value) => value,
+            Err(error) => return self.workspace.result_error(invocation.call_id, error),
+        };
+        self.dispatch_with_context(invocation, context).await
+    }
+
+    /// Dispatch one invocation with explicit authorization and cancellation context.
+    pub async fn dispatch_with_context(
+        &self,
+        invocation: ToolInvocation,
+        context: ToolExecutionContext,
+    ) -> ToolResult {
         let call_id = invocation.call_id.clone();
         match invocation.name.as_str() {
-            "read" => read::execute(&self.workspace, call_id, invocation.input).await,
-            "list" => list::execute(&self.workspace, call_id, invocation.input).await,
-            "find" => find::execute(&self.workspace, call_id, invocation.input).await,
-            "search" => search::execute(&self.workspace, call_id, invocation.input).await,
-            "write" => write::execute(&self.workspace, call_id, invocation.input).await,
-            "patch" => patch::execute(&self.workspace, call_id, invocation.input).await,
-            "shell" => shell::execute(&self.workspace, call_id, invocation.input).await,
-            "process" => process::execute(&self.workspace, call_id, invocation.input).await,
-            "git" => git::execute(&self.workspace, call_id, invocation.input).await,
+            "read" => read::execute(&self.workspace, call_id, invocation.input, context).await,
+            "list" => list::execute(&self.workspace, call_id, invocation.input, context).await,
+            "find" => find::execute(&self.workspace, call_id, invocation.input, context).await,
+            "search" => search::execute(&self.workspace, call_id, invocation.input, context).await,
+            "write" => write::execute(&self.workspace, call_id, invocation.input, context).await,
+            "patch" => patch::execute(&self.workspace, call_id, invocation.input, context).await,
+            "shell" => shell::execute(&self.workspace, call_id, invocation.input, context).await,
+            "process" => {
+                process::execute(&self.workspace, call_id, invocation.input, context).await
+            }
+            "git" => git::execute(&self.workspace, call_id, invocation.input, context).await,
             _ => ToolResult::failure(
                 call_id,
                 "unknown_tool",
@@ -64,6 +80,106 @@ impl ToolRegistry {
             ),
         }
     }
+
+    fn context_for(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> crate::common::ToolResultInternal<ToolExecutionContext> {
+        let definition = self
+            .definitions
+            .iter()
+            .find(|definition| definition.name == invocation.name)
+            .ok_or_else(|| crate::common::ToolInternalError::Input("unknown tool".to_owned()))?;
+        let request = self.permission_request(invocation).unwrap_or_else(|| PermissionRequest {
+            call_id: invocation.call_id.clone(),
+            tool: invocation.name.clone(),
+            class: definition.permission,
+            operation: invocation.name.clone(),
+            target: None,
+            details: serde_json::json!({}),
+        });
+        self.workspace.direct_context(&request)
+    }
+
+    /// Return the structured approval request for a mutating/executing invocation.
+    pub fn permission_request(&self, invocation: &ToolInvocation) -> Option<PermissionRequest> {
+        let definition =
+            self.definitions.iter().find(|definition| definition.name == invocation.name)?;
+        if definition.permission == PermissionClass::ReadOnly {
+            return None;
+        }
+        let details = match invocation.name.as_str() {
+            "write" => serde_json::from_value::<crate::WriteInput>(invocation.input.clone())
+                .map(|input| {
+                    serde_json::json!({
+                        "path": bounded_detail(&input.path),
+                        "bytes": input.content.len(),
+                        "create_only": input.create_only.unwrap_or(false),
+                        "precondition_present": input.expected_hash.is_some()
+                    })
+                })
+                .unwrap_or_else(|_| serde_json::json!({"invalid_input": true})),
+            "patch" => serde_json::from_value::<crate::PatchInput>(invocation.input.clone())
+                .map(|input| {
+                    serde_json::json!({
+                        "files": input.files.iter().map(|file| serde_json::json!({
+                            "path": bounded_detail(&file.path),
+                            "hunks": file.hunks.len(),
+                            "precondition_present": file.expected_hash.is_some()
+                        })).collect::<Vec<_>>(),
+                        "dry_run": input.dry_run.unwrap_or(false)
+                    })
+                })
+                .unwrap_or_else(|_| serde_json::json!({"invalid_input": true})),
+            "shell" => serde_json::from_value::<crate::ShellInput>(invocation.input.clone())
+                .map(|input| {
+                    serde_json::json!({
+                        "program": bounded_detail(&input.program),
+                        "arguments": bounded_arguments(input.args.unwrap_or_default()),
+                        "cwd": bounded_detail(&input.cwd.unwrap_or_else(|| ".".to_owned()))
+                    })
+                })
+                .unwrap_or_else(|_| serde_json::json!({"invalid_input": true})),
+            "process" => serde_json::from_value::<crate::ProcessInput>(invocation.input.clone())
+                .map(|input| {
+                    serde_json::json!({
+                        "operation": input.operation,
+                        "program": input.program.as_deref().map(bounded_detail),
+                        "arguments": bounded_arguments(input.args.unwrap_or_default()),
+                        "cwd": input.cwd.as_deref().map(bounded_detail),
+                        "process_id": input.process_id,
+                        "bytes": input.data.as_ref().map_or(0, String::len)
+                    })
+                })
+                .unwrap_or_else(|_| serde_json::json!({"invalid_input": true})),
+            _ => serde_json::json!({"input": "structured details unavailable"}),
+        };
+        Some(PermissionRequest {
+            call_id: invocation.call_id.clone(),
+            tool: invocation.name.clone(),
+            class: definition.permission,
+            operation: invocation.name.clone(),
+            target: details.get("path").and_then(serde_json::Value::as_str).map(str::to_owned),
+            details,
+        })
+    }
+}
+
+fn bounded_detail(value: &str) -> String {
+    BoundedText::new(value, 512).into_string()
+}
+
+fn bounded_arguments(arguments: Vec<String>) -> Vec<String> {
+    let count = arguments.len();
+    let mut bounded = arguments
+        .into_iter()
+        .take(32)
+        .map(|argument| bounded_detail(&argument))
+        .collect::<Vec<_>>();
+    if count > 32 {
+        bounded.push(format!("… {} additional arguments omitted", count - 32));
+    }
+    bounded
 }
 
 impl ToolExecutor for ToolRegistry {
@@ -71,8 +187,16 @@ impl ToolExecutor for ToolRegistry {
         &self.definitions
     }
 
-    fn execute<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a> {
-        Box::pin(async move { self.dispatch(invocation).await })
+    fn permission_request(&self, invocation: &ToolInvocation) -> Option<PermissionRequest> {
+        self.permission_request(invocation)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        context: ToolExecutionContext,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move { self.dispatch_with_context(invocation, context).await })
     }
 }
 

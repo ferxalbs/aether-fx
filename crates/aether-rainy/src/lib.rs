@@ -73,19 +73,7 @@ impl RainyBackend {
     }
 
     async fn model_for(&self, requested: Option<String>) -> Result<String, BackendError> {
-        if let Some(model) = requested {
-            if model.is_empty() {
-                return Err(BackendError::Mapping {
-                    message: "model identifier must not be empty".to_owned(),
-                });
-            }
-            return Ok(model);
-        }
-        self.catalog().await?.into_iter().next().map(|model| model.id).ok_or_else(|| {
-            BackendError::FeatureUnavailable {
-                feature: "Rainy returned an empty model catalog".to_owned(),
-            }
-        })
+        select_model(requested)
     }
 
     fn request(
@@ -107,6 +95,20 @@ impl RainyBackend {
         }
         Ok(rainy_request)
     }
+}
+
+fn select_model(requested: Option<String>) -> Result<String, BackendError> {
+    if let Some(model) = requested {
+        if model.is_empty() {
+            return Err(BackendError::Mapping {
+                message: "model identifier must not be empty".to_owned(),
+            });
+        }
+        return Ok(model);
+    }
+    Err(BackendError::FeatureUnavailable {
+        feature: "no model selected; pass --model or set AETHER_MODEL".to_owned(),
+    })
 }
 
 impl ModelBackend for RainyBackend {
@@ -348,6 +350,16 @@ mod tests {
         assert!(matches!(
             events.first(),
             Some(ModelEvent::TextDelta { text }) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn model_selection_never_uses_catalog_position() {
+        assert_eq!(select_model(Some("rainy-model".to_owned())).unwrap(), "rainy-model");
+        assert!(matches!(
+            select_model(None),
+            Err(BackendError::FeatureUnavailable { feature })
+                if feature.contains("no model selected")
         ));
     }
 

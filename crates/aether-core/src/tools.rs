@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BoundedText, PermissionClass, ToolCallId};
+use crate::{BoundedText, CancellationFlag, CoreError, CoreResult, PermissionClass, ToolCallId};
 
 /// A concise model-visible tool schema.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -27,6 +27,65 @@ pub struct ToolInvocation {
     pub name: String,
     /// JSON input decoded by the tool implementation into a typed struct.
     pub input: serde_json::Value,
+}
+
+/// Authorization evidence bound to one exact model tool call.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExecutionPermit {
+    /// Exact backend/model call identity.
+    pub call_id: ToolCallId,
+    /// Exact model-visible tool name.
+    pub tool: String,
+    /// Permission class approved for this call.
+    pub class: PermissionClass,
+}
+
+impl ExecutionPermit {
+    /// Construct a permit at the runtime authorization boundary.
+    pub fn new(call_id: ToolCallId, tool: impl Into<String>, class: PermissionClass) -> Self {
+        Self { call_id, tool: tool.into(), class }
+    }
+
+    /// Validate that a permit cannot be reused across calls, tools, or classes.
+    pub fn validate(
+        &self,
+        call_id: &ToolCallId,
+        tool: &str,
+        class: PermissionClass,
+    ) -> CoreResult<()> {
+        if &self.call_id != call_id || self.tool != tool || self.class != class {
+            return Err(CoreError::PermissionDenied {
+                operation: tool.to_owned(),
+                reason: "execution permit is not bound to this call, tool, and permission class"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Runtime context explicitly passed to every tool execution.
+#[derive(Clone, Debug)]
+pub struct ToolExecutionContext {
+    cancellation: CancellationFlag,
+    permit: ExecutionPermit,
+}
+
+impl ToolExecutionContext {
+    /// Construct a context from cooperative cancellation and authorization evidence.
+    pub fn new(cancellation: CancellationFlag, permit: ExecutionPermit) -> Self {
+        Self { cancellation, permit }
+    }
+
+    /// Return the shared cancellation flag.
+    pub fn cancellation(&self) -> &CancellationFlag {
+        &self.cancellation
+    }
+
+    /// Return the authorization permit.
+    pub fn permit(&self) -> &ExecutionPermit {
+        &self.permit
+    }
 }
 
 /// A structured tool error safe to show to a model.
@@ -121,6 +180,37 @@ pub trait ToolExecutor: Send + Sync {
     /// Return the exact model-visible registry.
     fn definitions(&self) -> &[ToolDefinition];
 
+    /// Build a structured permission request for calls that are not read-only.
+    fn permission_request(&self, invocation: &ToolInvocation) -> Option<crate::PermissionRequest>;
+
     /// Execute one typed invocation and return a structured result.
-    fn execute<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a>;
+    fn execute<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        context: ToolExecutionContext,
+    ) -> ToolFuture<'a>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_permit_is_bound_to_call_tool_and_class() {
+        let call_id = ToolCallId::new("call-1").unwrap();
+        let permit =
+            ExecutionPermit::new(call_id.clone(), "write", PermissionClass::WorkspaceWrite);
+        assert!(permit.validate(&call_id, "write", PermissionClass::WorkspaceWrite).is_ok());
+        assert!(
+            permit
+                .validate(
+                    &ToolCallId::new("call-2").unwrap(),
+                    "write",
+                    PermissionClass::WorkspaceWrite
+                )
+                .is_err()
+        );
+        assert!(permit.validate(&call_id, "shell", PermissionClass::ProcessExecute).is_err());
+        assert!(permit.validate(&call_id, "write", PermissionClass::ProcessExecute).is_err());
+    }
 }

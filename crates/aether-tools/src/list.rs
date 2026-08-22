@@ -1,11 +1,13 @@
 use std::path::Path;
 
-use aether_core::ToolCallId;
+use aether_core::{CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::{MAX_WALK_ENTRIES, Workspace, bounded_limit};
+use crate::common::{
+    MAX_WALK_ENTRIES, ToolInternalError, Workspace, bounded_limit, spawn_blocking_tool,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ListInput {
@@ -35,11 +37,32 @@ pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: ListInput = match workspace.parse(&input) {
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "list", PermissionClass::ReadOnly)
+    {
+        return workspace.result_error(call_id, error);
+    }
+    spawn_blocking_tool(workspace, call_id, &context, move |workspace, call_id, cancellation| {
+        execute_blocking(workspace, call_id, parsed, cancellation)
+    })
+    .await
+}
+
+fn execute_blocking(
+    workspace: Workspace,
+    call_id: ToolCallId,
+    parsed: ListInput,
+    cancellation: CancellationFlag,
+) -> aether_core::ToolResult {
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
+    }
     let requested_path = parsed.path.as_deref().unwrap_or(".");
     let (display_base, base) = match workspace.resolve_existing(requested_path) {
         Ok(value) => value,
@@ -52,7 +75,7 @@ pub(crate) async fn execute(
     if !base_metadata.is_dir() {
         return workspace.result_error(
             call_id,
-            crate::common::ToolInternalError::Input(format!("{display_base} is not a directory")),
+            ToolInternalError::Input(format!("{display_base} is not a directory")),
         );
     }
     let max_entries = parsed.max_entries.unwrap_or(1000).clamp(1, MAX_WALK_ENTRIES);
@@ -74,13 +97,14 @@ pub(crate) async fn execute(
     let mut entries = Vec::new();
     let mut truncated = false;
     for result in builder.build() {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
         let entry = match result {
             Ok(value) => value,
             Err(error) => {
-                return workspace.result_error(
-                    call_id,
-                    crate::common::ToolInternalError::Input(error.to_string()),
-                );
+                return workspace
+                    .result_error(call_id, ToolInternalError::Input(error.to_string()));
             }
         };
         if entry.path() == Path::new(&base) {
@@ -117,10 +141,9 @@ pub(crate) async fn execute(
             symlink: metadata.file_type().is_symlink(),
         });
     }
-    let output = serde_json::json!(ListOutput { entries, truncated });
     aether_core::ToolResult::success_json(
         call_id,
-        output,
+        serde_json::json!(ListOutput { entries, truncated }),
         bounded_limit(None, workspace.max_output_bytes()),
     )
 }

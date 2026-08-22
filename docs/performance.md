@@ -14,6 +14,32 @@ The initial targets are engineering targets, not achieved claims:
 | Renderer update | < 8 ms |
 | Ctrl+C cancellation | < 50 ms |
 
-The first benchmark suite covers process startup, argument parsing, renderer/buffer work, event dispatch, small and large bounded reads, listing, finding, content search, patch validation/application, session replay, and dispatch. It is deterministic and excludes network calls.
+The benchmark suite covers process startup, argument parsing, renderer/buffer work, event dispatch, small and large bounded reads, listing, finding, content search, patch validation/application, session replay, blocking-dispatch overhead, cancellation checkpoints, permission decisions, continuation bookkeeping, atomic write, staged patch application, persistent-process buffer reads, and short registry lookups. It is deterministic and excludes network calls; process-buffer benchmarks use a bounded fixture and terminate it after measurement.
+
+Phase 1 design measurements to record locally are:
+
+| Measurement | Result | Status |
+| --- | --- | --- |
+| Current-thread responsiveness while a blocking tool runs | async timer regression test passes | verified by workspace test |
+| Persistent output memory | 16 × 2 × 256 KiB maximum stream storage | design bound |
+| Cancellation latency | cooperative checkpoints plus 10 ms polling for async process I/O | diagnostic benchmark pending |
+| Release binary size | 4,943,824 bytes (4.71 MiB); 225 locked packages | measured 2026-08-21 |
+
+The blocking pool is deliberately not an unbounded fan-out: each filesystem/search tool call uses one bounded blocking operation, and traversal/result limits remain enforced inside that operation. Process output is drained continuously into recent-output buffers rather than accumulating an unbounded log.
+
+Quick local Criterion sample on 2026-08-21 (`sample-size 10`, 100 ms warmup, 200 ms measurement; directional rather than release-quality publication data):
+
+| Benchmark | Median estimate |
+| --- | ---: |
+| blocking dispatch overhead | 45.1 µs |
+| cooperative cancellation check | 2.45 ns |
+| permission decision | 976 ns |
+| multi-turn bookkeeping | 425 ns |
+| atomic write | 2.24 ms |
+| staged patch application | 2.15 ms |
+| persistent process buffer read | 46.6 µs |
+| process registry lookup/status | 5.48 µs |
+
+These measurements are local diagnostics, not cross-machine guarantees. The existing AETHER-versus-rg comparison remains intentionally separate because a freshly spawned `rg` process includes process startup overhead.
 
 The release profile is `opt-level=3`, fat LTO, one codegen unit, aborting panic, stripped symbols, no debug info, and no incremental compilation. Public builds do not use `target-cpu=native`.

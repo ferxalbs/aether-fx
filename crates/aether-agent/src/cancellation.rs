@@ -1,15 +1,12 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
-use aether_core::{CoreError, CoreResult};
+use aether_core::{CancellationFlag, CoreResult};
 use tokio::sync::Notify;
 
 /// Cheap, clonable cancellation signal shared by an agent turn and its tools.
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    flag: CancellationFlag,
     notify: Arc<Notify>,
 }
 
@@ -22,18 +19,18 @@ impl Default for CancellationToken {
 impl CancellationToken {
     /// Construct a fresh non-cancelled token.
     pub fn new() -> Self {
-        Self { cancelled: Arc::new(AtomicBool::new(false)), notify: Arc::new(Notify::new()) }
+        Self { flag: CancellationFlag::new(), notify: Arc::new(Notify::new()) }
     }
 
     /// Mark the operation cancelled.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.flag.cancel();
         self.notify.notify_waiters();
     }
 
     /// Check whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.flag.is_cancelled()
     }
 
     /// Wait until cancellation is requested.
@@ -47,6 +44,11 @@ impl CancellationToken {
 
     /// Convert the signal into the shared typed error.
     pub fn check(&self) -> CoreResult<()> {
-        if self.is_cancelled() { Err(CoreError::Cancelled) } else { Ok(()) }
+        self.flag.check()
+    }
+
+    /// Return the std-only signal shared with blocking tool work.
+    pub fn flag(&self) -> CancellationFlag {
+        self.flag.clone()
     }
 }

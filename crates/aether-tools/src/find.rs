@@ -1,11 +1,10 @@
+use aether_core::{CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use aether_core::ToolCallId;
-
-use crate::common::{MAX_WALK_ENTRIES, Workspace};
+use crate::common::{MAX_WALK_ENTRIES, ToolInternalError, Workspace, spawn_blocking_tool};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FindInput {
@@ -26,6 +25,7 @@ pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: FindInput = match workspace.parse(&input) {
         Ok(value) => value,
@@ -34,18 +34,36 @@ pub(crate) async fn execute(
     if parsed.patterns.is_empty() || parsed.patterns.len() > 32 {
         return workspace.result_error(
             call_id,
-            crate::common::ToolInternalError::Input("find requires 1..=32 patterns".to_owned()),
+            ToolInternalError::Input("find requires 1..=32 patterns".to_owned()),
         );
+    }
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "find", PermissionClass::ReadOnly)
+    {
+        return workspace.result_error(call_id, error);
+    }
+    spawn_blocking_tool(workspace, call_id, &context, move |workspace, call_id, cancellation| {
+        execute_blocking(workspace, call_id, parsed, cancellation)
+    })
+    .await
+}
+
+fn execute_blocking(
+    workspace: Workspace,
+    call_id: ToolCallId,
+    parsed: FindInput,
+    cancellation: CancellationFlag,
+) -> aether_core::ToolResult {
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
     }
     let mut glob_builder = GlobSetBuilder::new();
     for pattern in &parsed.patterns {
         let glob = match Glob::new(pattern) {
             Ok(value) => value,
             Err(error) => {
-                return workspace.result_error(
-                    call_id,
-                    crate::common::ToolInternalError::Pattern(error.to_string()),
-                );
+                return workspace
+                    .result_error(call_id, ToolInternalError::Pattern(error.to_string()));
             }
         };
         glob_builder.add(glob);
@@ -53,10 +71,7 @@ pub(crate) async fn execute(
     let glob_set = match glob_builder.build() {
         Ok(value) => value,
         Err(error) => {
-            return workspace.result_error(
-                call_id,
-                crate::common::ToolInternalError::Pattern(error.to_string()),
-            );
+            return workspace.result_error(call_id, ToolInternalError::Pattern(error.to_string()));
         }
     };
     let requested_path = parsed.path.as_deref().unwrap_or(".");
@@ -79,13 +94,14 @@ pub(crate) async fn execute(
     let mut paths = Vec::new();
     let mut truncated = false;
     for result in builder.build() {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
         let entry = match result {
             Ok(value) => value,
             Err(error) => {
-                return workspace.result_error(
-                    call_id,
-                    crate::common::ToolInternalError::Input(error.to_string()),
-                );
+                return workspace
+                    .result_error(call_id, ToolInternalError::Input(error.to_string()));
             }
         };
         let path = entry.path();

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, CoreResult};
+use crate::{CoreError, CoreResult, ToolCallId};
 
 /// Policy classes used to authorize local and network-affecting operations.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -40,15 +40,21 @@ impl std::fmt::Display for PermissionClass {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
-    /// The policy allows the operation.
-    Allowed,
-    /// The operation must be shown to and approved by the user.
-    RequiresConfirmation,
+    /// Approve only this tool call.
+    AllowOnce,
+    /// Approve this tool/class scope for the current process session.
+    AllowSession,
+    /// Refuse the requested operation.
+    Deny,
 }
 
 /// A structured operation presented to a future confirmation UI.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PermissionRequest {
+    /// Backend/model tool-call identity associated with the request.
+    pub call_id: ToolCallId,
+    /// Exact model-visible tool name.
+    pub tool: String,
     /// Policy category being requested.
     pub class: PermissionClass,
     /// Human-readable operation name.
@@ -132,22 +138,19 @@ impl PermissionEngine {
     }
 
     /// Return the decision without mutating state or prompting.
-    pub fn decide(&self, request: &PermissionRequest) -> PermissionDecision {
-        if self.policy.allows(request.class) {
-            PermissionDecision::Allowed
-        } else {
-            PermissionDecision::RequiresConfirmation
-        }
+    pub fn requires_confirmation(&self, request: &PermissionRequest) -> bool {
+        !self.policy.allows(request.class)
     }
 
     /// Authorize or return a structured core error suitable for a tool result.
     pub fn authorize(&self, request: &PermissionRequest) -> CoreResult<()> {
-        match self.decide(request) {
-            PermissionDecision::Allowed => Ok(()),
-            PermissionDecision::RequiresConfirmation => Err(CoreError::PermissionRequired {
+        if !self.requires_confirmation(request) {
+            Ok(())
+        } else {
+            Err(CoreError::PermissionRequired {
                 operation: request.operation.clone(),
                 class: request.class.to_string(),
-            }),
+            })
         }
     }
 
@@ -165,12 +168,14 @@ mod tests {
     fn default_policy_requires_confirmation_for_writes() {
         let engine = PermissionEngine::new(PermissionPolicy::default());
         let request = PermissionRequest {
+            call_id: ToolCallId::new("test-call").unwrap(),
+            tool: "write".to_owned(),
             class: PermissionClass::WorkspaceWrite,
             operation: "write file".to_owned(),
             target: Some("src/main.rs".to_owned()),
             details: serde_json::json!({"path": "src/main.rs"}),
         };
-        assert_eq!(engine.decide(&request), PermissionDecision::RequiresConfirmation);
+        assert!(engine.requires_confirmation(&request));
         assert!(engine.authorize(&request).is_err());
     }
 }

@@ -3,16 +3,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aether_core::{PermissionClass, ToolCallId};
+use aether_core::{CoreError, PermissionClass, ToolCallId, ToolExecutionContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    time::timeout,
 };
 
-use crate::common::{MAX_INPUT_BYTES, Workspace, bounded_limit};
+use crate::common::{MAX_INPUT_BYTES, Workspace, bounded_limit, resolve_existing_blocking};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ShellInput {
@@ -73,6 +72,7 @@ pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: ShellInput = match workspace.parse(&input) {
         Ok(value) => value,
@@ -84,6 +84,11 @@ pub(crate) async fn execute(
             crate::common::ToolInternalError::Input("shell program must not be empty".to_owned()),
         );
     }
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "shell", PermissionClass::ProcessExecute)
+    {
+        return workspace.result_error(call_id, error);
+    }
     let args = parsed.args.unwrap_or_default();
     if args.len() > 256 {
         return workspace.result_error(
@@ -94,7 +99,7 @@ pub(crate) async fn execute(
         );
     }
     let (cwd_display, cwd) = match parsed.cwd.as_deref() {
-        Some(path) => match workspace.resolve_existing(path) {
+        Some(path) => match resolve_existing_blocking(workspace, path.to_owned()).await {
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error),
         },
@@ -106,17 +111,9 @@ pub(crate) async fn execute(
             crate::common::ToolInternalError::Input("shell cwd is not a directory".to_owned()),
         );
     }
-    if let Err(error) = workspace.authorize(
-        PermissionClass::ProcessExecute,
-        "execute finite process",
-        Some(cwd_display.clone()),
-        serde_json::json!({
-            "program": parsed.program,
-            "arguments": args,
-            "cwd": cwd_display
-        }),
-    ) {
-        return workspace.result_error(call_id, error);
+    if context.cancellation().is_cancelled() {
+        return workspace
+            .result_error(call_id, crate::common::ToolInternalError::Core(CoreError::Cancelled));
     }
     let limit = bounded_limit(parsed.max_output_bytes, workspace.max_output_bytes());
     let timeout_duration =
@@ -158,15 +155,33 @@ pub(crate) async fn execute(
     };
     let stdout_task = tokio::spawn(read_bounded(stdout, limit));
     let stderr_task = tokio::spawn(read_bounded(stderr, limit));
-    let status = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => (status.code(), false),
-        Ok(Err(error)) => {
-            return workspace.result_error(call_id, error.into());
-        }
-        Err(_) => {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut child_wait = Box::pin(child.wait());
+    let status = loop {
+        if context.cancellation().is_cancelled() {
+            drop(child_wait);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            (None, true)
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return workspace.result_error(
+                call_id,
+                crate::common::ToolInternalError::Core(CoreError::Cancelled),
+            );
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            drop(child_wait);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            break (None, true);
+        }
+        tokio::select! {
+            result = &mut child_wait => match result {
+                Ok(status) => break (status.code(), false),
+                Err(error) => return workspace.result_error(call_id, error.into()),
+            },
+            _ = tokio::time::sleep(remaining.min(Duration::from_millis(10))) => {}
         }
     };
     let stdout = match stdout_task.await {

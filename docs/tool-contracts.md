@@ -8,10 +8,12 @@ The model-visible registry has exactly nine names:
 | `list` | ReadOnly | Ignore-aware bounded directory entries with depth, hidden policy, and metadata |
 | `find` | ReadOnly | Ignore-aware path/name globs such as `**/*.rs` |
 | `search` | ReadOnly | Ignore-aware bounded literal/regex content search with globs, case options, context, and binary exclusion |
-| `write` | WorkspaceWrite | Bounded UTF-8 replacement/create with optional BLAKE3 precondition and atomic same-directory temp file where supported |
-| `patch` | WorkspaceWrite | Multiple strict hunks/files, preconditions, dry-run, and best-effort rollback |
+| `write` | WorkspaceWrite | Bounded UTF-8 replacement/create with optional BLAKE3 precondition and same-directory staged atomic replacement; existing basic permissions are preserved |
+| `patch` | WorkspaceWrite | Multiple strict hunks/files, preconditions, dry-run, staged commit, and rollback-capable best-effort transaction; not globally atomic |
 | `shell` | ProcessExecute | Direct `program` plus `arguments`, `cwd`, exit status, duration, bounded stdout/stderr, and truncation metadata |
-| `process` | ProcessPersistent | `start`, `read`, `write`, `status`, and `kill` with stable process IDs |
+| `process` | ProcessPersistent | `start`, `read`, `write`, `signal`, `status`, and `kill` with stable process IDs; direct argv only, 16-process session cap, continuously-drained bounded stdout/stderr, and `buffered_bytes`/`dropped_bytes` metadata on reads/status |
 | `git` | ReadOnly in v0.1 | Structured status, diff, show, log, and branch inspection through the installed Git executable |
 
-Internal helpers are not registered as model-visible tools. Each request and result is typed and serializable; output is capped before it reaches model context.
+Internal helpers are not registered as model-visible tools. Each request and result is typed and serializable; output is capped before it reaches model context. Permission, cancellation, model selection, session, and terminal facilities are runtime controls, not tools.
+
+The interactive permission decisions are `allow_once`, `allow_session`, and `deny`. A denied tool call is returned to the model as a structured `permission_denied` result so the model can adapt; unknown tool names fail closed as `unknown_tool`.

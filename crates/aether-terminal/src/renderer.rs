@@ -48,6 +48,7 @@ impl Renderer {
                 self.buffer.newline();
                 self.buffer.append(if *ok { "[tool done]" } else { "[tool failed]" });
             }
+            AgentEvent::PermissionRequested { .. } | AgentEvent::PermissionResolved { .. } => {}
             AgentEvent::Usage { .. } => {}
             AgentEvent::Warning { message } => {
                 self.buffer.newline();

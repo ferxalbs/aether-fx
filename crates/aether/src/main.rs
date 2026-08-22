@@ -5,8 +5,14 @@ use std::{
     process::ExitCode,
 };
 
-use aether_agent::{Agent, AgentError, AgentRequest, CancellationToken, ModelBackend};
-use aether_core::{SessionId, TurnId};
+use aether_agent::{
+    Agent, AgentError, AgentRequest, AgentRunResult, CancellationToken, ModelBackend,
+    NoPermissionBroker, PermissionBroker, SessionPermissionBroker,
+};
+use aether_core::{
+    AgentEvent, BoundedText, OpaqueContinuation, PermissionDecision, SessionId, ToolExecutor,
+    TurnId,
+};
 use aether_rainy::RainyBackend;
 use aether_terminal::Renderer;
 use aether_tools::ToolRegistry;
@@ -73,12 +79,7 @@ fn run() -> Result<(), AppError> {
             "resume is not implemented in bootstrap (requested session {session})"
         ))),
         Command::Shell => {
-            let prompt = aether_terminal::run_minimal_shell()?;
-            if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
-                with_runtime(|runtime| runtime.block_on(run_prompt(prompt, None, cli.root)))
-            } else {
-                Ok(())
-            }
+            with_runtime(|runtime| runtime.block_on(run_interactive(cli.model, cli.root)))
         }
         Command::Prompt(prompt) => {
             with_runtime(|runtime| runtime.block_on(run_prompt(prompt, cli.model, cli.root)))
@@ -188,26 +189,143 @@ async fn models() -> Result<(), AppError> {
 }
 
 async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Result<(), AppError> {
+    let model = configured_model(model)?;
     let backend = RainyBackend::from_env().map_err(|error| AppError::Message(error.to_string()))?;
-    let tools = ToolRegistry::new(&root).map_err(AppError::Message)?;
+    let tools = new_tool_registry(root.clone()).await?;
+    let workspace = tools.workspace().clone();
     let agent = Agent::new(backend, tools);
     let session_id = SessionId::new(format!("session-{}", std::process::id()))
         .map_err(|error| AppError::Message(error.to_string()))?;
-    let turn_id = TurnId::new(format!("turn-{}", std::process::id()))
+    let turn_id = TurnId::new(format!("turn-{}-1", std::process::id()))
         .map_err(|error| AppError::Message(error.to_string()))?;
     let mut request = AgentRequest::new(session_id, turn_id, prompt);
-    request.model = model;
+    request.model = Some(model);
+    let mut renderer = Renderer::new();
+    let broker = NoPermissionBroker;
+    let _ = run_agent_turn(&agent, request, &broker, None, &mut renderer).await?;
+    workspace.shutdown_processes().await;
+    Ok(())
+}
+
+/// Keep the prompt local and visible before constructing the network backend.
+async fn run_interactive(model: Option<String>, root: PathBuf) -> Result<(), AppError> {
+    let Some(mut prompt) = read_prompt().await? else {
+        return Ok(());
+    };
+    let model = configured_model(model)?;
+    let backend = RainyBackend::from_env().map_err(|error| AppError::Message(error.to_string()))?;
+    let tools = new_tool_registry(root.clone()).await?;
+    let workspace = tools.workspace().clone();
+    let agent = Agent::new(backend, tools);
+    let broker = SessionPermissionBroker::new();
+    let session_id = SessionId::new(format!("session-{}", std::process::id()))
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    let mut continuation: Option<OpaqueContinuation> = None;
+    let mut turn_number = 0_u64;
+    let mut renderer = Renderer::new();
+
+    let session_result = async {
+        loop {
+            if prompt.trim().is_empty() {
+                let Some(next) = read_prompt().await? else {
+                    break;
+                };
+                prompt = next;
+                continue;
+            }
+
+            turn_number = turn_number.saturating_add(1);
+            let turn_id = TurnId::new(format!("turn-{}-{turn_number}", std::process::id()))
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            let mut request = AgentRequest::new(session_id.clone(), turn_id, prompt);
+            request.model = Some(model.clone());
+            request.continuation = continuation.clone();
+            if let Some(result) =
+                run_agent_turn(&agent, request, &broker, Some(&broker), &mut renderer).await?
+            {
+                continuation = result.continuation;
+            }
+
+            let Some(next) = read_prompt().await? else {
+                break;
+            };
+            prompt = next;
+        }
+        Ok::<(), AppError>(())
+    }
+    .await;
+    workspace.shutdown_processes().await;
+    session_result
+}
+
+async fn read_prompt() -> Result<Option<String>, AppError> {
+    tokio::task::spawn_blocking(aether_terminal::run_minimal_shell)
+        .await
+        .map_err(|error| AppError::Message(format!("prompt worker failed: {error}")))?
+        .map_err(AppError::Io)
+}
+
+async fn new_tool_registry(root: PathBuf) -> Result<ToolRegistry, AppError> {
+    tokio::task::spawn_blocking(move || ToolRegistry::new(root))
+        .await
+        .map_err(|error| AppError::Message(format!("tool registry worker failed: {error}")))?
+        .map_err(AppError::Message)
+}
+
+fn configured_model(cli_model: Option<String>) -> Result<String, AppError> {
+    configured_model_from(cli_model, std::env::var("AETHER_MODEL").ok())
+}
+
+fn configured_model_from(
+    cli_model: Option<String>,
+    env_model: Option<String>,
+) -> Result<String, AppError> {
+    let model = cli_model.or(env_model);
+    let Some(model) = model.filter(|value| !value.trim().is_empty()) else {
+        return Err(AppError::Message(
+            "no model selected; pass --model <id> or set AETHER_MODEL".to_owned(),
+        ));
+    };
+    Ok(model)
+}
+
+async fn run_agent_turn<B, T>(
+    agent: &Agent<B, T>,
+    request: AgentRequest,
+    broker: &dyn PermissionBroker,
+    resolver: Option<&SessionPermissionBroker>,
+    renderer: &mut Renderer,
+) -> Result<Option<AgentRunResult>, AppError>
+where
+    B: ModelBackend + 'static,
+    T: ToolExecutor + 'static,
+{
     let (sender, mut receiver) = mpsc::channel(64);
     let cancellation = CancellationToken::new();
-    let mut run = Box::pin(agent.run(request, sender, cancellation.clone()));
-    let mut renderer = Renderer::new();
-    let mut stdout = io::stdout().lock();
+    let mut run = Box::pin(agent.run_with_broker(request, sender, cancellation.clone(), broker));
     let mut interrupted = false;
     let result = loop {
         tokio::select! {
             result = &mut run => break result,
             event = receiver.recv() => {
-                if let Some(event) = event {
+                let Some(event) = event else { continue; };
+                if let AgentEvent::PermissionRequested { request } = &event {
+                    {
+                        let mut stdout = io::stdout().lock();
+                        renderer.render_if_due(&mut stdout, true)?;
+                    }
+                    let request_for_prompt = request.clone();
+                    let decision = tokio::task::spawn_blocking(move || {
+                        aether_terminal::prompt_permission(&request_for_prompt)
+                    })
+                    .await
+                    .map_err(|error| AppError::Message(format!("permission worker failed: {error}")))??
+                    .unwrap_or(PermissionDecision::Deny);
+                    if let Some(resolver) = resolver {
+                        let _ = resolver.resolve(&request.call_id, decision);
+                    }
+                } else {
+                    let mut stdout = io::stdout().lock();
                     renderer.handle(&event, &mut stdout)?;
                 }
             }
@@ -219,8 +337,40 @@ async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Res
             }
         }
     };
-    renderer.render_if_due(&mut stdout, true)?;
-    result?;
-    stdout.flush()?;
-    Ok(())
+    {
+        let mut stdout = io::stdout().lock();
+        renderer.render_if_due(&mut stdout, true)?;
+        stdout.flush()?;
+    }
+    match result {
+        Ok(result) => Ok(Some(result)),
+        Err(AgentError::Cancelled) => {
+            let mut stdout = io::stdout().lock();
+            renderer.handle(
+                &AgentEvent::Warning { message: BoundedText::new("turn cancelled", 1024) },
+                &mut stdout,
+            )?;
+            renderer.render_if_due(&mut stdout, true)?;
+            stdout.flush()?;
+            Ok(None)
+        }
+        Err(error) => Err(AppError::Agent(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_selection_is_explicit_and_precedence_is_stable() {
+        assert_eq!(
+            configured_model_from(Some("cli-model".to_owned()), Some("env-model".to_owned()))
+                .unwrap(),
+            "cli-model"
+        );
+        assert_eq!(configured_model_from(None, Some("env-model".to_owned())).unwrap(), "env-model");
+        let error = configured_model_from(None, None).unwrap_err().to_string();
+        assert!(error.contains("--model") && error.contains("AETHER_MODEL"));
+    }
 }

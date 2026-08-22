@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BoundedText, StepId, ToolCallId};
+use crate::{BoundedText, PermissionDecision, PermissionRequest, StepId, ToolCallId};
 
 /// Monotonic ordering metadata attached to a stream event.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,6 +41,10 @@ pub enum AgentEvent {
         operation: String,
         step_id: Option<StepId>,
     },
+    /// A mutating/executing tool needs a terminal-neutral user decision.
+    PermissionRequested { request: PermissionRequest },
+    /// The permission decision associated with a request.
+    PermissionResolved { call_id: ToolCallId, decision: PermissionDecision },
     /// Bounded structured/text output from a tool.
     ToolOutput { call_id: ToolCallId, output: BoundedText },
     /// A tool invocation finished.
@@ -61,6 +65,8 @@ impl AgentEvent {
         match self {
             Self::TextDelta { .. } => "text_delta",
             Self::ToolStarted { .. } => "tool_started",
+            Self::PermissionRequested { .. } => "permission_requested",
+            Self::PermissionResolved { .. } => "permission_resolved",
             Self::ToolOutput { .. } => "tool_output",
             Self::ToolFinished { .. } => "tool_finished",
             Self::Usage { .. } => "usage",

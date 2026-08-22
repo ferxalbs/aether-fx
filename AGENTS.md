@@ -61,28 +61,35 @@ Keep `CHANGELOG.md` history-only. Every change belongs under one dated entry
 at the top of the file:
 
 ```markdown
-## Unreleased - YYYY-MM-DD - Short description
+## Unreleased - YYYY-MM-DD (x) - Short description
 ```
 
 Before adding a new versioned release, use this exact heading format:
 
 ```markdown
-## vX.Y.Z - YYYY-MM-DD - Short release tagline
+## vX.Y.Z - YYYY-MM-DD (x) - Short release tagline
 ```
 
 Release rules:
 
 1. Use a lowercase `v` and a complete semantic version, such as `v0.1.0`.
 2. Use the ISO-8601 date format `YYYY-MM-DD`.
-3. Add one concise, outcome-focused tagline after the date.
-4. Organize each entry under only the sections that apply: `Added`,
+3. Use `x` as the sequential entry number for that date: start at `(1)`,
+   increment to `(2)`, `(3)`, and so on for each additional version or
+   unreleased entry on the same date, then reset to `(1)` on the next date.
+4. Add one concise, outcome-focused tagline after the date and sequence.
+5. Organize each entry under only the sections that apply: `Added`,
    `Changed`, `Fixed`, `Security`, `Performance`, `Documentation`, and
    `Known Limitations`.
-5. Keep exactly one dated `Unreleased` entry above all versioned releases.
-   When a release is prepared, move its completed items into the new version
-   heading and create a fresh `Unreleased` entry above it.
-6. Do not add a versioned heading for an unpublished, untagged, or unvalidated
+6. Keep all entries in the single public `CHANGELOG.md`. When a release is
+   prepared, move its completed items into the new version heading and create
+   the next dated `Unreleased` entry with the correct sequence number.
+7. Do not add a versioned heading for an unpublished, untagged, or unvalidated
    release. Validate the release before recording it as a versioned entry.
+8. Multiple commits and pull requests are grouped into the relevant changelog
+   entry; the sequence number tracks public changelog entries or releases,
+   not individual commits. AETHER Fx is a public open-source project, so
+   `CHANGELOG.md` is the single clear public record of that history.
 
 ## Security & Configuration
 

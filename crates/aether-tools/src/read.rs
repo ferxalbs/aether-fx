@@ -3,11 +3,15 @@ use std::{
     io::{self, Read},
 };
 
-use aether_core::{BoundedText, ToolCallId};
+use aether_core::{
+    BoundedText, CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::{Workspace, bounded_limit};
+use crate::common::{
+    MAX_INPUT_BYTES, ToolInternalError, Workspace, bounded_limit, spawn_blocking_tool,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadInput {
@@ -41,6 +45,7 @@ pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: ReadInput = match workspace.parse(&input) {
         Ok(value) => value,
@@ -49,19 +54,38 @@ pub(crate) async fn execute(
     if parsed.files.is_empty() || parsed.files.len() > 64 {
         return workspace.result_error(
             call_id,
-            crate::common::ToolInternalError::Input("read requires 1..=64 files".to_owned()),
+            ToolInternalError::Input("read requires 1..=64 files".to_owned()),
         );
     }
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "read", PermissionClass::ReadOnly)
+    {
+        return workspace.result_error(call_id, error);
+    }
     let limit = bounded_limit(parsed.max_bytes, workspace.max_output_bytes());
+    spawn_blocking_tool(workspace, call_id, &context, move |workspace, call_id, cancellation| {
+        execute_blocking(workspace, call_id, parsed, limit, cancellation)
+    })
+    .await
+}
+
+fn execute_blocking(
+    workspace: Workspace,
+    call_id: ToolCallId,
+    parsed: ReadInput,
+    limit: usize,
+    cancellation: CancellationFlag,
+) -> aether_core::ToolResult {
     let mut remaining = limit;
     let mut files = Vec::with_capacity(parsed.files.len());
     for target in parsed.files {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
         if target.start_line.zip(target.end_line).is_some_and(|(start, end)| start > end) {
             return workspace.result_error(
                 call_id,
-                crate::common::ToolInternalError::Input(
-                    "start_line must not be greater than end_line".to_owned(),
-                ),
+                ToolInternalError::Input("start_line must not be greater than end_line".to_owned()),
             );
         }
         let (relative, path) = match workspace.resolve_existing(&target.path) {
@@ -70,15 +94,12 @@ pub(crate) async fn execute(
         };
         let metadata = match path.metadata() {
             Ok(value) => value,
-            Err(error) => {
-                return workspace
-                    .result_error(call_id.clone(), crate::common::ToolInternalError::Io(error));
-            }
+            Err(error) => return workspace.result_error(call_id.clone(), error.into()),
         };
         if !metadata.is_file() {
             return workspace.result_error(
                 call_id,
-                crate::common::ToolInternalError::Input(format!("{relative} is not a file")),
+                ToolInternalError::Input(format!("{relative} is not a file")),
             );
         }
         if remaining == 0 {
@@ -91,18 +112,15 @@ pub(crate) async fn execute(
             });
             continue;
         }
-        let read_limit = remaining.min(crate::common::MAX_INPUT_BYTES);
-        let mut bytes = Vec::with_capacity(read_limit.min(8192));
+        let read_limit = remaining.min(MAX_INPUT_BYTES);
         let file = match File::open(&path) {
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error.into()),
         };
-        let mut limited = file.take(read_limit.saturating_add(1) as u64);
-        let read_count = match limited.read_to_end(&mut bytes) {
-            Ok(count) => count,
-            Err(error) => return workspace.result_error(call_id, error.into()),
+        let (mut bytes, truncated) = match read_limited(file, read_limit, &cancellation) {
+            Ok(value) => value,
+            Err(error) => return workspace.result_error(call_id, error),
         };
-        let truncated = read_count > read_limit;
         if truncated {
             bytes.truncate(read_limit);
         }
@@ -132,6 +150,31 @@ pub(crate) async fn execute(
         result.output = BoundedText::new(result.output.as_str(), limit);
     }
     result
+}
+
+fn read_limited(
+    mut file: File,
+    limit: usize,
+    cancellation: &CancellationFlag,
+) -> Result<(Vec<u8>, bool), ToolInternalError> {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 32 * 1024];
+    let mut truncated = false;
+    loop {
+        cancellation.check().map_err(ToolInternalError::Core)?;
+        let count = file.read(&mut buffer).map_err(ToolInternalError::Io)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < count {
+            truncated = true;
+            break;
+        }
+    }
+    Ok((bytes, truncated))
 }
 
 #[allow(dead_code)]

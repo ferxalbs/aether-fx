@@ -2,6 +2,7 @@
 
 //! Domain primitives shared by the AETHER Fx workspace.
 
+pub mod cancellation;
 pub mod error;
 pub mod events;
 pub mod ids;
@@ -12,6 +13,7 @@ pub mod permissions;
 pub mod session;
 pub mod tools;
 
+pub use cancellation::CancellationFlag;
 pub use error::{CoreError, CoreResult};
 pub use events::{AgentEvent, EventSequence, UsageMetadata};
 pub use ids::{SessionId, StepId, ToolCallId, TurnId};
@@ -22,4 +24,6 @@ pub use permissions::{
     PermissionClass, PermissionDecision, PermissionEngine, PermissionPolicy, PermissionRequest,
 };
 pub use session::{SESSION_SCHEMA_VERSION, SessionLine, SessionRecord};
-pub use tools::{ToolDefinition, ToolExecutor, ToolInvocation, ToolResult};
+pub use tools::{
+    ExecutionPermit, ToolDefinition, ToolExecutionContext, ToolExecutor, ToolInvocation, ToolResult,
+};

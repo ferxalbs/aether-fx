@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use aether_core::{
-    AgentEvent, BoundedText, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelRequest,
-    OpaqueContinuation, SessionId, StepId, ToolCallId, ToolExecutor, ToolInvocation, TurnId,
+    AgentEvent, BoundedText, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit, ModelEvent, ModelRequest,
+    OpaqueContinuation, PermissionDecision, SessionId, StepId, ToolCallId, ToolExecutionContext,
+    ToolExecutor, ToolInvocation, TurnId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::{BackendError, CancellationToken, ModelBackend};
+use crate::{BackendError, CancellationToken, ModelBackend, NoPermissionBroker, PermissionBroker};
 
 /// A user-requested agent turn.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -24,12 +25,21 @@ pub struct AgentRequest {
     pub model: Option<String>,
     /// Maximum model/tool continuation steps.
     pub max_steps: u16,
+    /// Opaque provider continuation from the preceding external turn.
+    pub continuation: Option<OpaqueContinuation>,
 }
 
 impl AgentRequest {
     /// Construct a bounded-default request.
     pub fn new(session_id: SessionId, turn_id: TurnId, prompt: impl Into<String>) -> Self {
-        Self { session_id, turn_id, prompt: prompt.into(), model: None, max_steps: 16 }
+        Self {
+            session_id,
+            turn_id,
+            prompt: prompt.into(),
+            model: None,
+            max_steps: 16,
+            continuation: None,
+        }
     }
 }
 
@@ -42,6 +52,8 @@ pub struct AgentRunResult {
     pub steps: u16,
     /// Whether the turn ended due to cancellation.
     pub cancelled: bool,
+    /// Opaque provider continuation for the next external turn.
+    pub continuation: Option<OpaqueContinuation>,
 }
 
 /// Agent loop failures are typed and secret-free.
@@ -87,9 +99,20 @@ where
         events: mpsc::Sender<AgentEvent>,
         cancellation: CancellationToken,
     ) -> Result<AgentRunResult, AgentError> {
+        self.run_with_broker(request, events, cancellation, &NoPermissionBroker).await
+    }
+
+    /// Execute one bounded turn with an explicit terminal-neutral permission broker.
+    pub async fn run_with_broker<P: PermissionBroker + ?Sized>(
+        &self,
+        request: AgentRequest,
+        events: mpsc::Sender<AgentEvent>,
+        cancellation: CancellationToken,
+        broker: &P,
+    ) -> Result<AgentRunResult, AgentError> {
         let mut accumulated = String::new();
         let mut input = json!([{"type":"message","role":"user","content":request.prompt}]);
-        let mut continuation: Option<OpaqueContinuation> = None;
+        let mut continuation = request.continuation.clone();
         let mut steps = 0_u16;
 
         loop {
@@ -143,24 +166,6 @@ where
                         .await?;
                     }
                     ModelEvent::ToolCall { call_id, name, arguments } => {
-                        let permission = self
-                            .tools
-                            .definitions()
-                            .iter()
-                            .find(|definition| definition.name == name)
-                            .map(|definition| definition.permission.to_string())
-                            .unwrap_or_else(|| "unknown".to_owned());
-                        send_event(
-                            &events,
-                            AgentEvent::ToolStarted {
-                                call_id: call_id.clone(),
-                                name: name.clone(),
-                                permission,
-                                operation: name.clone(),
-                                step_id: None,
-                            },
-                        )
-                        .await?;
                         tool_calls.push((call_id, name, arguments));
                     }
                     ModelEvent::Usage { input_tokens, output_tokens, total_tokens } => {
@@ -197,6 +202,7 @@ where
                     text: BoundedText::new(accumulated, DEFAULT_MAX_OUTPUT_BYTES),
                     steps,
                     cancelled: false,
+                    continuation,
                 });
             }
 
@@ -205,14 +211,91 @@ where
                 if cancellation.is_cancelled() {
                     return Err(AgentError::Cancelled);
                 }
-                let tool_future = self.tools.execute(ToolInvocation {
+                let invocation = ToolInvocation {
                     call_id: call_id.clone(),
                     name: name.clone(),
                     input: arguments,
-                });
-                let result = tokio::select! {
-                    _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-                    result = tool_future => result,
+                };
+                let permission_request = self.tools.permission_request(&invocation);
+                let permit = if let Some(permission_request) = permission_request {
+                    let needs_prompt = broker.needs_prompt(&permission_request);
+                    let decision_future = broker.decide(permission_request.clone());
+                    if needs_prompt {
+                        send_event(
+                            &events,
+                            AgentEvent::PermissionRequested { request: permission_request.clone() },
+                        )
+                        .await?;
+                    }
+                    let decision = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            broker.cancel(&call_id);
+                            return Err(AgentError::Cancelled);
+                        }
+                        decision = decision_future => decision,
+                    };
+                    if needs_prompt {
+                        send_event(
+                            &events,
+                            AgentEvent::PermissionResolved { call_id: call_id.clone(), decision },
+                        )
+                        .await?;
+                    }
+                    match decision {
+                        PermissionDecision::AllowOnce | PermissionDecision::AllowSession => {
+                            Some(ExecutionPermit::new(
+                                call_id.clone(),
+                                name.clone(),
+                                permission_request.class,
+                            ))
+                        }
+                        PermissionDecision::Deny => None,
+                    }
+                } else {
+                    let class = self
+                        .tools
+                        .definitions()
+                        .iter()
+                        .find(|definition| definition.name == name)
+                        .map(|definition| definition.permission)
+                        .unwrap_or(aether_core::PermissionClass::ReadOnly);
+                    Some(ExecutionPermit::new(call_id.clone(), name.clone(), class))
+                };
+                let permission = self
+                    .tools
+                    .definitions()
+                    .iter()
+                    .find(|definition| definition.name == name)
+                    .map(|definition| definition.permission.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                send_event(
+                    &events,
+                    AgentEvent::ToolStarted {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        permission,
+                        operation: name.clone(),
+                        step_id: None,
+                    },
+                )
+                .await?;
+                let result = if let Some(permit) = permit {
+                    let execution = self.tools.execute(
+                        invocation,
+                        ToolExecutionContext::new(cancellation.flag(), permit),
+                    );
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                        result = execution => result,
+                    }
+                } else {
+                    aether_core::ToolResult::failure(
+                        call_id.clone(),
+                        "permission_denied",
+                        "user denied permission for this operation",
+                        false,
+                        DEFAULT_MAX_OUTPUT_BYTES,
+                    )
                 };
                 send_event(
                     &events,
@@ -232,6 +315,11 @@ where
                     "call_id": call_id.as_str(),
                     "output": result.output.as_str(),
                     "ok": result.ok,
+                    "error": result.error.as_ref().map(|error| json!({
+                        "code": error.code.as_str(),
+                        "message": error.message.as_str(),
+                        "retryable": error.retryable,
+                    })),
                 }));
             }
             input = serde_json::Value::Array(outputs);
@@ -262,9 +350,19 @@ fn _tool_call_id_type_is_used(id: ToolCallId) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+    use crate::{BackendFuture, ModelCatalogItem, SessionPermissionBroker};
     use aether_core::tools::ToolFuture;
-    use aether_core::{PermissionClass, ToolDefinition, ToolResult};
+    use aether_core::{
+        ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass, ToolDefinition,
+        ToolExecutionContext, ToolResult,
+    };
+    use serde_json::json;
 
     struct FakeTools {
         definitions: Vec<ToolDefinition>,
@@ -275,7 +373,15 @@ mod tests {
             &self.definitions
         }
 
-        fn execute<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a> {
+        fn permission_request(&self, _: &ToolInvocation) -> Option<aether_core::PermissionRequest> {
+            None
+        }
+
+        fn execute<'a>(
+            &'a self,
+            invocation: ToolInvocation,
+            _: ToolExecutionContext,
+        ) -> ToolFuture<'a> {
             Box::pin(
                 async move { ToolResult::success_text(invocation.call_id, "tool output", 1024) },
             )
@@ -330,5 +436,254 @@ mod tests {
             agent.run(request, sender, cancellation).await,
             Err(AgentError::Cancelled)
         ));
+    }
+
+    #[derive(Clone, Default)]
+    struct ContinuationBackend {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl ModelBackend for ContinuationBackend {
+        fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
+            let requests = self.requests.clone();
+            Box::pin(async move {
+                requests.lock().unwrap().push(request.clone());
+                let (sender, receiver) = mpsc::channel(4);
+                sender
+                    .send(Ok(ModelEvent::TextDelta { text: "ok".to_owned() }))
+                    .await
+                    .map_err(|_| BackendError::Cancelled)?;
+                sender
+                    .send(Ok(ModelEvent::Done {
+                        continuation: Some(OpaqueContinuation(json!({
+                            "previous_response_id": request.step_id.as_str()
+                        }))),
+                    }))
+                    .await
+                    .map_err(|_| BackendError::Cancelled)?;
+                Ok(receiver)
+            })
+        }
+
+        fn discover_models<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<ModelCatalogItem>, BackendError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_turns_preserve_continuation_and_identity() {
+        let backend = ContinuationBackend::default();
+        let requests = backend.requests.clone();
+        let agent = Agent::new(backend, tools());
+        let session = SessionId::new("session-continuity").unwrap();
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let first = agent
+            .run(
+                AgentRequest::new(session.clone(), TurnId::new("turn-1").unwrap(), "first"),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut second_request =
+            AgentRequest::new(session.clone(), TurnId::new("turn-2").unwrap(), "second");
+        second_request.continuation = first.continuation.clone();
+        agent.run(second_request, sender, CancellationToken::new()).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].session_id, session);
+        assert_eq!(requests[1].session_id, requests[0].session_id);
+        assert_ne!(requests[0].turn_id, requests[1].turn_id);
+        assert!(requests[0].continuation.is_none());
+        assert_eq!(requests[1].continuation, first.continuation);
+    }
+
+    struct PermissionTools {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl ToolExecutor for PermissionTools {
+        fn definitions(&self) -> &[ToolDefinition] {
+            static DEFINITIONS: std::sync::OnceLock<Vec<ToolDefinition>> =
+                std::sync::OnceLock::new();
+            DEFINITIONS.get_or_init(|| {
+                vec![ToolDefinition {
+                    name: "write".to_owned(),
+                    description: "test write".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    permission: PermissionClass::WorkspaceWrite,
+                }]
+            })
+        }
+
+        fn permission_request(
+            &self,
+            invocation: &ToolInvocation,
+        ) -> Option<aether_core::PermissionRequest> {
+            Some(aether_core::PermissionRequest {
+                call_id: invocation.call_id.clone(),
+                tool: invocation.name.clone(),
+                class: PermissionClass::WorkspaceWrite,
+                operation: "write test file".to_owned(),
+                target: Some("test.txt".to_owned()),
+                details: json!({"path": "test.txt", "bytes": 1}),
+            })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            invocation: ToolInvocation,
+            _: ToolExecutionContext,
+        ) -> ToolFuture<'a> {
+            self.executions.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { ToolResult::success_text(invocation.call_id, "mutated", 1024) })
+        }
+    }
+
+    #[tokio::test]
+    async fn noninteractive_mutation_is_denied_before_tool_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(
+            crate::FakeBackend::new("done").with_tool_call("write", json!({"path": "test.txt"})),
+            PermissionTools { executions: executions.clone() },
+        );
+        let (sender, mut receiver) = mpsc::channel(16);
+        let result = agent
+            .run(
+                AgentRequest::new(
+                    SessionId::new("session-permission").unwrap(),
+                    TurnId::new("turn-permission").unwrap(),
+                    "write",
+                ),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
+        let mut denied = false;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(event, AgentEvent::ToolFinished { ok: false, .. }) {
+                denied = true;
+            }
+        }
+        assert!(denied);
+        assert_eq!(result.text.as_str(), "done");
+    }
+
+    #[tokio::test]
+    async fn agent_permission_event_resolves_allow_once_before_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = Arc::new(Agent::new(
+            crate::FakeBackend::new("done").with_tool_call("write", json!({"path": "test.txt"})),
+            PermissionTools { executions: executions.clone() },
+        ));
+        let broker = SessionPermissionBroker::new();
+        let (sender, mut receiver) = mpsc::channel(16);
+        let task_agent = Arc::clone(&agent);
+        let task_broker = broker.clone();
+        let task = tokio::spawn(async move {
+            task_agent
+                .run_with_broker(
+                    AgentRequest::new(
+                        SessionId::new("session-permission-event").unwrap(),
+                        TurnId::new("turn-permission-event").unwrap(),
+                        "write",
+                    ),
+                    sender,
+                    CancellationToken::new(),
+                    &task_broker,
+                )
+                .await
+        });
+        while let Some(event) = receiver.recv().await {
+            if let AgentEvent::PermissionRequested { request } = event {
+                assert!(broker.resolve(&request.call_id, PermissionDecision::AllowOnce));
+                break;
+            }
+        }
+        assert!(task.await.unwrap().is_ok());
+        assert_eq!(executions.load(Ordering::Relaxed), 1);
+    }
+
+    struct SlowTools;
+
+    impl ToolExecutor for SlowTools {
+        fn definitions(&self) -> &[ToolDefinition] {
+            static DEFINITIONS: std::sync::OnceLock<Vec<ToolDefinition>> =
+                std::sync::OnceLock::new();
+            DEFINITIONS.get_or_init(|| {
+                vec![ToolDefinition {
+                    name: "read".to_owned(),
+                    description: "slow read".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    permission: PermissionClass::ReadOnly,
+                }]
+            })
+        }
+
+        fn permission_request(&self, _: &ToolInvocation) -> Option<aether_core::PermissionRequest> {
+            None
+        }
+
+        fn execute<'a>(
+            &'a self,
+            invocation: ToolInvocation,
+            context: ToolExecutionContext,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                loop {
+                    if context.cancellation().is_cancelled() {
+                        return ToolResult::failure(
+                            invocation.call_id,
+                            "cancelled",
+                            "slow fixture cancelled",
+                            true,
+                            1024,
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_turn_waiting_on_a_tool_returns_control() {
+        let agent = Arc::new(Agent::new(
+            crate::FakeBackend::default().with_tool_call("read", json!({"files": []})),
+            SlowTools,
+        ));
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (sender, _receiver) = mpsc::channel(16);
+        let task_agent = Arc::clone(&agent);
+        let task = tokio::spawn(async move {
+            task_agent
+                .run(
+                    AgentRequest::new(
+                        SessionId::new("session-tool-cancel").unwrap(),
+                        TurnId::new("turn-tool-cancel").unwrap(),
+                        "read",
+                    ),
+                    sender,
+                    task_cancellation,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cancellation.cancel();
+        assert!(matches!(task.await.unwrap(), Err(AgentError::Cancelled)));
     }
 }

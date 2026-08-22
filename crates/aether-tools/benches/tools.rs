@@ -1,8 +1,10 @@
-use std::{fs, hint::black_box, path::PathBuf, process::Command};
+use std::{fs, hint::black_box, path::PathBuf, process::Command, time::Duration};
 
-use aether_agent::SessionStore;
+use aether_agent::{AgentRequest, PermissionBroker, SessionPermissionBroker, SessionStore};
 use aether_core::{
-    AgentEvent, BoundedText, SessionId, SessionLine, SessionRecord, ToolCallId, ToolInvocation,
+    AgentEvent, BoundedText, OpaqueContinuation, PermissionClass, PermissionDecision,
+    PermissionEngine, PermissionPolicy, PermissionRequest, SessionId, SessionLine, SessionRecord,
+    ToolCallId, ToolInvocation,
 };
 use aether_terminal::Renderer;
 use aether_tools::{ToolRegistry, apply_patch_text};
@@ -16,6 +18,17 @@ fn workspace_root() -> PathBuf {
 
 fn registry() -> ToolRegistry {
     ToolRegistry::new(workspace_root()).expect("benchmark workspace")
+}
+
+fn writable_registry(root: &PathBuf) -> ToolRegistry {
+    ToolRegistry::with_policy(root, PermissionEngine::new(PermissionPolicy::allow_all()))
+        .expect("benchmark writable workspace")
+}
+
+fn temporary_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("aether-bench-{label}-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("benchmark temp root");
+    root
 }
 
 fn invocation(name: &str, input: serde_json::Value, number: u64) -> ToolInvocation {
@@ -148,7 +161,145 @@ fn tool_operations(c: &mut Criterion) {
             )))
         })
     });
+    group.bench_function("blocking_dispatch_overhead", |b| {
+        b.iter(|| {
+            runtime.block_on(registry.dispatch(invocation(
+                "read",
+                json!({"files": [{"path": "Cargo.toml", "start_line": 1, "end_line": 1}]}),
+                8,
+            )))
+        })
+    });
     group.finish();
+}
+
+fn cancellation_permission_and_continuation(c: &mut Criterion) {
+    c.bench_function("cooperative_search_cancellation_check", |b| {
+        let cancellation = aether_core::CancellationFlag::new();
+        b.iter(|| black_box(cancellation.check()))
+    });
+
+    let runtime = Builder::new_current_thread().enable_all().build().expect("benchmark runtime");
+    let broker = SessionPermissionBroker::new();
+    c.bench_function("permission_decision", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let request = PermissionRequest {
+                    call_id: ToolCallId::new("bench-permission").expect("benchmark id"),
+                    tool: "write".to_owned(),
+                    class: PermissionClass::WorkspaceWrite,
+                    operation: "write".to_owned(),
+                    target: Some("bench.txt".to_owned()),
+                    details: json!({"bytes": 1}),
+                };
+                let call_id = request.call_id.clone();
+                let decision = broker.decide(request);
+                let _ = broker.resolve(&call_id, PermissionDecision::AllowOnce);
+                black_box(decision.await)
+            })
+        })
+    });
+
+    c.bench_function("multi_turn_bookkeeping", |b| {
+        let session = SessionId::new("bench-session").expect("benchmark id");
+        b.iter(|| {
+            let mut request = AgentRequest::new(
+                session.clone(),
+                aether_core::TurnId::new("turn-2").expect("benchmark id"),
+                "continue",
+            );
+            request.continuation = Some(OpaqueContinuation(json!({
+                "previous_response_id": "resp-bench"
+            })));
+            black_box(request)
+        })
+    });
+}
+
+fn atomic_and_staged_writes(c: &mut Criterion) {
+    let runtime = Builder::new_current_thread().enable_all().build().expect("benchmark runtime");
+    let root = temporary_root("writes");
+    let registry = writable_registry(&root);
+    fs::write(root.join("atomic.txt"), "old\n").expect("benchmark fixture");
+    c.bench_function("atomic_write", |b| {
+        b.iter(|| {
+            black_box(runtime.block_on(registry.dispatch(invocation(
+                "write",
+                json!({"path": "atomic.txt", "content": "new\n"}),
+                9,
+            ))))
+        })
+    });
+
+    c.bench_function("patch_staged_application", |b| {
+        b.iter(|| {
+            fs::write(root.join("patch.txt"), "first\nold\n").expect("benchmark fixture");
+            black_box(runtime.block_on(registry.dispatch(invocation(
+                "patch",
+                json!({"files": [{
+                    "path": "patch.txt",
+                    "hunks": [{
+                        "old_start": 2,
+                        "old_count": 1,
+                        "new_start": 2,
+                        "new_count": 1,
+                        "lines": ["-old", "+new"]
+                    }]
+                }]}),
+                10,
+            ))))
+        })
+    });
+    runtime.block_on(registry.workspace().shutdown_processes());
+    let _ = fs::remove_dir_all(root);
+}
+
+fn process_buffer_and_registry(c: &mut Criterion) {
+    let runtime = Builder::new_current_thread().enable_all().build().expect("benchmark runtime");
+    let root = temporary_root("process");
+    let registry = writable_registry(&root);
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/C".to_owned(), "for /L %i in (1,1,100000) do @echo x".to_owned()])
+    } else {
+        ("yes", vec!["x".to_owned()])
+    };
+    let started = runtime.block_on(registry.dispatch(invocation(
+        "process",
+        json!({"operation": "start", "program": program, "args": args}),
+        11,
+    )));
+    if !started.ok {
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    let process_id =
+        started.data.expect("process data")["process_id"].as_u64().expect("process id");
+    runtime.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
+    c.bench_function("process_buffer_read", |b| {
+        b.iter(|| {
+            black_box(runtime.block_on(registry.dispatch(invocation(
+                "process",
+                json!({
+                    "operation": "read",
+                    "process_id": process_id,
+                    "max_bytes": 4096,
+                    "timeout_ms": 10
+                }),
+                12,
+            ))))
+        })
+    });
+    c.bench_function("process_registry_lookup", |b| {
+        b.iter(|| {
+            black_box(runtime.block_on(registry.dispatch(invocation(
+                "process",
+                json!({"operation": "status", "process_id": process_id}),
+                13,
+            ))))
+        })
+    });
+    runtime.block_on(registry.workspace().shutdown_processes());
+    let _ = fs::remove_dir_all(root);
 }
 
 fn search_comparison(c: &mut Criterion) {
@@ -229,6 +380,9 @@ criterion_group!(
     terminal_renderer,
     event_dispatch,
     tool_operations,
+    cancellation_permission_and_continuation,
+    atomic_and_staged_writes,
+    process_buffer_and_registry,
     search_comparison,
     patch_operations,
     session_replay

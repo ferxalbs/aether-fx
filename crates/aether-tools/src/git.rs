@@ -1,9 +1,9 @@
 use std::{process::Stdio, time::Duration};
 
-use aether_core::ToolCallId;
+use aether_core::{CoreError, PermissionClass, ToolCallId, ToolExecutionContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, time::sleep};
 
 use crate::{
     common::{ToolInternalError, Workspace, bounded_limit},
@@ -35,15 +35,37 @@ pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: GitInput = match workspace.parse(&input) {
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
-    let args = match git_args(workspace, &parsed) {
-        Ok(value) => value,
-        Err(error) => return workspace.result_error(call_id, error),
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "git", PermissionClass::ReadOnly)
+    {
+        return workspace.result_error(call_id, error);
+    }
+    let cancellation = context.cancellation().clone();
+    let args = match tokio::task::spawn_blocking({
+        let workspace = workspace.clone();
+        let parsed = parsed.clone();
+        move || git_args(&workspace, &parsed)
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return workspace.result_error(call_id, error),
+        Err(error) => {
+            return workspace.result_error(
+                call_id,
+                ToolInternalError::Input(format!("git path worker failed: {error}")),
+            );
+        }
     };
+    if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+        return workspace.result_error(call_id, error);
+    }
     let limit = bounded_limit(None, workspace.max_output_bytes());
     let mut command = Command::new("git");
     command
@@ -80,13 +102,30 @@ pub(crate) async fn execute(
     };
     let stdout_task = tokio::spawn(read_bounded(stdout, limit));
     let stderr_task = tokio::spawn(read_bounded(stderr, limit));
-    let status = match timeout(Duration::from_secs(120), child.wait()).await {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => return workspace.result_error(call_id, error.into()),
-        Err(_) => {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut child_wait = Box::pin(child.wait());
+    let (status, timed_out) = loop {
+        if cancellation.is_cancelled() {
+            drop(child_wait);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return workspace.result_error(call_id, ToolInternalError::Timeout);
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return workspace.result_error(call_id, ToolInternalError::Core(CoreError::Cancelled));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            drop(child_wait);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            break (None, true);
+        }
+        tokio::select! {
+            result = &mut child_wait => match result {
+                Ok(status) => break (Some(status), false),
+                Err(error) => return workspace.result_error(call_id, error.into()),
+            },
+            _ = sleep(remaining.min(Duration::from_millis(10))) => {}
         }
     };
     let stdout = match stdout_task.await {
@@ -109,12 +148,12 @@ pub(crate) async fn execute(
         program: "git".to_owned(),
         args,
         cwd: ".".to_owned(),
-        exit_code: status.code(),
-        success: status.success(),
+        exit_code: status.as_ref().and_then(std::process::ExitStatus::code),
+        success: !timed_out && status.is_some_and(|status| status.success()),
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
         duration_ms: 0,
-        timed_out: false,
+        timed_out,
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
     };

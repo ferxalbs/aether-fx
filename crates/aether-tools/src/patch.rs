@@ -1,10 +1,13 @@
-use std::fs;
+use std::{collections::HashSet, fs::File, io::Read, path::PathBuf};
 
-use aether_core::{PermissionClass, ToolCallId};
+use aether_core::{CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::{MAX_INPUT_BYTES, Workspace, atomic_write, hash_bytes, hash_file};
+use crate::common::{
+    MAX_INPUT_BYTES, StagedReplacement, ToolInternalError, Workspace, atomic_write, hash_bytes,
+    hash_file, install_replacement, spawn_blocking_tool, stage_replacement,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PatchInput {
@@ -42,10 +45,13 @@ pub struct PatchFileOutput {
     pub changed: bool,
 }
 
+type PreparedFile = (String, PathBuf, Vec<u8>, String, Vec<u8>);
+
 pub(crate) async fn execute(
     workspace: &Workspace,
     call_id: ToolCallId,
     input: Value,
+    context: ToolExecutionContext,
 ) -> aether_core::ToolResult {
     let parsed: PatchInput = match workspace.parse(&input) {
         Ok(value) => value,
@@ -54,42 +60,59 @@ pub(crate) async fn execute(
     if parsed.files.is_empty() || parsed.files.len() > 64 {
         return workspace.result_error(
             call_id,
-            crate::common::ToolInternalError::Input("patch requires 1..=64 files".to_owned()),
+            ToolInternalError::Input("patch requires 1..=64 files".to_owned()),
         );
     }
+    if let Err(error) =
+        workspace.require_permit(&context, &call_id, "patch", PermissionClass::WorkspaceWrite)
+    {
+        return workspace.result_error(call_id, error);
+    }
+    spawn_blocking_tool(workspace, call_id, &context, move |workspace, call_id, cancellation| {
+        execute_blocking(workspace, call_id, parsed, cancellation)
+    })
+    .await
+}
+
+fn execute_blocking(
+    workspace: Workspace,
+    call_id: ToolCallId,
+    parsed: PatchInput,
+    cancellation: CancellationFlag,
+) -> aether_core::ToolResult {
     let mut prepared = Vec::with_capacity(parsed.files.len());
+    let mut seen = HashSet::with_capacity(parsed.files.len());
     for file in &parsed.files {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
         if file.hunks.is_empty() || file.hunks.len() > 256 {
             return workspace.result_error(
                 call_id,
-                crate::common::ToolInternalError::Input(
-                    "each patch file requires 1..=256 hunks".to_owned(),
-                ),
+                ToolInternalError::Input("each patch file requires 1..=256 hunks".to_owned()),
             );
         }
         let (display, path) = match workspace.resolve_for_write(&file.path) {
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error),
         };
-        let old_bytes = match fs::read(&path) {
-            Ok(value) => value,
-            Err(error) => return workspace.result_error(call_id, error.into()),
-        };
-        if old_bytes.len() > MAX_INPUT_BYTES {
+        if !seen.insert(display.clone()) {
             return workspace.result_error(
                 call_id,
-                crate::common::ToolInternalError::Input(
-                    "patch source exceeds the bounded input limit".to_owned(),
-                ),
+                ToolInternalError::Input(format!("patch contains duplicate file {display}")),
             );
         }
+        let old_bytes = match read_bounded_file(&path, &cancellation) {
+            Ok(value) => value,
+            Err(error) => return workspace.result_error(call_id, error),
+        };
         let old_hash = hash_bytes(&old_bytes);
         if let Some(expected_hash) = file.expected_hash.as_deref()
             && expected_hash != old_hash
         {
             return workspace.result_error(
                 call_id,
-                crate::common::ToolInternalError::Input(format!(
+                ToolInternalError::Input(format!(
                     "patch precondition failed for {display}: file hash changed"
                 )),
             );
@@ -99,9 +122,7 @@ pub(crate) async fn execute(
             Err(_) => {
                 return workspace.result_error(
                     call_id,
-                    crate::common::ToolInternalError::Input(format!(
-                        "{display} is not valid UTF-8"
-                    )),
+                    ToolInternalError::Input(format!("{display} is not valid UTF-8")),
                 );
             }
         };
@@ -110,30 +131,17 @@ pub(crate) async fn execute(
             Err(error) => {
                 return workspace.result_error(
                     call_id,
-                    crate::common::ToolInternalError::Input(format!("{display}: {error}")),
+                    ToolInternalError::Input(format!("{display}: {error}")),
                 );
             }
         };
         if new_bytes.len() > MAX_INPUT_BYTES {
             return workspace.result_error(
                 call_id,
-                crate::common::ToolInternalError::Input(
-                    "patch result exceeds the bounded input limit".to_owned(),
-                ),
+                ToolInternalError::Input("patch result exceeds the bounded input limit".to_owned()),
             );
         }
         prepared.push((display, path, old_bytes, old_hash, new_bytes));
-    }
-    if let Err(error) = workspace.authorize(
-        PermissionClass::WorkspaceWrite,
-        if parsed.dry_run.unwrap_or(false) { "validate patch" } else { "apply patch" },
-        None,
-        serde_json::json!({
-            "files": prepared.iter().map(|entry| entry.0.as_str()).collect::<Vec<_>>(),
-            "dry_run": parsed.dry_run.unwrap_or(false)
-        }),
-    ) {
-        return workspace.result_error(call_id, error);
     }
     let dry_run = parsed.dry_run.unwrap_or(false);
     let outputs: Vec<PatchFileOutput> = prepared
@@ -145,26 +153,91 @@ pub(crate) async fn execute(
             changed: new_bytes != old_bytes,
         })
         .collect();
-    if !dry_run {
-        let mut applied: Vec<(&std::path::Path, &[u8])> = Vec::new();
-        for (_, path, old_bytes, _, new_bytes) in &prepared {
-            if old_bytes == new_bytes {
-                continue;
-            }
-            if let Err(error) = atomic_write(path, new_bytes) {
-                for (rollback_path, rollback_bytes) in applied.iter().rev() {
-                    let _ = atomic_write(rollback_path, rollback_bytes);
-                }
-                return workspace.result_error(call_id, error);
-            }
-            applied.push((path, old_bytes));
-        }
+    if !dry_run && let Err(error) = commit_prepared(&prepared, &cancellation) {
+        return workspace.result_error(call_id, error);
     }
     aether_core::ToolResult::success_json(
         call_id,
         serde_json::json!(PatchOutput { dry_run, files: outputs }),
         workspace.max_output_bytes(),
     )
+}
+
+fn commit_prepared(
+    prepared: &[PreparedFile],
+    cancellation: &CancellationFlag,
+) -> Result<(), ToolInternalError> {
+    let mut staged = Vec::<(PathBuf, Vec<u8>, StagedReplacement)>::new();
+    for (_, path, old_bytes, _, new_bytes) in prepared {
+        if old_bytes == new_bytes {
+            continue;
+        }
+        match stage_replacement(path, new_bytes, cancellation) {
+            Ok(replacement) => staged.push((path.clone(), old_bytes.clone(), replacement)),
+            Err(error) => {
+                for (_, _, replacement) in &staged {
+                    replacement.cleanup();
+                }
+                return Err(error);
+            }
+        }
+    }
+    let mut applied = Vec::<(PathBuf, Vec<u8>)>::new();
+    for (path, old_bytes, replacement) in &staged {
+        let commit_result = install_replacement(replacement, cancellation);
+        match commit_result {
+            Ok(()) => applied.push((path.clone(), old_bytes.clone())),
+            Err(error) => {
+                for (_, _, pending) in &staged {
+                    pending.cleanup();
+                }
+                return finish_commit_failure(error, &applied);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn finish_commit_failure(
+    commit_error: ToolInternalError,
+    applied: &[(PathBuf, Vec<u8>)],
+) -> Result<(), ToolInternalError> {
+    let rollback_flag = CancellationFlag::new();
+    let mut results = Vec::new();
+    for (path, bytes) in applied.iter().rev() {
+        match atomic_write(path, bytes, &rollback_flag) {
+            Ok(()) => results.push(format!("{}: restored", path.display())),
+            Err(error) => results.push(format!("{}: rollback failed: {error}", path.display())),
+        }
+    }
+    if results.iter().all(|result| result.ends_with(": restored")) {
+        Err(commit_error)
+    } else {
+        Err(ToolInternalError::RollbackFailed { commit: commit_error.to_string(), results })
+    }
+}
+
+fn read_bounded_file(
+    path: &std::path::Path,
+    cancellation: &CancellationFlag,
+) -> Result<Vec<u8>, ToolInternalError> {
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        cancellation.check().map_err(ToolInternalError::Core)?;
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > MAX_INPUT_BYTES {
+            return Err(ToolInternalError::Input(
+                "patch source exceeds the bounded input limit".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    Ok(bytes)
 }
 
 pub fn apply_patch_text(source: &str, hunks: &[PatchHunk]) -> Result<String, String> {
@@ -199,6 +272,9 @@ pub fn apply_patch_text(source: &str, hunks: &[PatchHunk]) -> Result<String, Str
         let mut new_seen = 0usize;
         let mut source_index = start;
         for line in &hunk.lines {
+            if line.is_empty() {
+                return Err("hunk lines must begin with space, plus, or minus".to_owned());
+            }
             let (kind, content) = line.split_at(1);
             match kind {
                 " " => {
@@ -239,7 +315,7 @@ pub fn apply_patch_text(source: &str, hunks: &[PatchHunk]) -> Result<String, Str
 
 #[allow(dead_code)]
 fn _hash_file_is_available(path: &std::path::Path) -> bool {
-    hash_file(path).is_ok()
+    hash_file(path, &CancellationFlag::new()).is_ok()
 }
 
 #[cfg(test)]
@@ -268,5 +344,22 @@ mod tests {
             lines: vec!["-old".to_owned(), "+new".to_owned()],
         };
         assert_eq!(apply_patch_text("first\nold\n", &[hunk]).unwrap(), "first\nnew\n");
+    }
+
+    #[test]
+    fn rollback_restores_an_already_committed_file() {
+        let root =
+            std::env::temp_dir().join(format!("aether-patch-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("file.txt");
+        std::fs::write(&path, "new").unwrap();
+        let applied = vec![(path.clone(), b"old".to_vec())];
+        let result = finish_commit_failure(
+            ToolInternalError::Input("simulated commit failure".to_owned()),
+            &applied,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

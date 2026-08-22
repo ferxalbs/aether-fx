@@ -3,7 +3,7 @@
 All notable AETHER Fx changes are recorded here. This project is still in
 foundational bootstrap, so the current work remains unreleased.
 
-## Unreleased - 2026-08-21 - Foundational bootstrap and runtime hardening
+## Unreleased - 2026-08-21 (1) - Foundational bootstrap and runtime hardening
 
 > Status: unreleased foundational work. No artifact has been published.
 
