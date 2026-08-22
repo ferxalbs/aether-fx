@@ -3,6 +3,52 @@
 All notable AETHER Fx changes are recorded here. The project remains
 unreleased, with changes grouped by implementation phase.
 
+## Unreleased - 2026-08-22 (3) - Phase 1.1 correctness closure
+
+> Status: unreleased Phase 1.1 work. No artifact has been published.
+
+### Fixed
+
+- Closed same-path AETHER `write`/`patch` mutation races with weak-reference
+  per-destination coordination and deterministic multi-file lock ordering.
+- Made `create_only` use commit-time no-replace installation and strengthened
+  filesystem precondition revalidation before staged commits.
+- Preserved persistent-process tracking until termination is confirmed and
+  surfaced kill, wait, timeout, and session-cleanup failures.
+- Made Ctrl+C during permission approval cancel the active turn, clean pending
+  broker state, and remain distinct from ordinary denial.
+- Rejected Rainy streams that end without a valid terminal response event and
+  prevented truncated tool calls from executing.
+
+### Changed
+
+- Updated the six-target CI matrix to execute native workspace tests in
+  addition to centralized quality and policy gates.
+- Made process drain-task ownership and bounded five-second termination waits
+  explicit in the runtime behavior.
+
+### Security
+
+- Strengthened mutation precondition handling and process-lifecycle failure
+  reporting without claiming cross-process compare-and-swap guarantees.
+
+### Performance
+
+- Re-ran the existing benchmark suite and recorded current local measurements
+  and observed regression signals in `docs/performance.md`.
+
+### Documentation
+
+- Documented atomic replacement versus atomic create-if-absent, optimistic
+  content preconditions, process cleanup aggregation, permission cancellation,
+  native CI execution, and Rainy terminal-stream handling.
+
+### Known Limitations
+
+- An arbitrary external process can still mutate the filesystem namespace in
+  the final window after AETHER revalidation and before the atomic OS call;
+  same-path AETHER races are serialized and the limitation is documented.
+
 ## Unreleased - 2026-08-22 (2) - Phase 1 native runtime hardening and interactive agent
 
 > Status: unreleased Phase 1 work. No artifact has been published.

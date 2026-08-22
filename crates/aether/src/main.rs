@@ -10,12 +10,11 @@ use aether_agent::{
     NoPermissionBroker, PermissionBroker, SessionPermissionBroker,
 };
 use aether_core::{
-    AgentEvent, BoundedText, OpaqueContinuation, PermissionDecision, SessionId, ToolExecutor,
-    TurnId,
+    AgentEvent, BoundedText, OpaqueContinuation, PermissionRequest, SessionId, ToolExecutor, TurnId,
 };
 use aether_rainy::RainyBackend;
 use aether_terminal::Renderer;
-use aether_tools::ToolRegistry;
+use aether_tools::{ProcessShutdownReport, ToolRegistry};
 use thiserror::Error;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
@@ -202,9 +201,15 @@ async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Res
     request.model = Some(model);
     let mut renderer = Renderer::new();
     let broker = NoPermissionBroker;
-    let _ = run_agent_turn(&agent, request, &broker, None, &mut renderer).await?;
-    workspace.shutdown_processes().await;
-    Ok(())
+    let turn_result = run_agent_turn(&agent, request, &broker, None, &mut renderer).await;
+    let cleanup = workspace.shutdown_processes().await;
+    if let Err(error) = turn_result {
+        if !cleanup.is_clean() {
+            report_shutdown_failure(&cleanup);
+        }
+        return Err(error);
+    }
+    finish_shutdown(cleanup)
 }
 
 /// Keep the prompt local and visible before constructing the network backend.
@@ -254,8 +259,32 @@ async fn run_interactive(model: Option<String>, root: PathBuf) -> Result<(), App
         Ok::<(), AppError>(())
     }
     .await;
-    workspace.shutdown_processes().await;
-    session_result
+    let cleanup = workspace.shutdown_processes().await;
+    if !cleanup.is_clean() {
+        report_shutdown_failure(&cleanup);
+    }
+    match session_result {
+        Err(error) => Err(error),
+        Ok(()) if cleanup.is_clean() => Ok(()),
+        Ok(()) => Err(AppError::Message("owned process cleanup failed".to_owned())),
+    }
+}
+
+fn finish_shutdown(report: ProcessShutdownReport) -> Result<(), AppError> {
+    if report.is_clean() {
+        Ok(())
+    } else {
+        report_shutdown_failure(&report);
+        Err(AppError::Message("owned process cleanup failed".to_owned()))
+    }
+}
+
+fn report_shutdown_failure(report: &ProcessShutdownReport) {
+    eprintln!(
+        "AETHER Fx: HIGH-SEVERITY owned process cleanup failure ({} remaining): {}",
+        report.failures.len(),
+        report.failure_summary()
+    );
 }
 
 async fn read_prompt() -> Result<Option<String>, AppError> {
@@ -315,15 +344,18 @@ where
                         renderer.render_if_due(&mut stdout, true)?;
                     }
                     let request_for_prompt = request.clone();
-                    let decision = tokio::task::spawn_blocking(move || {
+                    let outcome = tokio::task::spawn_blocking(move || {
                         aether_terminal::prompt_permission(&request_for_prompt)
                     })
                     .await
-                    .map_err(|error| AppError::Message(format!("permission worker failed: {error}")))??
-                    .unwrap_or(PermissionDecision::Deny);
-                    if let Some(resolver) = resolver {
-                        let _ = resolver.resolve(&request.call_id, decision);
-                    }
+                    .map_err(|error| AppError::Message(format!("permission worker failed: {error}")))??;
+                    handle_permission_outcome(
+                        outcome,
+                        request,
+                        broker,
+                        resolver,
+                        &cancellation,
+                    );
                 } else {
                     let mut stdout = io::stdout().lock();
                     renderer.handle(&event, &mut stdout)?;
@@ -358,6 +390,27 @@ where
     }
 }
 
+fn handle_permission_outcome(
+    outcome: aether_terminal::PermissionPromptOutcome,
+    request: &PermissionRequest,
+    broker: &dyn PermissionBroker,
+    resolver: Option<&SessionPermissionBroker>,
+    cancellation: &CancellationToken,
+) {
+    match outcome {
+        aether_terminal::PermissionPromptOutcome::Decision(decision) => {
+            if let Some(resolver) = resolver {
+                let _ = resolver.resolve(&request.call_id, decision);
+            }
+        }
+        aether_terminal::PermissionPromptOutcome::CancelTurn
+        | aether_terminal::PermissionPromptOutcome::EndOfInput => {
+            cancellation.cancel();
+            broker.cancel(&request.call_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +425,30 @@ mod tests {
         assert_eq!(configured_model_from(None, Some("env-model".to_owned())).unwrap(), "env-model");
         let error = configured_model_from(None, None).unwrap_err().to_string();
         assert!(error.contains("--model") && error.contains("AETHER_MODEL"));
+    }
+
+    #[tokio::test]
+    async fn permission_ctrl_c_cancels_turn_and_removes_pending_request() {
+        let broker = SessionPermissionBroker::new();
+        let request = PermissionRequest {
+            call_id: aether_core::ToolCallId::new("permission-cancel").unwrap(),
+            tool: "write".to_owned(),
+            class: aether_core::PermissionClass::WorkspaceWrite,
+            operation: "write".to_owned(),
+            target: Some("file.txt".to_owned()),
+            details: Default::default(),
+        };
+        let decision = broker.decide(request.clone());
+        let cancellation = CancellationToken::new();
+        handle_permission_outcome(
+            aether_terminal::PermissionPromptOutcome::CancelTurn,
+            &request,
+            &broker,
+            Some(&broker),
+            &cancellation,
+        );
+        assert!(cancellation.is_cancelled());
+        assert!(!broker.resolve(&request.call_id, aether_core::PermissionDecision::AllowOnce));
+        assert_eq!(decision.await, aether_core::PermissionDecision::Deny);
     }
 }

@@ -20,7 +20,9 @@ pub use find::{FindInput, FindOutput};
 pub use git::{GitInput, GitOperation, GitOutput};
 pub use list::{ListEntry, ListInput, ListOutput};
 pub use patch::{PatchFile, PatchHunk, PatchInput, PatchOutput, apply_patch_text};
-pub use process::{ProcessInput, ProcessOperation, ProcessOutput};
+pub use process::{
+    ProcessInput, ProcessOperation, ProcessOutput, ProcessShutdownFailure, ProcessShutdownReport,
+};
 pub use read::{ReadFile, ReadInput, ReadLine, ReadTarget};
 pub use schema::{TOOL_NAMES, ToolRegistry};
 pub use search::{SearchInput, SearchMatch, SearchOutput};
@@ -240,6 +242,91 @@ mod tests {
         assert!(!result.ok);
         assert_eq!(result.error.unwrap().code, "invalid_input");
         assert_eq!(fs::read_to_string(root.join("guarded.txt")).unwrap(), "original");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn create_only_fails_without_replacing_existing_destination() {
+        let root = test_root();
+        fs::write(root.join("existing.txt"), "keep").unwrap();
+        let registry = registry(&root, true);
+        let result = registry
+            .dispatch(call(
+                "write",
+                serde_json::json!({
+                    "path": "existing.txt",
+                    "content": "replace",
+                    "create_only": true
+                }),
+                60,
+            ))
+            .await;
+        assert!(!result.ok);
+        assert_eq!(result.error.unwrap().code, "already_exists");
+        assert_eq!(fs::read_to_string(root.join("existing.txt")).unwrap(), "keep");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_destination_are_not_torn() {
+        let root = test_root();
+        let registry = Arc::new(registry(&root, true));
+        let first = Arc::clone(&registry);
+        let second = Arc::clone(&registry);
+        let (left, right) = tokio::join!(
+            first.dispatch(call(
+                "write",
+                serde_json::json!({"path": "same.txt", "content": "left\n"}),
+                61,
+            )),
+            second.dispatch(call(
+                "write",
+                serde_json::json!({"path": "same.txt", "content": "right\n"}),
+                62,
+            )),
+        );
+        assert!(left.ok, "{}", left.output.as_str());
+        assert!(right.ok, "{}", right.output.as_str());
+        let content = fs::read_to_string(root.join("same.txt")).unwrap();
+        assert!(content == "left\n" || content == "right\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_write_and_patch_to_one_destination_are_not_torn() {
+        let root = test_root();
+        fs::write(root.join("same.txt"), "old\n").unwrap();
+        let registry = Arc::new(registry(&root, true));
+        let hash = blake3::hash(b"old\n").to_hex().to_string();
+        let writer = Arc::clone(&registry);
+        let patcher = Arc::clone(&registry);
+        let (write, patch) = tokio::join!(
+            writer.dispatch(call(
+                "write",
+                serde_json::json!({"path": "same.txt", "content": "written\n"}),
+                63,
+            )),
+            patcher.dispatch(call(
+                "patch",
+                serde_json::json!({
+                    "files": [{
+                        "path": "same.txt",
+                        "expected_hash": hash,
+                        "hunks": [{
+                            "old_start": 1,
+                            "old_count": 1,
+                            "new_start": 1,
+                            "new_count": 1,
+                            "lines": ["-old", "+patched"]
+                        }]
+                    }]
+                }),
+                64,
+            )),
+        );
+        assert!(write.ok || patch.ok);
+        let content = fs::read_to_string(root.join("same.txt")).unwrap();
+        assert!(content == "written\n" || content == "patched\n");
         let _ = fs::remove_dir_all(root);
     }
 

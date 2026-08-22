@@ -95,6 +95,11 @@ impl SessionPermissionBroker {
             .map(|state| state.session_grants.contains(&(tool.to_owned(), class)))
             .unwrap_or(false)
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.state.lock().map(|state| state.pending.len()).unwrap_or(0)
+    }
 }
 
 impl PermissionBroker for SessionPermissionBroker {
@@ -157,5 +162,16 @@ mod tests {
             PermissionClass::ProcessExecute
         )));
         assert!(broker.needs_prompt(&request("write-3", "write", PermissionClass::WorkspaceWrite)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_removes_pending_permission() {
+        let broker = SessionPermissionBroker::new();
+        let request = request("cancel-1", "write", PermissionClass::WorkspaceWrite);
+        let decision = broker.decide(request.clone());
+        assert_eq!(broker.pending_count(), 1);
+        broker.cancel(&request.call_id);
+        assert_eq!(broker.pending_count(), 0);
+        assert_eq!(decision.await, PermissionDecision::Deny);
     }
 }

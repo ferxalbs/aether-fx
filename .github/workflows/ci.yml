@@ -70,23 +70,29 @@ jobs:
           if-no-files-found: error
 
   primary-targets:
-    name: Build ${{ matrix.target }}
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
+            name: Test Windows x64
           - target: aarch64-pc-windows-msvc
             runner: windows-11-vs2026-arm
+            name: Test Windows ARM64
           - target: x86_64-apple-darwin
             runner: macos-26-intel
+            name: Test macOS Intel
           - target: aarch64-apple-darwin
             runner: macos-26
+            name: Test macOS ARM64
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
+            name: Test Linux x64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            name: Test Linux ARM64
     runs-on: ${{ matrix.runner }}
     steps:
       # actions/checkout v6.0.2
@@ -97,5 +103,5 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Compile target
-        run: cargo build --workspace --locked --target ${{ matrix.target }}
+      - name: Native workspace tests
+        run: cargo test --workspace --all-features --locked --target ${{ matrix.target }}

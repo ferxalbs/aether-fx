@@ -24,6 +24,15 @@ pub enum BackendError {
     /// A backend payload could not be adapted.
     #[error("backend payload mapping failed: {message}")]
     Mapping { message: String },
+    /// The provider ended a stream without a successful terminal response event.
+    #[error("backend response stream incomplete: {message}")]
+    IncompleteStream { message: String },
+    /// The provider emitted an explicit failed terminal response.
+    #[error("backend response failed: {message}")]
+    ResponseFailed { message: String },
+    /// The provider emitted an explicit incomplete terminal response.
+    #[error("backend response incomplete: {message}")]
+    ResponseIncomplete { message: String },
     /// The backend is not available in this build/configuration.
     #[error("backend feature unavailable: {feature}")]
     FeatureUnavailable { feature: String },

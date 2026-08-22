@@ -4,6 +4,13 @@ use aether_core::{PermissionDecision, PermissionRequest};
 
 use crate::{input, platform};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PermissionPromptOutcome {
+    Decision(PermissionDecision),
+    CancelTurn,
+    EndOfInput,
+}
+
 /// RAII guard that restores terminal modes on every normal/unwinding exit.
 pub struct TerminalGuard {
     state: Option<platform::State>,
@@ -59,9 +66,9 @@ pub fn run_minimal_shell() -> io::Result<Option<String>> {
 }
 
 /// Present one structured permission request using the same monochrome terminal substrate.
-pub fn prompt_permission(request: &PermissionRequest) -> io::Result<Option<PermissionDecision>> {
+pub fn prompt_permission(request: &PermissionRequest) -> io::Result<PermissionPromptOutcome> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(None);
+        return Ok(PermissionPromptOutcome::EndOfInput);
     }
     let mut guard = TerminalGuard::enter()?;
     let mut stdout = io::stdout().lock();
@@ -75,26 +82,54 @@ pub fn prompt_permission(request: &PermissionRequest) -> io::Result<Option<Permi
     }
     stdout.write_all(b"\n\n[y] allow once\n[s] allow session\n[n] deny\n")?;
     stdout.flush()?;
-    let decision = loop {
-        match input::read_event(&mut io::stdin().lock())? {
+    let decision = read_permission_outcome(&mut io::stdin().lock())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    guard.restore()?;
+    Ok(decision)
+}
+
+fn read_permission_outcome<R: io::Read>(reader: &mut R) -> io::Result<PermissionPromptOutcome> {
+    loop {
+        match input::read_event(reader)? {
             Some(input::InputEvent::Character('y' | 'Y')) => {
-                break Some(PermissionDecision::AllowOnce);
+                return Ok(PermissionPromptOutcome::Decision(PermissionDecision::AllowOnce));
             }
             Some(input::InputEvent::Character('s' | 'S')) => {
-                break Some(PermissionDecision::AllowSession);
+                return Ok(PermissionPromptOutcome::Decision(PermissionDecision::AllowSession));
             }
-            Some(input::InputEvent::Character('n' | 'N'))
-            | Some(input::InputEvent::CtrlC)
-            | Some(input::InputEvent::CtrlD)
-            | None => break Some(PermissionDecision::Deny),
+            Some(input::InputEvent::Character('n' | 'N')) => {
+                return Ok(PermissionPromptOutcome::Decision(PermissionDecision::Deny));
+            }
+            Some(input::InputEvent::CtrlC) => return Ok(PermissionPromptOutcome::CancelTurn),
+            Some(input::InputEvent::CtrlD) | None => {
+                return Ok(PermissionPromptOutcome::EndOfInput);
+            }
             Some(input::InputEvent::Enter)
             | Some(input::InputEvent::Backspace)
             | Some(input::InputEvent::Escape)
             | Some(input::InputEvent::Character(_)) => {}
         }
-    };
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    guard.restore()?;
-    Ok(decision)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_ctrl_c_is_terminal_turn_cancellation() {
+        assert_eq!(
+            read_permission_outcome(&mut b"\x03".as_slice()).unwrap(),
+            PermissionPromptOutcome::CancelTurn
+        );
+    }
+
+    #[test]
+    fn permission_deny_remains_distinct_from_ctrl_c() {
+        assert_eq!(
+            read_permission_outcome(&mut b"n".as_slice()).unwrap(),
+            PermissionPromptOutcome::Decision(PermissionDecision::Deny)
+        );
+    }
 }

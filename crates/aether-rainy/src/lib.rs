@@ -159,12 +159,16 @@ async fn adapt_stream(
 ) {
     let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut completed_tool_calls = HashSet::new();
-    let mut completed = false;
     loop {
         tokio::select! {
             _ = sender.closed() => return,
             event = stream.next() => {
-                let Some(event) = event else { break; };
+                let Some(event) = event else {
+                    let _ = sender.send(Err(BackendError::IncompleteStream {
+                        message: "Rainy response stream ended before a terminal response event".to_owned(),
+                    })).await;
+                    return;
+                };
                 let event = match event {
                     Ok(value) => value,
                     Err(error) => {
@@ -172,8 +176,13 @@ async fn adapt_stream(
                         return;
                     }
                 };
-                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
-                    completed = true;
+                let is_completed = event.get("type").and_then(Value::as_str)
+                    == Some("response.completed");
+                if is_completed && !tool_calls.is_empty() {
+                    let _ = sender.send(Err(BackendError::IncompleteStream {
+                        message: "Rainy response completed with an incomplete tool call".to_owned(),
+                    })).await;
+                    return;
                 }
                 match map_event(event, &mut tool_calls, &mut completed_tool_calls) {
                     Ok(events) => {
@@ -181,6 +190,9 @@ async fn adapt_stream(
                             if sender.send(Ok(event)).await.is_err() {
                                 return;
                             }
+                        }
+                        if is_completed {
+                            return;
                         }
                     }
                     Err(error) => {
@@ -190,9 +202,6 @@ async fn adapt_stream(
                 }
             }
         }
-    }
-    if !completed {
-        let _ = sender.send(Ok(ModelEvent::Done { continuation: None })).await;
     }
 }
 
@@ -279,6 +288,12 @@ fn map_event(
         }
         "response.completed" => {
             let response = event.get("response").unwrap_or(&event);
+            let id =
+                response.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(
+                    || BackendError::Mapping {
+                        message: "Rainy completed response omitted its response id".to_owned(),
+                    },
+                )?;
             let mut output = Vec::new();
             if let Some(usage) = response.get("usage") {
                 output.push(ModelEvent::Usage {
@@ -296,19 +311,49 @@ fn map_event(
                         .map(|v| v as u32),
                 });
             }
-            let continuation = response
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| OpaqueContinuation(json!({"previous_response_id": id})));
-            output.push(ModelEvent::Done { continuation });
+            output.push(ModelEvent::Done {
+                continuation: Some(OpaqueContinuation(json!({"previous_response_id": id}))),
+            });
             Ok(output)
         }
-        "response.failed" | "response.incomplete" | "error" => Err(BackendError::Operation {
-            message: "Rainy returned an unsuccessful response event".to_owned(),
-            retryable: false,
-        }),
+        "response.failed" => {
+            Err(BackendError::ResponseFailed { message: terminal_message(&event) })
+        }
+        "response.incomplete" => {
+            Err(BackendError::ResponseIncomplete { message: terminal_message(&event) })
+        }
+        "error" => {
+            Err(BackendError::Operation { message: terminal_message(&event), retryable: false })
+        }
         _ => Ok(Vec::new()),
     }
+}
+
+fn terminal_message(event: &Value) -> String {
+    let response = event.get("response").unwrap_or(event);
+    let error = response.get("error").or_else(|| event.get("error"));
+    let code = error
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let raw = match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_owned(),
+        (None, Some(message)) => message.to_owned(),
+        (None, None) => response
+            .get("incomplete_details")
+            .and_then(|value| value.get("reason"))
+            .and_then(Value::as_str)
+            .map_or_else(
+                || "Rainy returned an unsuccessful response event".to_owned(),
+                str::to_owned,
+            ),
+    };
+    raw.chars().take(512).collect()
 }
 
 fn event_string(event: &Value, keys: &[&str]) -> Result<String, BackendError> {
@@ -333,6 +378,20 @@ fn map_rainy_error(error: &RainyError) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+
+    async fn collect(events: Vec<Value>) -> Vec<Result<ModelEvent, BackendError>> {
+        let stream = Box::pin(stream::iter(
+            events.into_iter().map(Ok::<Value, RainyError>).collect::<Vec<_>>(),
+        ));
+        let (sender, mut receiver) = mpsc::channel(16);
+        adapt_stream(stream, sender).await;
+        let mut output = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            output.push(event);
+        }
+        output
+    }
 
     #[test]
     fn maps_text_delta_without_exposing_reasoning() {
@@ -456,5 +515,123 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn normal_text_response_requires_completed_terminal_event() {
+        let output = collect(vec![
+            json!({"type": "response.output_text.delta", "delta": "hello"}),
+            json!({"type": "response.completed", "response": {"id": "resp_text"}}),
+        ])
+        .await;
+        assert!(matches!(output[0], Ok(ModelEvent::TextDelta { ref text }) if text == "hello"));
+        assert!(matches!(
+            output[1],
+            Ok(ModelEvent::Done { continuation: Some(ref continuation) })
+                if continuation.0["previous_response_id"] == "resp_text"
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_tool_call_and_terminal_event_are_forwarded() {
+        let output = collect(vec![
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "call_id": "call_1",
+                "delta": "{}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_1",
+                "name": "read"
+            }),
+            json!({"type": "response.completed", "response": {"id": "resp_tool"}}),
+        ])
+        .await;
+        assert!(matches!(output[0], Ok(ModelEvent::ToolCall { ref name, .. }) if name == "read"));
+        assert!(matches!(output[1], Ok(ModelEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn unexpected_eof_is_an_incomplete_stream_error() {
+        let output = collect(vec![json!({
+            "type": "response.output_text.delta",
+            "delta": "partial"
+        })])
+        .await;
+        assert!(matches!(
+            output.last(),
+            Some(Err(BackendError::IncompleteStream { message }))
+                if message.contains("ended before a terminal")
+        ));
+        assert!(!output.iter().any(|event| matches!(event, Ok(ModelEvent::Done { .. }))));
+    }
+
+    #[tokio::test]
+    async fn partial_tool_arguments_are_discarded_on_eof() {
+        let output = collect(vec![json!({
+            "type": "response.function_call_arguments.delta",
+            "call_id": "call_partial",
+            "delta": "{\"path\":"
+        })])
+        .await;
+        assert!(
+            output.iter().any(|event| matches!(event, Err(BackendError::IncompleteStream { .. })))
+        );
+        assert!(!output.iter().any(|event| matches!(event, Ok(ModelEvent::ToolCall { .. }))));
+    }
+
+    #[tokio::test]
+    async fn completed_tool_call_without_terminal_event_fails_closed() {
+        let output = collect(vec![json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_no_terminal",
+            "name": "read",
+            "arguments": "{}"
+        })])
+        .await;
+        assert!(output.iter().any(|event| matches!(event, Ok(ModelEvent::ToolCall { .. }))));
+        assert!(
+            output.iter().any(|event| matches!(event, Err(BackendError::IncompleteStream { .. })))
+        );
+        assert!(!output.iter().any(|event| matches!(event, Ok(ModelEvent::Done { .. }))));
+    }
+
+    #[test]
+    fn failed_and_incomplete_response_events_are_typed_failures() {
+        let mut calls = HashMap::new();
+        let mut completed = HashSet::new();
+        assert!(matches!(
+            map_event(
+                json!({
+                    "type": "response.failed",
+                    "response": {"error": {"code": "server_error", "message": "bounded"}}
+                }),
+                &mut calls,
+                &mut completed,
+            ),
+            Err(BackendError::ResponseFailed { message }) if message.contains("server_error")
+        ));
+        assert!(matches!(
+            map_event(
+                json!({
+                    "type": "response.incomplete",
+                    "response": {"incomplete_details": {"reason": "max_output_tokens"}}
+                }),
+                &mut calls,
+                &mut completed,
+            ),
+            Err(BackendError::ResponseIncomplete { message })
+                if message.contains("max_output_tokens")
+        ));
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_stops_stream_consumption() {
+        let stream = Box::pin(stream::pending::<Result<Value, RainyError>>());
+        let (sender, receiver) = mpsc::channel(1);
+        let task = tokio::spawn(adapt_stream(stream, sender));
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
     }
 }

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::{
-    MAX_INPUT_BYTES, ToolInternalError, Workspace, atomic_write, hash_bytes, hash_file,
-    spawn_blocking_tool,
+    MAX_INPUT_BYTES, ToolInternalError, Workspace, file_state, hash_bytes, hash_file,
+    install_replacement, spawn_blocking_tool, stage_replacement,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,39 +62,65 @@ fn execute_blocking(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
-    let exists = path.exists();
-    if parsed.create_only.unwrap_or(false) && exists {
-        return workspace.result_error(
-            call_id,
-            ToolInternalError::Input("create_only refused to replace an existing file".to_owned()),
-        );
-    }
-    if let Some(expected_hash) = parsed.expected_hash.as_deref() {
-        if !exists {
+    let key = match workspace.mutation_key(&path) {
+        Ok(value) => value,
+        Err(error) => return workspace.result_error(call_id, error),
+    };
+    let _mutation_guard = match workspace.acquire_mutations([key]) {
+        Ok(value) => value,
+        Err(error) => return workspace.result_error(call_id, error),
+    };
+    let initial_state = match file_state(&path) {
+        Ok(value) => value,
+        Err(error) => return workspace.result_error(call_id, error),
+    };
+    let create_only = parsed.create_only.unwrap_or(false);
+    let initial_hash = if matches!(initial_state, crate::common::FileState::Missing) {
+        if parsed.expected_hash.is_some() {
             return workspace.result_error(
                 call_id,
                 ToolInternalError::Input("expected_hash requires an existing file".to_owned()),
             );
         }
+        None
+    } else if create_only && parsed.expected_hash.is_none() {
+        None
+    } else {
         let current_hash = match hash_file(&path, &cancellation) {
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error),
         };
-        if current_hash != expected_hash {
+        if let Some(expected_hash) = parsed.expected_hash.as_deref()
+            && current_hash != expected_hash
+        {
             return workspace.result_error(
                 call_id,
                 ToolInternalError::Input("write precondition failed: file hash changed".to_owned()),
             );
         }
-    }
-    if let Err(error) = atomic_write(&path, parsed.content.as_bytes(), &cancellation) {
+        Some(current_hash)
+    };
+    let staged = match stage_replacement(&path, parsed.content.as_bytes(), &cancellation) {
+        Ok(value) => value,
+        Err(error) => return workspace.result_error(call_id, error),
+    };
+    let result = (|| {
+        if let Some(initial_hash) = initial_hash.as_deref() {
+            revalidate_hash(&path, initial_hash, &cancellation)?;
+        } else if file_state(&path)? != initial_state {
+            return Err(ToolInternalError::ConcurrentModification { path: display.clone() });
+        }
+        install_replacement(&staged, &initial_state, create_only, &cancellation)
+    })();
+    if let Err(error) = result {
+        staged.cleanup();
         return workspace.result_error(call_id, error);
     }
     let output = WriteOutput {
         path: display,
         bytes: parsed.content.len(),
         hash: hash_bytes(parsed.content.as_bytes()),
-        replaced: exists,
+        replaced: matches!(initial_state, crate::common::FileState::Present { .. }),
     };
     aether_core::ToolResult::success_json(
         call_id,
@@ -103,7 +129,50 @@ fn execute_blocking(
     )
 }
 
+fn revalidate_hash(
+    path: &std::path::Path,
+    expected_hash: &str,
+    cancellation: &CancellationFlag,
+) -> Result<(), ToolInternalError> {
+    match hash_file(path, cancellation) {
+        Ok(current) if current == expected_hash => Ok(()),
+        Ok(_) => {
+            Err(ToolInternalError::ConcurrentModification { path: path.display().to_string() })
+        }
+        Err(ToolInternalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(ToolInternalError::ConcurrentModification { path: path.display().to_string() })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[allow(dead_code)]
 fn _metadata_is_file(path: &std::path::Path) -> bool {
     fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{ToolInternalError, stage_replacement};
+
+    #[test]
+    fn expected_hash_revalidation_rejects_change_after_staging() {
+        let root =
+            std::env::temp_dir().join(format!("aether-write-revalidation-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("file.txt");
+        fs::write(&path, b"original").unwrap();
+        let expected = blake3::hash(b"original").to_hex().to_string();
+        let cancellation = CancellationFlag::new();
+        let staged = stage_replacement(&path, b"replacement", &cancellation).unwrap();
+        fs::write(&path, b"external change").unwrap();
+
+        assert!(matches!(
+            revalidate_hash(&path, &expected, &cancellation),
+            Err(ToolInternalError::ConcurrentModification { .. })
+        ));
+        staged.cleanup();
+        let _ = fs::remove_dir_all(root);
+    }
 }

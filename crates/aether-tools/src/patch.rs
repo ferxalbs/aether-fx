@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::{
-    MAX_INPUT_BYTES, StagedReplacement, ToolInternalError, Workspace, atomic_write, hash_bytes,
-    hash_file, install_replacement, spawn_blocking_tool, stage_replacement,
+    FileState, MAX_INPUT_BYTES, StagedReplacement, ToolInternalError, Workspace, atomic_write,
+    file_state, hash_bytes, hash_file, install_replacement, spawn_blocking_tool, stage_replacement,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -45,7 +45,14 @@ pub struct PatchFileOutput {
     pub changed: bool,
 }
 
-type PreparedFile = (String, PathBuf, Vec<u8>, String, Vec<u8>);
+struct PreparedFile {
+    display: String,
+    path: PathBuf,
+    initial_state: FileState,
+    old_bytes: Vec<u8>,
+    old_hash: String,
+    new_bytes: Vec<u8>,
+}
 
 pub(crate) async fn execute(
     workspace: &Workspace,
@@ -80,7 +87,7 @@ fn execute_blocking(
     parsed: PatchInput,
     cancellation: CancellationFlag,
 ) -> aether_core::ToolResult {
-    let mut prepared = Vec::with_capacity(parsed.files.len());
+    let mut targets = Vec::with_capacity(parsed.files.len());
     let mut seen = HashSet::with_capacity(parsed.files.len());
     for file in &parsed.files {
         if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
@@ -96,18 +103,39 @@ fn execute_blocking(
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error),
         };
-        if !seen.insert(display.clone()) {
+        let key = match workspace.mutation_key(&path) {
+            Ok(value) => value,
+            Err(error) => return workspace.result_error(call_id, error),
+        };
+        if !seen.insert(key.clone()) {
             return workspace.result_error(
                 call_id,
                 ToolInternalError::Input(format!("patch contains duplicate file {display}")),
             );
         }
+        targets.push((display, path, key, file.expected_hash.clone(), file.hunks.clone()));
+    }
+    let _mutation_guards =
+        match workspace.acquire_mutations(targets.iter().map(|(_, _, key, _, _)| key.clone())) {
+            Ok(value) => value,
+            Err(error) => return workspace.result_error(call_id, error),
+        };
+
+    let mut prepared = Vec::with_capacity(targets.len());
+    for (display, path, _, expected_hash, hunks) in targets {
+        if let Err(error) = cancellation.check().map_err(ToolInternalError::Core) {
+            return workspace.result_error(call_id, error);
+        }
+        let initial_state = match file_state(&path) {
+            Ok(value) => value,
+            Err(error) => return workspace.result_error(call_id, error),
+        };
         let old_bytes = match read_bounded_file(&path, &cancellation) {
             Ok(value) => value,
             Err(error) => return workspace.result_error(call_id, error),
         };
         let old_hash = hash_bytes(&old_bytes);
-        if let Some(expected_hash) = file.expected_hash.as_deref()
+        if let Some(expected_hash) = expected_hash.as_deref()
             && expected_hash != old_hash
         {
             return workspace.result_error(
@@ -126,7 +154,7 @@ fn execute_blocking(
                 );
             }
         };
-        let new_bytes = match apply_patch_text(&old_text, &file.hunks) {
+        let new_bytes = match apply_patch_text(&old_text, &hunks) {
             Ok(value) => value.into_bytes(),
             Err(error) => {
                 return workspace.result_error(
@@ -141,16 +169,23 @@ fn execute_blocking(
                 ToolInternalError::Input("patch result exceeds the bounded input limit".to_owned()),
             );
         }
-        prepared.push((display, path, old_bytes, old_hash, new_bytes));
+        prepared.push(PreparedFile {
+            display,
+            path,
+            initial_state,
+            old_bytes,
+            old_hash,
+            new_bytes,
+        });
     }
     let dry_run = parsed.dry_run.unwrap_or(false);
     let outputs: Vec<PatchFileOutput> = prepared
         .iter()
-        .map(|(display, _, old_bytes, old_hash, new_bytes)| PatchFileOutput {
-            path: display.clone(),
-            old_hash: old_hash.clone(),
-            new_hash: hash_bytes(new_bytes),
-            changed: new_bytes != old_bytes,
+        .map(|file| PatchFileOutput {
+            path: file.display.clone(),
+            old_hash: file.old_hash.clone(),
+            new_hash: hash_bytes(&file.new_bytes),
+            changed: file.new_bytes != file.old_bytes,
         })
         .collect();
     if !dry_run && let Err(error) = commit_prepared(&prepared, &cancellation) {
@@ -167,15 +202,15 @@ fn commit_prepared(
     prepared: &[PreparedFile],
     cancellation: &CancellationFlag,
 ) -> Result<(), ToolInternalError> {
-    let mut staged = Vec::<(PathBuf, Vec<u8>, StagedReplacement)>::new();
-    for (_, path, old_bytes, _, new_bytes) in prepared {
-        if old_bytes == new_bytes {
+    let mut staged = Vec::<(usize, StagedReplacement)>::new();
+    for (index, file) in prepared.iter().enumerate() {
+        if file.old_bytes == file.new_bytes {
             continue;
         }
-        match stage_replacement(path, new_bytes, cancellation) {
-            Ok(replacement) => staged.push((path.clone(), old_bytes.clone(), replacement)),
+        match stage_replacement(&file.path, &file.new_bytes, cancellation) {
+            Ok(replacement) => staged.push((index, replacement)),
             Err(error) => {
-                for (_, _, replacement) in &staged {
+                for (_, replacement) in &staged {
                     replacement.cleanup();
                 }
                 return Err(error);
@@ -183,12 +218,18 @@ fn commit_prepared(
         }
     }
     let mut applied = Vec::<(PathBuf, Vec<u8>)>::new();
-    for (path, old_bytes, replacement) in &staged {
-        let commit_result = install_replacement(replacement, cancellation);
+    for (index, replacement) in &staged {
+        let file = &prepared[*index];
+        let commit_result = revalidate_prepared(file, cancellation).and_then(|()| {
+            install_replacement(replacement, &file.initial_state, false, cancellation)
+        });
         match commit_result {
-            Ok(()) => applied.push((path.clone(), old_bytes.clone())),
+            Ok(()) => {
+                replacement.cleanup();
+                applied.push((file.path.clone(), file.old_bytes.clone()));
+            }
             Err(error) => {
-                for (_, _, pending) in &staged {
+                for (_, pending) in &staged {
                     pending.cleanup();
                 }
                 return finish_commit_failure(error, &applied);
@@ -196,6 +237,23 @@ fn commit_prepared(
         }
     }
     Ok(())
+}
+
+fn revalidate_prepared(
+    file: &PreparedFile,
+    cancellation: &CancellationFlag,
+) -> Result<(), ToolInternalError> {
+    if file_state(&file.path)? != file.initial_state {
+        return Err(ToolInternalError::ConcurrentModification { path: file.display.clone() });
+    }
+    match hash_file(&file.path, cancellation) {
+        Ok(current) if current == file.old_hash => Ok(()),
+        Ok(_) => Err(ToolInternalError::ConcurrentModification { path: file.display.clone() }),
+        Err(ToolInternalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(ToolInternalError::ConcurrentModification { path: file.display.clone() })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn finish_commit_failure(

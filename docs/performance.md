@@ -23,7 +23,7 @@ Phase 1 design measurements to record locally are:
 | Current-thread responsiveness while a blocking tool runs | async timer regression test passes | verified by workspace test |
 | Persistent output memory | 16 × 2 × 256 KiB maximum stream storage | design bound |
 | Cancellation latency | cooperative checkpoints plus 10 ms polling for async process I/O | diagnostic benchmark pending |
-| Release binary size | 4,943,824 bytes (4.71 MiB); 225 locked packages | measured 2026-08-21 |
+| Release binary size | 4,997,200 bytes (4.77 MiB); 225 locked packages | measured 2026-08-22 |
 
 The blocking pool is deliberately not an unbounded fan-out: each filesystem/search tool call uses one bounded blocking operation, and traversal/result limits remain enforced inside that operation. Process output is drained continuously into recent-output buffers rather than accumulating an unbounded log.
 
@@ -41,5 +41,7 @@ Quick local Criterion sample on 2026-08-21 (`sample-size 10`, 100 ms warmup, 200
 | process registry lookup/status | 5.48 µs |
 
 These measurements are local diagnostics, not cross-machine guarantees. The existing AETHER-versus-rg comparison remains intentionally separate because a freshly spawned `rg` process includes process startup overhead.
+
+Phase 1.1 verification run on 2026-08-22 used the same Criterion benchmark suite on the same x86_64 macOS host. Selected current medians were: startup 47.851 ms, blocking dispatch 47.367 µs, permission decision 882.94 ns, atomic write 1.7574 ms, staged patch application 1.9243 ms, persistent-process buffer read 50.791 µs, and process registry lookup 5.2652 µs. Criterion reported a statistically significant blocking-dispatch change of +5.97% against its saved baseline and AETHER search-comparison change of +7.47%; process-buffer read reported no statistically significant change. These are observations for regression review, not cross-machine performance claims, and no microbenchmark optimization was added in this correctness phase.
 
 The release profile is `opt-level=3`, fat LTO, one codegen unit, aborting panic, stripped symbols, no debug info, and no incremental compilation. Public builds do not use `target-cpu=native`.

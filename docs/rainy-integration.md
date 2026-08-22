@@ -10,4 +10,10 @@ Normal inference uses deterministic model precedence in the binary: `--model`, t
 
 Rainy's transport/retry behavior remains Rainy's/SDK's responsibility. AETHER emits semantic step IDs and does not blindly retry ambiguous tool/model operations. The verified 0.6.14 ResponsesRequest surface has no documented idempotency field, so AETHER does not invent one; the IDs remain the local semantic identity until an SDK contract exposes transport integration. Reasoning and continuation fields are opaque values; raw chain-of-thought is never rendered or exposed as a tool result.
 
+## Responses stream completion
+
+The adapter treats `response.completed` as the only successful terminal event. It requires the event to carry a non-empty response ID and stores that ID as opaque `previous_response_id` continuation metadata; continuation is never fabricated when transport state disappears. Explicit `response.failed` and `response.incomplete` events become typed backend errors with bounded safe diagnostic text.
+
+An EOF before a valid terminal event is `IncompleteStream`, including after text deltas or a parseable function-call event. The adapter does not emit `Done` for that stream. Partial function-call argument deltas are discarded, and a completed function-call event followed by EOF still fails the enclosing agent step before any tool execution. If the receiving side is dropped, the adapter observes the bounded output channel's closed state and stops consuming the Rainy stream.
+
 The catalog cache uses a bounded five-minute TTL. Bootstrap refreshes stale entries synchronously on an explicit catalog/model operation; stale-while-refresh background refresh is intentionally not enabled until its task lifetime and cancellation semantics are proven.

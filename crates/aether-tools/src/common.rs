@@ -4,9 +4,10 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, RwLock,
+        Arc, Mutex as StdMutex, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 use aether_core::{
@@ -19,7 +20,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     process::{Child, ChildStdin},
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, OwnedMutexGuard},
+    task::JoinHandle,
 };
 
 #[cfg(windows)]
@@ -43,6 +45,12 @@ pub enum ToolInternalError {
     Pattern(String),
     #[error("operation timed out")]
     Timeout,
+    #[error("destination already exists: {path}")]
+    DestinationExists { path: String },
+    #[error("concurrent modification detected: {path}")]
+    ConcurrentModification { path: String },
+    #[error("process {process_id} termination failed: {error}")]
+    ProcessTermination { process_id: u64, error: String },
     #[error("HIGH-SEVERITY rollback incomplete after commit error: {commit}; results: {results:?}")]
     RollbackFailed { commit: String, results: Vec<String> },
 }
@@ -149,17 +157,53 @@ pub(crate) struct ProcessHandle {
     pub stdin: Mutex<Option<ChildStdin>>,
     pub stdout: Arc<OutputBuffer>,
     pub stderr: Arc<OutputBuffer>,
+    pub drains: Mutex<Vec<JoinHandle<()>>>,
+    pub state: StdMutex<ProcessState>,
     pub program: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    #[cfg(test)]
+    pub test_termination: StdMutex<Option<TestTerminationMode>>,
 }
 
 impl ProcessHandle {
-    pub(crate) async fn terminate(&self) {
-        let mut child = self.child.lock().await;
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    pub(crate) async fn terminate(&self) -> Result<ProcessTermination, ProcessTerminationError> {
+        crate::process::terminate_process(self).await
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessTermination {
+    AlreadyExited { exit_code: Option<i32> },
+    Terminated { exit_code: Option<i32> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessState {
+    Running,
+    Exited,
+    TerminationRequested,
+    TerminationFailed,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestTerminationMode {
+    Fail,
+    Timeout,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ProcessTerminationError {
+    #[error("kill request failed: {0}")]
+    Kill(#[source] io::Error),
+    #[error("wait failed: {0}")]
+    Wait(#[source] io::Error),
+    #[error("termination wait timed out after {timeout_ms} ms")]
+    Timeout { timeout_ms: u64 },
+    #[cfg(test)]
+    #[error("test termination failure: {0}")]
+    Test(String),
 }
 
 /// Short-lived registry lock around process handles, never around process I/O.
@@ -210,11 +254,93 @@ impl ProcessRegistry {
         self.entries.write().ok()?.remove(&process_id)
     }
 
-    pub(crate) fn take_all(&self) -> Vec<Arc<ProcessHandle>> {
+    pub(crate) fn snapshot(&self) -> Vec<(u64, Arc<ProcessHandle>)> {
         self.entries
-            .write()
-            .map(|mut entries| entries.drain().map(|(_, handle)| handle).collect())
+            .read()
+            .map(|entries| entries.iter().map(|(id, handle)| (*id, handle.clone())).collect())
             .unwrap_or_default()
+    }
+}
+
+/// Per-destination mutation locks shared by write and patch.
+#[derive(Debug, Default)]
+pub(crate) struct PathMutationCoordinator {
+    locks: StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+}
+
+impl PathMutationCoordinator {
+    pub(crate) fn acquire(
+        self: &Arc<Self>,
+        keys: impl IntoIterator<Item = PathBuf>,
+    ) -> ToolResultInternal<PathMutationGuard> {
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+
+        let locks =
+            keys.iter().map(|key| self.lock_for(key)).collect::<ToolResultInternal<Vec<_>>>()?;
+        let guards = locks.iter().map(|lock| lock.clone().blocking_lock_owned()).collect();
+
+        Ok(PathMutationGuard { coordinator: Arc::clone(self), keys, locks, guards })
+    }
+
+    fn lock_for(&self, key: &Path) -> ToolResultInternal<Arc<Mutex<()>>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|_| ToolInternalError::Input("path mutation lock poisoned".to_owned()))?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key.to_owned(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+}
+
+pub(crate) struct PathMutationGuard {
+    coordinator: Arc<PathMutationCoordinator>,
+    keys: Vec<PathBuf>,
+    locks: Vec<Arc<Mutex<()>>>,
+    guards: Vec<OwnedMutexGuard<()>>,
+}
+
+impl Drop for PathMutationGuard {
+    fn drop(&mut self) {
+        let guards = std::mem::take(&mut self.guards);
+        drop(guards);
+
+        if let Ok(mut locks) = self.coordinator.locks.lock() {
+            for (key, lock) in self.keys.iter().zip(&self.locks) {
+                let same_lock = locks
+                    .get(key)
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|current| Arc::ptr_eq(&current, lock));
+                if same_lock && Arc::strong_count(lock) == 1 {
+                    locks.remove(key);
+                }
+            }
+        }
+        self.locks.clear();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FileState {
+    Missing,
+    Present { length: u64, modified: Option<SystemTime>, symlink: bool },
+}
+
+pub(crate) fn file_state(path: &Path) -> ToolResultInternal<FileState> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(FileState::Present {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            symlink: metadata.file_type().is_symlink(),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(FileState::Missing),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -225,6 +351,7 @@ pub struct Workspace {
     permissions: PermissionEngine,
     max_output_bytes: usize,
     processes: Arc<ProcessRegistry>,
+    mutations: Arc<PathMutationCoordinator>,
 }
 
 impl Workspace {
@@ -239,6 +366,7 @@ impl Workspace {
             permissions: PermissionEngine::new(Default::default()),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             processes: Arc::new(ProcessRegistry::new()),
+            mutations: Arc::new(PathMutationCoordinator::default()),
         })
     }
 
@@ -305,6 +433,24 @@ impl Workspace {
         Ok((relative.display(), lexical))
     }
 
+    pub(crate) fn mutation_key(&self, path: &Path) -> ToolResultInternal<PathBuf> {
+        let key = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = path.parent().ok_or_else(|| {
+                    ToolInternalError::Input("write path has no parent directory".to_owned())
+                })?;
+                let file_name = path.file_name().ok_or_else(|| {
+                    ToolInternalError::Input("write path has no file name".to_owned())
+                })?;
+                fs::canonicalize(parent)?.join(file_name)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.ensure_contained(&key, &path.display().to_string())?;
+        Ok(key)
+    }
+
     pub(crate) fn verify_entry(&self, path: &Path, display: &str) -> ToolResultInternal<()> {
         let canonical = fs::canonicalize(path)?;
         self.ensure_contained(&canonical, display)
@@ -331,11 +477,30 @@ impl Workspace {
         &self.processes
     }
 
+    pub(crate) fn acquire_mutations(
+        &self,
+        keys: impl IntoIterator<Item = PathBuf>,
+    ) -> ToolResultInternal<PathMutationGuard> {
+        self.mutations.acquire(keys)
+    }
+
     /// Terminate all persistent processes owned by this workspace/session.
-    pub async fn shutdown_processes(&self) {
-        for handle in self.processes.take_all() {
-            handle.terminate().await;
+    pub async fn shutdown_processes(&self) -> crate::process::ProcessShutdownReport {
+        let mut report = crate::process::ProcessShutdownReport::default();
+        for (process_id, handle) in self.processes.snapshot() {
+            report.attempted += 1;
+            match handle.terminate().await {
+                Ok(_) => {
+                    self.processes.remove(process_id);
+                    report.terminated += 1;
+                }
+                Err(error) => report.failures.push(crate::process::ProcessShutdownFailure {
+                    process_id,
+                    error: error.to_string(),
+                }),
+            }
         }
+        report
     }
 
     pub(crate) fn result_error(&self, call_id: ToolCallId, error: ToolInternalError) -> ToolResult {
@@ -353,6 +518,9 @@ impl Workspace {
             ToolInternalError::Core(CoreError::FeatureUnavailable { .. }) => {
                 ("feature_unavailable", false)
             }
+            ToolInternalError::DestinationExists { .. } => ("already_exists", false),
+            ToolInternalError::ConcurrentModification { .. } => ("concurrent_modification", true),
+            ToolInternalError::ProcessTermination { .. } => ("termination_failed", true),
             ToolInternalError::RollbackFailed { .. } => ("rollback_failed", false),
             ToolInternalError::Timeout => ("timeout", true),
             ToolInternalError::Input(_) | ToolInternalError::Pattern(_) => ("invalid_input", false),
@@ -511,38 +679,55 @@ pub(crate) fn stage_replacement(
 
 pub(crate) fn install_replacement(
     staged: &StagedReplacement,
+    initial_state: &FileState,
+    create_only: bool,
     cancellation: &CancellationFlag,
 ) -> ToolResultInternal<()> {
-    // Once the platform replacement/rename starts, it is completed as one OS operation.
+    // The state check belongs immediately before this function. The OS call below is still
+    // atomic, but an arbitrary external process can mutate the namespace after that check.
     cancellation.check()?;
-    let destination_exists = match fs::metadata(&staged.destination) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
+    if create_only || matches!(initial_state, FileState::Missing) {
+        return install_without_replacement(staged, create_only, cancellation);
+    }
+
     #[cfg(windows)]
     {
-        if destination_exists {
-            match platform::replace_existing(&staged.destination, &staged.temporary) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        match fs::rename(&staged.temporary, &staged.destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                platform::replace_existing(&staged.destination, &staged.temporary)?;
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
+        platform::replace_existing(&staged.destination, &staged.temporary)?;
+        Ok(())
     }
     #[cfg(not(windows))]
     {
-        let _ = destination_exists;
         fs::rename(&staged.temporary, &staged.destination)?;
         Ok(())
+    }
+}
+
+fn install_without_replacement(
+    staged: &StagedReplacement,
+    create_only: bool,
+    cancellation: &CancellationFlag,
+) -> ToolResultInternal<()> {
+    cancellation.check()?;
+    match fs::hard_link(&staged.temporary, &staged.destination) {
+        Ok(()) => {
+            // The hard link is the commit point. Removing the same-directory staging name does
+            // not alter the installed destination; if cleanup is unavailable, leave the bounded
+            // temporary artifact rather than reporting a false failed commit.
+            let _ = fs::remove_file(&staged.temporary);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if create_only {
+                Err(ToolInternalError::DestinationExists {
+                    path: staged.destination.display().to_string(),
+                })
+            } else {
+                Err(ToolInternalError::ConcurrentModification {
+                    path: staged.destination.display().to_string(),
+                })
+            }
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -551,8 +736,9 @@ pub(crate) fn atomic_write(
     bytes: &[u8],
     cancellation: &CancellationFlag,
 ) -> ToolResultInternal<()> {
+    let initial_state = file_state(path)?;
     let staged = stage_replacement(path, bytes, cancellation)?;
-    let result = install_replacement(&staged, cancellation);
+    let result = install_replacement(&staged, &initial_state, false, cancellation);
     if result.is_err() {
         staged.cleanup();
     }
@@ -562,6 +748,20 @@ pub(crate) fn atomic_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{Barrier, mpsc},
+        time::Duration,
+    };
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aether-common-{label}-{}-{}",
+            std::process::id(),
+            temporary_path(Path::new("fixture")).file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 
     #[test]
     fn output_buffer_preserves_recent_bytes_and_counts_every_drop() {
@@ -577,5 +777,83 @@ mod tests {
         let second = buffer.take(64);
         assert_eq!(second.bytes, b"2345");
         assert_eq!(second.dropped_bytes, 4);
+    }
+
+    #[test]
+    fn no_replace_commit_refuses_destination_that_appears_before_commit() {
+        let root = temp_root("create-only");
+        let path = root.join("file.txt");
+        let cancellation = CancellationFlag::new();
+        let staged = stage_replacement(&path, b"replacement", &cancellation).unwrap();
+        fs::write(&path, b"external").unwrap();
+
+        let result = install_replacement(&staged, &FileState::Missing, true, &cancellation);
+        assert!(matches!(result, Err(ToolInternalError::DestinationExists { .. })));
+        assert_eq!(fs::read(&path).unwrap(), b"external");
+        staged.cleanup();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_mutations_serialize_same_destination_and_clean_dead_entries() {
+        let coordinator = Arc::new(PathMutationCoordinator::default());
+        let path = PathBuf::from("/workspace/file");
+        let first = coordinator.acquire([path.clone()]).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let other = Arc::clone(&coordinator);
+        let worker = std::thread::spawn(move || {
+            let guard = other.acquire([path]).unwrap();
+            sender.send(()).unwrap();
+            drop(guard);
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(first);
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert!(coordinator.locks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrelated_destinations_do_not_share_one_filesystem_lock() {
+        let coordinator = Arc::new(PathMutationCoordinator::default());
+        let first = coordinator.acquire([PathBuf::from("/workspace/a")]).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let other = Arc::clone(&coordinator);
+        let worker = std::thread::spawn(move || {
+            let guard = other.acquire([PathBuf::from("/workspace/b")]).unwrap();
+            sender.send(()).unwrap();
+            drop(guard);
+        });
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(first);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn multi_path_mutations_use_deterministic_lock_order() {
+        let coordinator = Arc::new(PathMutationCoordinator::default());
+        let barrier = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+        for keys in [
+            vec![PathBuf::from("/workspace/a"), PathBuf::from("/workspace/b")],
+            vec![PathBuf::from("/workspace/b"), PathBuf::from("/workspace/a")],
+        ] {
+            let coordinator = Arc::clone(&coordinator);
+            let barrier = Arc::clone(&barrier);
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let guard = coordinator.acquire(keys).unwrap();
+                sender.send(()).unwrap();
+                drop(guard);
+            }));
+        }
+        barrier.wait();
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 }

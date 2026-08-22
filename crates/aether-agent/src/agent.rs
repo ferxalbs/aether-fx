@@ -234,6 +234,10 @@ where
                         }
                         decision = decision_future => decision,
                     };
+                    if cancellation.is_cancelled() {
+                        broker.cancel(&call_id);
+                        return Err(AgentError::Cancelled);
+                    }
                     if needs_prompt {
                         send_event(
                             &events,
@@ -615,6 +619,111 @@ mod tests {
         }
         assert!(task.await.unwrap().is_ok());
         assert_eq!(executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_permission_prompt_cancels_before_tool_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = Arc::new(Agent::new(
+            crate::FakeBackend::new("done").with_tool_call("write", json!({"path": "test.txt"})),
+            PermissionTools { executions: executions.clone() },
+        ));
+        let broker = SessionPermissionBroker::new();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (sender, mut receiver) = mpsc::channel(16);
+        let task_agent = Arc::clone(&agent);
+        let task_broker = broker.clone();
+        let task = tokio::spawn(async move {
+            task_agent
+                .run_with_broker(
+                    AgentRequest::new(
+                        SessionId::new("session-permission-cancel").unwrap(),
+                        TurnId::new("turn-permission-cancel").unwrap(),
+                        "write",
+                    ),
+                    sender,
+                    task_cancellation,
+                    &task_broker,
+                )
+                .await
+        });
+        let call_id = loop {
+            if let Some(AgentEvent::PermissionRequested { request }) = receiver.recv().await {
+                break request.call_id;
+            }
+        };
+        assert_eq!(broker.pending_count(), 1);
+        cancellation.cancel();
+        assert!(matches!(task.await.unwrap(), Err(AgentError::Cancelled)));
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.pending_count(), 0);
+        assert!(!broker.resolve(&call_id, PermissionDecision::AllowOnce));
+        assert!(
+            !std::iter::from_fn(|| receiver.try_recv().ok())
+                .any(|event| matches!(event, AgentEvent::ToolFinished { .. }))
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    struct ToolThenIncompleteBackend;
+
+    impl ModelBackend for ToolThenIncompleteBackend {
+        fn stream_step<'a>(&'a self, _: ModelRequest) -> BackendFuture<'a> {
+            Box::pin(async {
+                let (sender, receiver) = mpsc::channel(4);
+                sender
+                    .send(Ok(ModelEvent::ToolCall {
+                        call_id: ToolCallId::new("truncated-call").unwrap(),
+                        name: "write".to_owned(),
+                        arguments: json!({"path": "test.txt"}),
+                    }))
+                    .await
+                    .unwrap();
+                sender
+                    .send(Err(BackendError::IncompleteStream {
+                        message: "synthetic truncated response".to_owned(),
+                    }))
+                    .await
+                    .unwrap();
+                Ok(receiver)
+            })
+        }
+
+        fn discover_models<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<ModelCatalogItem>, BackendError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_after_tool_call_never_executes_the_tool() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(
+            ToolThenIncompleteBackend,
+            PermissionTools { executions: executions.clone() },
+        );
+        let (sender, _receiver) = mpsc::channel(16);
+        let result = agent
+            .run(
+                AgentRequest::new(
+                    SessionId::new("session-truncated-tool").unwrap(),
+                    TurnId::new("turn-truncated-tool").unwrap(),
+                    "write",
+                ),
+                sender,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentError::Backend(BackendError::IncompleteStream { .. }))));
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
     }
 
     struct SlowTools;
