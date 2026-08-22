@@ -41,10 +41,10 @@ mod tests {
 
     use aether_core::{
         CancellationFlag, ExecutionPermit, PermissionClass, PermissionEngine, PermissionPolicy,
-        ToolCallId, ToolExecutionContext, ToolInvocation,
+        ToolCallId, ToolExecutionContext, ToolInvocation, ToolResult,
     };
 
-    use super::{ToolRegistry, Workspace};
+    use super::{ToolRegistry, Workspace, common};
 
     fn test_root() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -169,6 +169,41 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_tool_does_not_monopolize_current_thread_control_plane() {
+        let root = test_root();
+        let workspace = Workspace::new(&root).unwrap();
+        let invocation = call("search", serde_json::json!({"patterns": ["needle"]}), 33);
+        let context = ToolExecutionContext::new(
+            CancellationFlag::new(),
+            ExecutionPermit::new(invocation.call_id.clone(), "search", PermissionClass::ReadOnly),
+        );
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let released = Arc::new(AtomicU64::new(0));
+        let released_in_blocking = Arc::clone(&released);
+        let blocking = common::spawn_blocking_tool(
+            &workspace,
+            invocation.call_id.clone(),
+            &context,
+            move |_, call_id, _| {
+                let _ = started_sender.send(());
+                if release_receiver.recv_timeout(Duration::from_millis(250)).is_ok() {
+                    released_in_blocking.store(1, Ordering::Release);
+                }
+                ToolResult::failure(call_id, "fixture", "done", false, 1024)
+            },
+        );
+        let control_plane = async move {
+            let _ = started_receiver.await;
+            let _ = release_sender.send(());
+        };
+        let (result, ()) = tokio::join!(blocking, control_plane);
+        assert!(!result.ok);
+        assert_eq!(released.load(Ordering::Acquire), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn default_policy_rejects_mutation_and_path_escape() {
         let root = test_root();
@@ -282,7 +317,7 @@ mod tests {
         let (program, args) = if cfg!(windows) {
             ("cmd", vec!["/C".to_owned(), "for /L %i in (1,1,400000) do @echo x".to_owned()])
         } else {
-            ("yes", vec!["x".to_owned()])
+            ("sh", vec!["-c".to_owned(), "yes x | head -c 400000".to_owned()])
         };
         let started = registry
             .dispatch(call(
@@ -293,23 +328,43 @@ mod tests {
             .await;
         assert!(started.ok, "{}", started.output.as_str());
         let process_id = started.data.unwrap()["process_id"].as_u64().unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let read = registry
-            .dispatch(call(
-                "process",
-                serde_json::json!({
-                    "operation": "read",
-                    "process_id": process_id,
-                    "max_bytes": 65536,
-                    "timeout_ms": 100
-                }),
-                23,
-            ))
-            .await;
-        assert!(read.ok, "{}", read.output.as_str());
-        let data = read.data.unwrap();
-        assert!(data["buffered_bytes"].as_u64().unwrap() <= 256 * 1024);
-        assert!(data["dropped_bytes"].as_u64().unwrap() > 0);
+        for number in 0..100 {
+            let status = registry
+                .dispatch(call(
+                    "process",
+                    serde_json::json!({"operation": "status", "process_id": process_id}),
+                    23 + number,
+                ))
+                .await;
+            assert!(status.ok, "{}", status.output.as_str());
+            if !status.data.unwrap()["running"].as_bool().unwrap_or(false) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut dropped_bytes = 0;
+        for number in 0..16 {
+            let read = registry
+                .dispatch(call(
+                    "process",
+                    serde_json::json!({
+                        "operation": "read",
+                        "process_id": process_id,
+                        "max_bytes": 65536,
+                        "timeout_ms": 1000
+                    }),
+                    123 + number,
+                ))
+                .await;
+            assert!(read.ok, "{}", read.output.as_str());
+            let data = read.data.unwrap();
+            assert!(data["buffered_bytes"].as_u64().unwrap() <= 256 * 1024);
+            dropped_bytes = data["dropped_bytes"].as_u64().unwrap();
+            if dropped_bytes > 0 || data["eof"].as_bool().unwrap_or(false) {
+                break;
+            }
+        }
+        assert!(dropped_bytes > 0);
         let killed = registry
             .dispatch(call(
                 "process",
