@@ -1,0 +1,8 @@
+[build]
+warnings = "deny"
+
+[term]
+verbose = false
+
+[alias]
+coverage = "llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info"

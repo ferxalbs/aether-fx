@@ -1,0 +1,20 @@
+[package]
+name = "aether"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AETHER Fx native terminal coding agent"
+
+[lints]
+workspace = true
+
+[dependencies]
+aether-agent.workspace = true
+aether-core.workspace = true
+aether-rainy.workspace = true
+aether-terminal.workspace = true
+aether-tools.workspace = true
+lexopt.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }

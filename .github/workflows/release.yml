@@ -1,0 +1,97 @@
+name: Release artifacts
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Package ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            name: windows-x86_64
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-vs2026-arm
+            name: windows-aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+            name: macos-x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            name: macos-aarch64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            name: linux-x86_64-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            name: linux-aarch64-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Validate lockfile
+        run: cargo metadata --format-version 1 --all-features --locked --no-deps
+
+      - name: Build
+        run: cargo build --locked --release --package aether --target ${{ matrix.target }}
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo install --locked --version 0.5.9 cargo-cyclonedx
+          cargo cyclonedx --manifest-path crates/aether/Cargo.toml --format json --describe binaries --override-filename bom.json
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          artifact="aether-${version}-${{ matrix.name }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aether" "dist/${artifact}"
+          cp crates/aether/bom.json "dist/${artifact}.cdx.json"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "dist/"
+          tar -C dist -czf "dist/${artifact}.tar.gz" "${artifact}" "${artifact}.cdx.json" LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          sha256sum "dist/${artifact}.tar.gz" > "dist/${artifact}.tar.gz.sha256"
+          rm "dist/${artifact}" "dist/${artifact}.cdx.json" "dist/LICENSE" "dist/NOTICE" "dist/THIRD_PARTY_NOTICES.md"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          $artifact = "aether-$version-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aether.exe" "dist/$artifact.exe"
+          Copy-Item crates/aether/bom.json "dist/$artifact.cdx.json"
+          Copy-Item LICENSE, NOTICE, THIRD_PARTY_NOTICES.md -Destination dist/
+          Compress-Archive -Path "dist/$artifact.exe", "dist/$artifact.cdx.json", "dist/LICENSE", "dist/NOTICE", "dist/THIRD_PARTY_NOTICES.md" -DestinationPath "dist/$artifact.zip"
+          (Get-FileHash "dist/$artifact.zip" -Algorithm SHA256).Hash.ToLower() + "  $artifact.zip" | Set-Content "dist/$artifact.zip.sha256"
+          Remove-Item "dist/$artifact.exe", "dist/$artifact.cdx.json", "dist/LICENSE", "dist/NOTICE", "dist/THIRD_PARTY_NOTICES.md"
+
+      # actions/upload-artifact v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+      # actions/attest-build-provenance v4.1.0; requires the permissions above.
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: dist/*

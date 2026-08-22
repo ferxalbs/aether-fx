@@ -1,6 +1,64 @@
-[package]
-name = "aether-fx"
-version = "0.0.1"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "crates/aether",
+    "crates/aether-core",
+    "crates/aether-agent",
+    "crates/aether-rainy",
+    "crates/aether-tools",
+    "crates/aether-terminal",
+]
+default-members = ["crates/aether"]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+
+[workspace.dependencies]
+aether-agent = { path = "crates/aether-agent", version = "0.1.0" }
+aether-core = { path = "crates/aether-core", version = "0.1.0" }
+aether-rainy = { path = "crates/aether-rainy", version = "0.1.0" }
+aether-terminal = { path = "crates/aether-terminal", version = "0.1.0" }
+aether-tools = { path = "crates/aether-tools", version = "0.1.0" }
+
+blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
+criterion = "0.8.2"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+globset = { version = "0.4.20", default-features = false }
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.33"
+lexopt = "0.3.2"
+rainy-sdk = { version = "0.6.14", default-features = false }
+regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "meta", "nfa", "hybrid"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "stdio", "termios"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+windows-sys = { version = "0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false

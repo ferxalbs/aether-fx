@@ -1,0 +1,21 @@
+[package]
+name = "aether-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AETHER Fx native terminal substrate"
+
+[lints]
+workspace = true
+
+[dependencies]
+aether-core.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

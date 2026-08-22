@@ -1,0 +1,32 @@
+[package]
+name = "aether-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AETHER Fx bounded local tools"
+
+[lints]
+workspace = true
+
+[dependencies]
+aether-core.workspace = true
+blake3.workspace = true
+globset.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+regex-automata.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+
+[dev-dependencies]
+aether-agent.workspace = true
+aether-terminal.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "tools"
+harness = false

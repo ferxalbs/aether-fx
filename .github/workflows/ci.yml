@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality and policy
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Locked metadata
+        run: cargo metadata --format-version 1 --all-features --locked --no-deps
+
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Nextest
+        run: |
+          cargo install --locked --version 0.9.143 cargo-nextest
+          cargo nextest run --workspace --all-features --locked
+
+      - name: Dependency policy
+        run: |
+          cargo install --locked --version 0.20.2 cargo-deny
+          cargo deny check
+
+      - name: Security advisories
+        run: |
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo audit
+
+      - name: Coverage
+        run: |
+          cargo install --locked --version 0.9.0 cargo-llvm-cov
+          cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+
+      # actions/upload-artifact v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage
+          path: lcov.info
+          if-no-files-found: error
+
+  primary-targets:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-vs2026-arm
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+          - target: aarch64-apple-darwin
+            runner: macos-26
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Compile target
+        run: cargo build --workspace --locked --target ${{ matrix.target }}
