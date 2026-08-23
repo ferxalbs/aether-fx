@@ -385,6 +385,46 @@ fn session_replay(c: &mut Criterion) {
     let _ = fs::remove_dir_all(root);
 }
 
+fn session_discovery(c: &mut Criterion) {
+    let root = temporary_root("session-discovery");
+    for number in 0..100 {
+        let session = SessionId::new(format!("discovery-{number:03}")).expect("benchmark id");
+        let path = SessionStore::path_for(&root, &session);
+        fs::create_dir_all(path.parent().expect("session parent")).expect("session directory");
+        let started = SessionLine::new(
+            1,
+            session.clone(),
+            None,
+            SessionRecord::Started {
+                workspace_root: root.display().to_string(),
+                model: Some("bench".to_owned()),
+            },
+        );
+        fs::write(
+            path,
+            format!("{}\n", serde_json::to_string(&started).expect("session serialization")),
+        )
+        .expect("session fixture");
+    }
+    let mut group = c.benchmark_group("session_discovery");
+    for count in [10_usize, 100] {
+        let subset = temporary_root(&format!("session-discovery-{count}"));
+        let source = SessionStore::directory_for(&root);
+        let target = SessionStore::directory_for(&subset);
+        fs::create_dir_all(&target).expect("session directory");
+        for number in 0..count {
+            let name = format!("discovery-{number:03}.jsonl");
+            fs::copy(source.join(&name), target.join(name)).expect("session copy");
+        }
+        group.bench_function(format!("{count}_sessions"), |b| {
+            b.iter(|| black_box(SessionStore::summaries(&subset).expect("session discovery")))
+        });
+        let _ = fs::remove_dir_all(subset);
+    }
+    group.finish();
+    let _ = fs::remove_dir_all(root);
+}
+
 criterion_group!(
     benches,
     process_startup,
@@ -397,6 +437,7 @@ criterion_group!(
     process_buffer_and_registry,
     search_comparison,
     patch_operations,
-    session_replay
+    session_replay,
+    session_discovery
 );
 criterion_main!(benches);

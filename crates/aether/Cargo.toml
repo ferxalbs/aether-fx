@@ -18,3 +18,6 @@ aether-tools.workspace = true
 lexopt.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -366,19 +366,19 @@ async fn run_resume(session: String, model: Option<String>, root: PathBuf) -> Re
 }
 
 async fn run_resume_latest(model: Option<String>, root: PathBuf) -> Result<(), AppError> {
-    let (summaries, issues) = tokio::task::spawn_blocking({
+    let (restored, issues) = tokio::task::spawn_blocking({
         let root = root.clone();
-        move || SessionStore::summaries(root)
+        move || SessionStore::restore_latest(root)
     })
     .await
     .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
     for issue in issues {
         eprintln!("AETHER Fx: skipped corrupt session: {issue}");
     }
-    let Some(session) = summaries.first() else {
+    let Some(restored) = restored else {
         return Err(AppError::Message("session not found".to_owned()));
     };
-    run_resume(session.session_id.as_str().to_owned(), model, root).await
+    run_interactive(model, root, Some(restored), None, false).await
 }
 
 fn finish_shutdown(report: ProcessShutdownReport) -> Result<(), AppError> {

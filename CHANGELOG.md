@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-22 (8) - Contained session discovery and reliable resume
+
+> Status: unreleased work. No artifact has been published.
+
+### Changed
+
+- Session listing reads bounded header and tail metadata instead of replaying complete JSONL
+  history, while preserving newest-first ordering.
+- `aether resume --latest` skips corrupt, empty, unsupported, or otherwise unrestorable sessions
+  until it finds newest valid candidate.
+
+### Security
+
+- Session enumeration opens `.aether`, `sessions`, and JSONL entries through contained no-follow
+  filesystem operations, rejecting symbolic links and Windows reparse points.
+
 ## Unreleased - 2026-08-22 (7) - CLI and session workflow improvements
 
 > Status: unreleased work. No artifact has been published.

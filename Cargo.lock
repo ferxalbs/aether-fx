@@ -12,6 +12,7 @@ dependencies = [
  "aether-terminal",
  "aether-tools",
  "lexopt",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

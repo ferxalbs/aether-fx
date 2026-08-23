@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use aether_core::{
@@ -69,71 +69,136 @@ impl SessionStore {
     pub fn summaries(
         workspace: impl AsRef<Path>,
     ) -> Result<(Vec<SessionSummary>, Vec<String>), SessionStoreError> {
-        let directory = Self::directory_for(workspace.as_ref());
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new()));
-            }
-            Err(error) => {
-                return Err(SessionStoreError::Io {
-                    operation: "list sessions".to_owned(),
-                    message: error.to_string(),
-                });
-            }
-        };
+        let entries = session_fs::session_entries(workspace.as_ref())?;
         let mut summaries = Vec::new();
         let mut issues = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|error| SessionStoreError::Io {
-                operation: "read session directory".to_owned(),
-                message: error.to_string(),
-            })?;
-            let entry_path = entry.path();
-            let Some(stem) = entry_path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let Ok(session_id) = SessionId::new(stem.to_owned()) else { continue };
-            let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let store = match Self::open(workspace.as_ref(), session_id.clone()) {
-                Ok(store) => store,
-                Err(error) => {
-                    issues.push(format!("{session_id}: {error}"));
-                    continue;
-                }
-            };
-            let lines = match store.read() {
-                Ok(lines) => lines,
-                Err(error) => {
-                    issues.push(format!("{session_id}: {error}"));
-                    continue;
-                }
-            };
-            let mut model = None;
-            let mut workspace = None;
-            let mut last_turn = None;
-            for line in lines {
-                match line.record {
-                    SessionRecord::Started { workspace_root, model: stored_model } => {
-                        workspace = Some(workspace_root);
-                        model = stored_model;
+            let session_id = entry.session_id;
+            let summary =
+                match Self::summary_from_file(entry.file, session_id.clone(), entry.modified) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        issues.push(format!("{session_id}: {error}"));
+                        continue;
                     }
-                    SessionRecord::TurnSnapshot { snapshot } => {
-                        last_turn = Some(snapshot.turn_id);
-                        if snapshot.context.model.is_some() {
-                            model = snapshot.context.model;
-                        }
-                    }
-                    SessionRecord::Finished => {}
-                }
-            }
-            summaries.push(SessionSummary { session_id, model, last_turn, workspace, modified });
+                };
+            summaries.push(summary);
         }
         summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
         Ok((summaries, issues))
+    }
+
+    fn summary_from_file(
+        mut file: File,
+        session_id: SessionId,
+        modified: std::time::SystemTime,
+    ) -> Result<SessionSummary, SessionStoreError> {
+        let length = file
+            .metadata()
+            .map_err(|error| SessionStoreError::Io {
+                operation: "stat session file".to_owned(),
+                message: error.to_string(),
+            })?
+            .len();
+        if length > MAX_SESSION_FILE_BYTES as u64 {
+            return Err(SessionStoreError::Invalid("session file exceeds size limit".to_owned()));
+        }
+        let mut header_text = String::new();
+        let header_bytes =
+            BufReader::new(&mut file).read_line(&mut header_text).map_err(|error| {
+                SessionStoreError::Io {
+                    operation: "read session header".to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+        if header_bytes == 0 {
+            return Err(SessionStoreError::Invalid("session file is empty".to_owned()));
+        }
+        if header_bytes > MAX_SESSION_LINE_BYTES {
+            return Err(SessionStoreError::Invalid("session line exceeds limit".to_owned()));
+        }
+        let header = Self::parse_summary_line(header_text.trim_end(), &session_id)?;
+        let SessionRecord::Started { workspace_root, model } = header.record else {
+            return Err(SessionStoreError::Invalid("session header is missing".to_owned()));
+        };
+
+        const TAIL_BYTES: usize = MAX_SESSION_LINE_BYTES * 2 + 2;
+        let tail_length = usize::try_from(length.min(TAIL_BYTES as u64)).unwrap_or(TAIL_BYTES);
+        file.seek(SeekFrom::End(-(tail_length as i64))).map_err(|error| SessionStoreError::Io {
+            operation: "seek session tail".to_owned(),
+            message: error.to_string(),
+        })?;
+        let mut tail = vec![0; tail_length];
+        file.read_exact(&mut tail).map_err(|error| SessionStoreError::Io {
+            operation: "read session tail".to_owned(),
+            message: error.to_string(),
+        })?;
+        let ended_with_newline = tail.ends_with(b"\n");
+        let tail = std::str::from_utf8(&tail)
+            .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
+        let mut lines: Vec<&str> = tail.split_terminator('\n').collect();
+        if !ended_with_newline && !lines.is_empty() {
+            lines.pop();
+        }
+        if length > tail_length as u64 && !tail.starts_with('\n') && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let mut last_turn = None;
+        let mut latest_model = None;
+        for text in lines.into_iter().rev() {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let line = Self::parse_summary_line(text.trim_end(), &session_id)?;
+            if let SessionRecord::TurnSnapshot { snapshot } = line.record {
+                last_turn = Some(snapshot.turn_id);
+                latest_model = snapshot.context.model;
+                break;
+            }
+        }
+        Ok(SessionSummary {
+            session_id,
+            model: latest_model.or(model),
+            last_turn,
+            workspace: Some(workspace_root),
+            modified,
+        })
+    }
+
+    fn parse_summary_line(
+        text: &str,
+        session_id: &SessionId,
+    ) -> Result<SessionLine, SessionStoreError> {
+        if text.len() > MAX_SESSION_LINE_BYTES {
+            return Err(SessionStoreError::Invalid("session line exceeds limit".to_owned()));
+        }
+        let line: SessionLine = serde_json::from_str(text)
+            .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
+        if line.schema_version != SESSION_SCHEMA_VERSION {
+            return Err(SessionStoreError::Invalid(format!(
+                "unsupported session schema {}",
+                line.schema_version
+            )));
+        }
+        if &line.session_id != session_id {
+            return Err(SessionStoreError::Invalid("session id mismatch".to_owned()));
+        }
+        Ok(line)
+    }
+
+    /// Restore newest valid resumable session, skipping bad candidates.
+    pub fn restore_latest(
+        workspace: impl AsRef<Path>,
+    ) -> Result<(Option<ResumableSession>, Vec<String>), SessionStoreError> {
+        let workspace = workspace.as_ref();
+        let (summaries, mut issues) = Self::summaries(workspace)?;
+        for summary in summaries {
+            match Self::restore(workspace, summary.session_id.clone()) {
+                Ok(restored) => return Ok((Some(restored), issues)),
+                Err(error) => issues.push(format!("{}: {error}", summary.session_id)),
+            }
+        }
+        Ok((None, issues))
     }
     /// Return `{workspace}/.aether/sessions`.
     pub fn directory_for(workspace: impl AsRef<Path>) -> PathBuf {
@@ -340,9 +405,10 @@ impl SessionStore {
                 "session is missing a workspace root".to_owned(),
             ));
         }
-        let mut engine = ContextEngine::restore(context.unwrap_or_else(|| {
-            ContextSnapshot::new(live_workspace.display().to_string(), model.clone())
-        }));
+        let context = context.ok_or_else(|| {
+            SessionStoreError::Invalid("session has no committed turn".to_owned())
+        })?;
+        let mut engine = ContextEngine::restore(context);
         engine.set_model(model.clone());
         engine.set_continuation(continuation.clone());
         let stale = engine.refresh_against_workspace(&live_workspace);
@@ -878,6 +944,74 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside\n");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn summaries_reject_aether_and_sessions_directory_links() {
+        for name in [".aether", ".aether/sessions"] {
+            let (root, _, _) = temp_session("summary-dir-link");
+            let outside = outside_dir("summary-dir-link");
+            if name.contains('/') {
+                std::fs::create_dir_all(root.join(".aether")).unwrap();
+            }
+            if !try_dir_symlink(&outside, &root.join(name)) {
+                let _ = std::fs::remove_dir_all(root);
+                let _ = std::fs::remove_dir_all(outside);
+                continue;
+            }
+            let error = SessionStore::summaries(&root).unwrap_err().to_string();
+            assert!(error.contains("symbolic link") || error.contains("reparse"));
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(outside);
+        }
+    }
+
+    #[test]
+    fn summaries_are_newest_first_and_scale_to_one_hundred() {
+        let (root, _, _) = temp_session("summary-hundred");
+        let mut expected_newest = None;
+        for number in 0..100 {
+            let session = SessionId::new(format!("summary-{number:03}")).unwrap();
+            let mut store = SessionStore::open(&root, session.clone()).unwrap();
+            write_started_and_turn(
+                &mut store,
+                &root,
+                ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned())),
+                None,
+            );
+            expected_newest = Some(session);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (summaries, issues) = SessionStore::summaries(&root).unwrap();
+        assert!(issues.is_empty());
+        assert_eq!(summaries.len(), 100);
+        assert_eq!(summaries[0].session_id, expected_newest.unwrap());
+        assert!(summaries.windows(2).all(|pair| pair[0].modified >= pair[1].modified));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_latest_skips_corrupt_empty_and_unsupported_candidates() {
+        for invalid in ["not-json\n", "", "{\"schema_version\":2}\n"] {
+            let (root, _, _) = temp_session("latest-skip");
+            let older = SessionId::new("older-valid").unwrap();
+            let mut store = SessionStore::open(&root, older.clone()).unwrap();
+            write_started_and_turn(
+                &mut store,
+                &root,
+                ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned())),
+                None,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let newest = SessionId::new("newest-invalid").unwrap();
+            let path = SessionStore::path_for(&root, &newest);
+            std::fs::write(path, invalid).unwrap();
+
+            let (restored, issues) = SessionStore::restore_latest(&root).unwrap();
+            assert_eq!(restored.unwrap().session_id, older);
+            assert!(issues.iter().any(|issue| issue.contains("newest-invalid")));
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
