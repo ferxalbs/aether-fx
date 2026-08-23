@@ -26,11 +26,9 @@ pub enum SessionStoreError {
     Invalid(String),
 }
 
-pub(crate) const AETHER_STATE_DIR: &str = ".aether-fx";
-pub(crate) const SESSION_DIR: &str = "sessions";
 pub(crate) const SESSION_TEMP_PREFIX: &str = ".aether-fx-session";
 
-/// Append-friendly local JSONL session store.
+/// Append-friendly JSONL session store in private OS application-state storage.
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     workspace: PathBuf,
@@ -69,6 +67,21 @@ pub struct SessionSummary {
 }
 
 impl SessionStore {
+    /// Resolve the private AETHER Fx application-state root without creating it.
+    pub fn state_root() -> Result<PathBuf, SessionStoreError> {
+        session_fs::state_root()
+    }
+
+    /// Return the canonical workspace path used for state binding and execution.
+    pub fn canonical_workspace(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+        session_fs::canonical_workspace(workspace)
+    }
+
+    /// Derive the stable, platform-native workspace bucket identifier.
+    pub fn workspace_id(workspace: impl AsRef<Path>) -> Result<String, SessionStoreError> {
+        session_fs::workspace_id(workspace)
+    }
+
     /// Discover contained session files without exposing their contents.
     pub fn summaries(
         workspace: impl AsRef<Path>,
@@ -207,14 +220,9 @@ impl SessionStore {
         }
         Ok((None, issues))
     }
-    /// Return `{workspace}/.aether-fx/sessions`.
-    pub fn directory_for(workspace: impl AsRef<Path>) -> PathBuf {
-        workspace.as_ref().join(AETHER_STATE_DIR).join(SESSION_DIR)
-    }
-
-    /// Return the JSONL path for a session id inside a workspace.
-    pub fn path_for(workspace: impl AsRef<Path>, session_id: &SessionId) -> PathBuf {
-        Self::directory_for(workspace).join(format!("{}.jsonl", session_id.as_str()))
+    /// Return the resolved OS-state session directory for a workspace.
+    pub fn directory_for(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+        session_fs::session_directory(workspace)
     }
 
     /// Open or create a session file inside a workspace and recover its next sequence.
@@ -360,8 +368,7 @@ impl SessionStore {
         live_workspace: impl AsRef<Path>,
         session_id: SessionId,
     ) -> Result<ResumableSession, SessionStoreError> {
-        let path = Self::path_for(live_workspace.as_ref(), &session_id);
-        let layout = session_fs::SessionLayout::from_existing_path(live_workspace.as_ref(), &path)?;
+        let layout = session_fs::SessionLayout::existing(live_workspace.as_ref(), &session_id)?;
         let file = layout.open_jsonl(false)?;
         let lines = Self::replay_reader(file)?;
         if lines.is_empty() {
@@ -554,8 +561,75 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let session = SessionId::new(format!("s-{label}")).unwrap();
-        let path = SessionStore::path_for(&root, &session);
+        let path = SessionStore::directory_for(&root).unwrap().join(format!("{}.jsonl", session));
         (root, path, session)
+    }
+
+    #[test]
+    fn workspace_id_is_deterministic_and_workspace_scoped() {
+        let (root, _, _) = temp_session("workspace-id-a");
+        let (other, _, _) = temp_session("workspace-id-b");
+        let canonical = SessionStore::canonical_workspace(&root).unwrap();
+        assert_eq!(
+            SessionStore::workspace_id(&root).unwrap(),
+            SessionStore::workspace_id(&canonical).unwrap()
+        );
+        assert_ne!(
+            SessionStore::workspace_id(&root).unwrap(),
+            SessionStore::workspace_id(&other).unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn session_creation_stays_outside_workspace() {
+        let (root, path, session) = temp_session("state-override");
+        let mut store = SessionStore::open(&root, session).unwrap();
+        store
+            .append(
+                None,
+                SessionRecord::Started { workspace_root: root.display().to_string(), model: None },
+            )
+            .unwrap();
+        assert!(path.starts_with(SessionStore::state_root().unwrap()));
+        assert!(path.is_file());
+        assert!(!root.join(".aether").exists());
+        assert!(!root.join(".aether-fx").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_id_hashes_non_utf8_native_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let (root, _, _) = temp_session("workspace-id-native");
+        let non_utf8 = root.join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        if fs::create_dir(&non_utf8).is_err() {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let canonical = fs::canonicalize(&non_utf8).unwrap();
+        let expected = blake3::hash(canonical.as_os_str().as_bytes()).to_hex().to_string();
+        assert_eq!(SessionStore::workspace_id(&non_utf8).unwrap(), expected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_metadata_mismatch_fails_closed() {
+        let (root, path, session) = temp_session("metadata-mismatch");
+        let _store = SessionStore::open(&root, session).unwrap();
+        let metadata_path = path.parent().unwrap().parent().unwrap().join("workspace.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["workspace"] = serde_json::Value::String("/different/workspace".to_owned());
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let error = SessionStore::summaries(&root).unwrap_err().to_string();
+        assert!(error.contains("workspace metadata"), "{error}");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     fn inspected(path: &str, hash: &str) -> InspectedFile {
@@ -862,10 +936,19 @@ mod tests {
                 SessionRecord::Started { workspace_root: root.display().to_string(), model: None },
             )
             .unwrap();
-        let aether = root.join(AETHER_STATE_DIR);
-        let sessions = aether.join(SESSION_DIR);
-        assert_eq!(fs::metadata(&aether).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(&sessions).unwrap().permissions().mode() & 0o777, 0o700);
+        let sessions = path.parent().unwrap();
+        let workspace_state = sessions.parent().unwrap();
+        let workspaces = workspace_state.parent().unwrap();
+        let state_root = workspaces.parent().unwrap();
+        assert_eq!(fs::metadata(state_root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(workspaces).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(workspace_state).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(sessions).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(workspace_state.join("workspace.json")).unwrap().permissions().mode()
+                & 0o777,
+            0o600
+        );
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1004,12 +1087,21 @@ mod tests {
         }
     }
 
+    fn state_bucket(root: &Path) -> PathBuf {
+        SessionStore::state_root()
+            .unwrap()
+            .join("workspaces")
+            .join(SessionStore::workspace_id(root).unwrap())
+    }
+
     #[test]
-    fn aether_fx_state_symlink_escape_is_rejected() {
+    fn workspace_bucket_symlink_escape_is_rejected() {
         let (root, _, session) = temp_session("aether-link");
         let outside = outside_dir("aether-link");
         std::fs::write(outside.join("escaped.txt"), "outside").unwrap();
-        if !try_dir_symlink(&outside, &root.join(AETHER_STATE_DIR)) {
+        let bucket = state_bucket(&root);
+        std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+        if !try_dir_symlink(&outside, &bucket) {
             let _ = std::fs::remove_dir_all(root);
             let _ = std::fs::remove_dir_all(outside);
             return;
@@ -1029,8 +1121,10 @@ mod tests {
     fn sessions_symlink_escape_is_rejected() {
         let (root, _, session) = temp_session("sessions-link");
         let outside = outside_dir("sessions-link");
-        std::fs::create_dir_all(root.join(AETHER_STATE_DIR)).unwrap();
-        if !try_dir_symlink(&outside, &root.join(AETHER_STATE_DIR).join(SESSION_DIR)) {
+        let bucket = state_bucket(&root);
+        std::fs::create_dir_all(&bucket).unwrap();
+        let sessions = bucket.join("sessions");
+        if !try_dir_symlink(&outside, &sessions) {
             let _ = std::fs::remove_dir_all(root);
             let _ = std::fs::remove_dir_all(outside);
             return;
@@ -1070,17 +1164,16 @@ mod tests {
 
     #[test]
     fn summaries_reject_state_and_sessions_directory_links() {
-        for name in [AETHER_STATE_DIR, SESSION_DIR] {
+        for nested in [false, true] {
             let (root, _, _) = temp_session("summary-dir-link");
             let outside = outside_dir("summary-dir-link");
-            if name == SESSION_DIR {
-                std::fs::create_dir_all(root.join(AETHER_STATE_DIR)).unwrap();
-            }
-            let link = if name == SESSION_DIR {
-                root.join(AETHER_STATE_DIR).join(name)
+            let bucket = state_bucket(&root);
+            if nested {
+                std::fs::create_dir_all(&bucket).unwrap();
             } else {
-                root.join(name)
-            };
+                std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+            }
+            let link = if nested { bucket.join("sessions") } else { bucket };
             if !try_dir_symlink(&outside, &link) {
                 let _ = std::fs::remove_dir_all(root);
                 let _ = std::fs::remove_dir_all(outside);
@@ -1131,7 +1224,8 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
             let newest = SessionId::new("newest-invalid").unwrap();
-            let path = SessionStore::path_for(&root, &newest);
+            let path =
+                SessionStore::directory_for(&root).unwrap().join(format!("{}.jsonl", newest));
             std::fs::write(path, invalid).unwrap();
 
             let (restored, issues) = SessionStore::restore_latest(&root).unwrap();

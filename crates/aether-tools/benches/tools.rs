@@ -354,7 +354,9 @@ fn session_replay(c: &mut Criterion) {
     let root = std::env::temp_dir().join(format!("aether-bench-session-{}", std::process::id()));
     fs::create_dir_all(&root).expect("benchmark root");
     let session = SessionId::new("bench-session").expect("benchmark id");
-    let path = SessionStore::path_for(&root, &session);
+    let path = SessionStore::directory_for(&root)
+        .expect("session directory")
+        .join(format!("{session}.jsonl"));
     let lines = (1..=32)
         .map(|sequence| {
             serde_json::to_string(&SessionLine::new(
@@ -389,7 +391,9 @@ fn session_discovery(c: &mut Criterion) {
     let root = temporary_root("session-discovery");
     for number in 0..100 {
         let session = SessionId::new(format!("discovery-{number:03}")).expect("benchmark id");
-        let path = SessionStore::path_for(&root, &session);
+        let path = SessionStore::directory_for(&root)
+            .expect("session directory")
+            .join(format!("{session}.jsonl"));
         fs::create_dir_all(path.parent().expect("session parent")).expect("session directory");
         let started = SessionLine::new(
             1,
@@ -409,8 +413,8 @@ fn session_discovery(c: &mut Criterion) {
     let mut group = c.benchmark_group("session_discovery");
     for count in [10_usize, 100] {
         let subset = temporary_root(&format!("session-discovery-{count}"));
-        let source = SessionStore::directory_for(&root);
-        let target = SessionStore::directory_for(&subset);
+        let source = SessionStore::directory_for(&root).expect("session directory");
+        let target = SessionStore::directory_for(&subset).expect("session directory");
         fs::create_dir_all(&target).expect("session directory");
         for number in 0..count {
             let name = format!("discovery-{number:03}.jsonl");
@@ -422,6 +426,21 @@ fn session_discovery(c: &mut Criterion) {
         let _ = fs::remove_dir_all(subset);
     }
     group.finish();
+    let _ = fs::remove_dir_all(root);
+}
+
+fn state_workspace_resolution(c: &mut Criterion) {
+    let root = temporary_root("state-resolution");
+    c.bench_function("state_workspace_resolution", |b| {
+        b.iter(|| {
+            black_box((
+                SessionStore::state_root().expect("state root"),
+                SessionStore::canonical_workspace(&root).expect("canonical workspace"),
+                SessionStore::workspace_id(&root).expect("workspace id"),
+                SessionStore::directory_for(&root).expect("session directory"),
+            ))
+        })
+    });
     let _ = fs::remove_dir_all(root);
 }
 
@@ -438,6 +457,7 @@ criterion_group!(
     search_comparison,
     patch_operations,
     session_replay,
-    session_discovery
+    session_discovery,
+    state_workspace_resolution
 );
 criterion_main!(benches);

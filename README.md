@@ -28,7 +28,7 @@ cargo test --workspace --all-features --locked
 cargo run -p aether -- --version
 ```
 
-`aether` does not contact Rainy at startup. Inference requires `RAINY_API_KEY`; the key is read from the environment only when an inference operation is requested and is never printed or persisted. Interactive and one-shot runs write bounded JSONL under `<workspace>/.aether-fx/sessions/`. Resume with `aether resume <session-id>`.
+`aether` does not contact Rainy at startup. Inference requires `RAINY_API_KEY`; the key is read from the environment only when an inference operation is requested and is never printed or persisted. Repositories contain user/project data; AETHER Fx persistent application and session state lives in private OS state storage, grouped by canonical workspace identity. Set `AETHER_FX_STATE_DIR` for tests or controlled environments. Resume with `aether resume <session-id>`.
 
 ## Security and licensing
 

@@ -171,20 +171,20 @@ fn print_help() {
         "AETHER Fx {VERSION}\n\n\
          Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models\n  aether doctor\n\n\
          Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  --latest      Resume the newest valid local session\n  -h, --help    Show help\n  -V, --version Show version\n\n\
-         Sessions are stored as bounded JSONL under <root>/.aether-fx/sessions."
+         Sessions are stored as bounded JSONL in private OS application-state storage."
     );
 }
 
 fn doctor(root: &Path) -> Result<(), AppError> {
+    let workspace = SessionStore::canonical_workspace(root)?;
+    let state = SessionStore::state_root()?;
+    let sessions = SessionStore::directory_for(&workspace)?;
     println!("AETHER Fx {VERSION}");
-    println!("workspace: {}", root.display());
-    println!(
-        "RAINY_API_KEY: {}",
-        if std::env::var_os("RAINY_API_KEY").is_some() { "present" } else { "missing" }
-    );
+    println!("workspace: {}", workspace.display());
+    println!("state: {}", state.display());
+    println!("sessions: {}", sessions.display());
     println!("telemetry: disabled");
     println!("provider integrations: Rainy SDK only");
-    println!("sessions: {}", SessionStore::directory_for(root).display());
     Ok(())
 }
 
@@ -259,7 +259,9 @@ async fn run_interactive(
         None => configured_model(model)?,
     };
     let backend = RainyBackend::from_env().map_err(|error| AppError::Message(error.to_string()))?;
-    let live_root = resume.as_ref().map(|session| session.workspace_root.clone()).unwrap_or(root);
+    let requested_root =
+        resume.as_ref().map(|session| session.workspace_root.clone()).unwrap_or(root);
+    let live_root = SessionStore::canonical_workspace(requested_root)?;
     let tools = new_tool_registry(live_root.clone()).await?;
     let workspace = tools.workspace().clone();
     let agent = Agent::new(backend, tools);

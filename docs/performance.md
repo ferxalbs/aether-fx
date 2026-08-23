@@ -46,6 +46,14 @@ Phase 1.1 verification run on 2026-08-22 used the same Criterion benchmark suite
 
 Phase 2 verification run on 2026-08-22 used the same Criterion suite (`sample-size 10`, 100 ms warmup, 200 ms measurement) on the same x86_64 macOS host. Selected current medians were: process startup 47.382 ms, small-file read 69.493 µs, blocking dispatch 60.242 µs, atomic write 1.9126 ms, staged patch application 1.9403 ms, session replay 32.246 µs, and process registry lookup 5.4360 µs. Criterion reported statistically significant regressions versus the saved baseline for small-file read (+28.5%), blocking dispatch (+25.3%), atomic write (+17.2%), session replay (+11.3%), event dispatch (+2.3%), and process registry lookup (+2.4%). The small-file-read increase is expected: `read` now computes a BLAKE3 content hash for stale-file tracking. Session replay now validates schema version 2, secret refusal, and truncated-tail recovery. Short-sample Criterion noise remains; these are observations for regression review, not cross-machine claims.
 
-Session-safety hardening uses schema version 3 committed `TurnSnapshot` records, Unix session modes, continuation invalidation on workspace drift, typed `InvalidContinuation` recovery, and no-follow session path containment. No new Criterion run was taken for this correctness pass. Session replay now validates schema v3 rather than v2.
+Session-safety hardening uses schema version 3 committed `TurnSnapshot` records, Unix session modes, continuation invalidation on workspace drift, typed `InvalidContinuation` recovery, and no-follow session path containment. The earlier correctness pass took no new Criterion run; session replay now validates schema v3 rather than v2.
+
+Private application-state verification run on 2026-08-22 used the new OS-state layout with
+the exact benchmark command, 100 Criterion samples, and the same local host. Measured
+medians were 661.76 µs for bounded session replay, 444.97 µs for 10-session discovery,
+2.5024 ms for 100-session discovery, and 63.656 µs for combined state-root,
+canonical-workspace, workspace-ID, and session-directory resolution. These are local
+diagnostics for the new layout; no cross-machine or speculative regression percentage is
+published.
 
 The release profile is `opt-level=3`, fat LTO, one codegen unit, aborting panic, stripped symbols, no debug info, and no incremental compilation. Public builds do not use `target-cpu=native`.

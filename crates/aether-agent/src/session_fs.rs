@@ -1,10 +1,12 @@
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aether_core::SessionId;
+use serde::{Deserialize, Serialize};
 
-use crate::session::{AETHER_STATE_DIR, SESSION_DIR, SESSION_TEMP_PREFIX, SessionStoreError};
+use crate::session::{SESSION_TEMP_PREFIX, SessionStoreError};
+use crate::state;
 
 pub(crate) struct SessionEntry {
     pub session_id: SessionId,
@@ -12,14 +14,82 @@ pub(crate) struct SessionEntry {
     pub modified: std::time::SystemTime,
 }
 
-pub(crate) fn session_entries(
-    workspace: impl AsRef<Path>,
-) -> Result<Vec<SessionEntry>, SessionStoreError> {
-    contained_session_entries(workspace.as_ref())
+pub(crate) struct WorkspaceLayout {
+    pub workspace: PathBuf,
+    pub state_root: PathBuf,
+    #[cfg(unix)]
+    pub workspace_id: String,
+    pub workspace_dir: PathBuf,
+    pub sessions_dir: PathBuf,
+}
+
+impl WorkspaceLayout {
+    pub(crate) fn resolve(
+        workspace: impl AsRef<Path>,
+        create: bool,
+    ) -> Result<Option<Self>, SessionStoreError> {
+        let workspace = state::canonical_workspace(workspace.as_ref())?;
+        let state_root = state::resolve_state_root()?;
+        if state_root == workspace || state_root.starts_with(&workspace) {
+            return Err(SessionStoreError::Invalid(
+                "AETHER Fx state root must be outside the workspace".to_owned(),
+            ));
+        }
+        let workspace_id = state::workspace_id(&workspace);
+        let workspace_dir = state_root.join(state::WORKSPACES_DIR).join(&workspace_id);
+        let sessions_dir = workspace_dir.join(state::SESSION_DIR);
+
+        if create {
+            prepare_directories(&state_root, &workspace_id)?;
+        } else if !state_directories_exist(&state_root, &workspace_id)? {
+            return Ok(None);
+        }
+
+        let layout = Self {
+            workspace,
+            state_root,
+            #[cfg(unix)]
+            workspace_id,
+            workspace_dir,
+            sessions_dir,
+        };
+        ensure_workspace_metadata(&layout)?;
+        Ok(Some(layout))
+    }
+
+    pub(crate) fn session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionLayout, SessionStoreError> {
+        let file_name = format!("{}.jsonl", session_id.as_str());
+        let path = self.sessions_dir.join(&file_name);
+        reject_indirect_file(&path, "session file")?;
+        Ok(SessionLayout {
+            workspace: self.workspace.clone(),
+            #[cfg(unix)]
+            state_root: self.state_root.clone(),
+            #[cfg(unix)]
+            workspace_id: self.workspace_id.clone(),
+            #[cfg(unix)]
+            workspace_dir: self.workspace_dir.clone(),
+            #[cfg(unix)]
+            sessions_dir: self.sessions_dir.clone(),
+            path,
+            file_name,
+        })
+    }
 }
 
 pub(crate) struct SessionLayout {
     pub workspace: PathBuf,
+    #[cfg(unix)]
+    pub state_root: PathBuf,
+    #[cfg(unix)]
+    pub workspace_id: String,
+    #[cfg(unix)]
+    pub workspace_dir: PathBuf,
+    #[cfg(unix)]
+    pub sessions_dir: PathBuf,
     pub path: PathBuf,
     file_name: String,
 }
@@ -29,55 +99,18 @@ impl SessionLayout {
         workspace: impl AsRef<Path>,
         session_id: &SessionId,
     ) -> Result<Self, SessionStoreError> {
-        let workspace = canonical_workspace(workspace.as_ref())?;
-        let file_name = format!("{}.jsonl", session_id.as_str());
-        let path = workspace.join(AETHER_STATE_DIR).join(SESSION_DIR).join(&file_name);
-        prepare_directories(&workspace)?;
-        reject_indirect_file(&path)?;
-        Ok(Self { workspace, path, file_name })
+        WorkspaceLayout::resolve(workspace, true)?
+            .ok_or(SessionStoreError::NotFound)?
+            .session(session_id)
     }
 
-    pub(crate) fn from_existing_path(
-        live_workspace: impl AsRef<Path>,
-        path: impl AsRef<Path>,
+    pub(crate) fn existing(
+        workspace: impl AsRef<Path>,
+        session_id: &SessionId,
     ) -> Result<Self, SessionStoreError> {
-        let workspace = canonical_workspace(live_workspace.as_ref())?;
-        let path = path.as_ref();
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| SessionStoreError::Invalid("session file name is invalid".to_owned()))?
-            .to_owned();
-        if !file_name.ends_with(".jsonl") {
-            return Err(SessionStoreError::Invalid("session file name is invalid".to_owned()));
-        }
-        let sessions_dir = path.parent().ok_or_else(|| {
-            SessionStoreError::Invalid("session path escapes the workspace".to_owned())
-        })?;
-        let aether_dir = sessions_dir.parent().ok_or_else(|| {
-            SessionStoreError::Invalid("session path escapes the workspace".to_owned())
-        })?;
-        let claimed_workspace = aether_dir.parent().ok_or_else(|| {
-            SessionStoreError::Invalid("session path escapes the workspace".to_owned())
-        })?;
-        if sessions_dir.file_name() != Some(std::ffi::OsStr::new(SESSION_DIR))
-            || aether_dir.file_name() != Some(std::ffi::OsStr::new(AETHER_STATE_DIR))
-        {
-            return Err(SessionStoreError::Invalid(
-                "session path escapes the workspace".to_owned(),
-            ));
-        }
-        let claimed = fs::canonicalize(claimed_workspace)
-            .map_err(|error| io_err("canonicalize session workspace prefix", error))?;
-        if claimed != workspace {
-            return Err(SessionStoreError::Invalid(
-                "session path escapes the workspace".to_owned(),
-            ));
-        }
-        prepare_directories(&workspace)?;
-        let expected = workspace.join(AETHER_STATE_DIR).join(SESSION_DIR).join(&file_name);
-        reject_indirect_file(&expected)?;
-        Ok(Self { workspace, path: expected, file_name })
+        WorkspaceLayout::resolve(workspace, false)?
+            .ok_or(SessionStoreError::NotFound)?
+            .session(session_id)
     }
 
     pub(crate) fn open_jsonl(&self, create: bool) -> Result<File, SessionStoreError> {
@@ -97,34 +130,214 @@ impl SessionLayout {
     }
 }
 
-fn canonical_workspace(path: &Path) -> Result<PathBuf, SessionStoreError> {
-    let workspace = fs::canonicalize(path).map_err(|error| SessionStoreError::Io {
-        operation: "canonicalize workspace".to_owned(),
-        message: error.to_string(),
-    })?;
-    let metadata = fs::metadata(&workspace).map_err(|error| SessionStoreError::Io {
-        operation: "stat workspace".to_owned(),
-        message: error.to_string(),
-    })?;
-    if !metadata.is_dir() {
-        return Err(SessionStoreError::Invalid("workspace is not a directory".to_owned()));
+pub(crate) fn session_entries(
+    workspace: impl AsRef<Path>,
+) -> Result<Vec<SessionEntry>, SessionStoreError> {
+    let Some(layout) = WorkspaceLayout::resolve(workspace, false)? else {
+        return Ok(Vec::new());
+    };
+    contained_session_entries(&layout)
+}
+
+pub(crate) fn session_directory(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+    let workspace = state::canonical_workspace(workspace.as_ref())?;
+    let state_root = state::resolve_state_root()?;
+    if state_root == workspace || state_root.starts_with(&workspace) {
+        return Err(SessionStoreError::Invalid(
+            "AETHER Fx state root must be outside the workspace".to_owned(),
+        ));
     }
-    Ok(workspace)
+    let workspace_id = state::workspace_id(&workspace);
+    Ok(state_root.join(state::WORKSPACES_DIR).join(workspace_id).join(state::SESSION_DIR))
+}
+
+pub(crate) fn canonical_workspace(path: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+    state::canonical_workspace(path.as_ref())
+}
+
+pub(crate) fn workspace_id(path: impl AsRef<Path>) -> Result<String, SessionStoreError> {
+    let workspace = state::canonical_workspace(path.as_ref())?;
+    Ok(state::workspace_id(&workspace))
+}
+
+pub(crate) fn state_root() -> Result<PathBuf, SessionStoreError> {
+    state::resolve_state_root()
+}
+
+#[derive(Deserialize, Serialize)]
+struct WorkspaceMetadata {
+    version: u32,
+    workspace: String,
+    workspace_native: String,
+}
+
+fn workspace_metadata_bytes(workspace: &Path) -> Result<Vec<u8>, SessionStoreError> {
+    serde_json::to_vec(&WorkspaceMetadata {
+        version: state::WORKSPACE_METADATA_VERSION,
+        workspace: state::workspace_display(workspace),
+        workspace_native: state::native_path_hex(workspace),
+    })
+    .map_err(|error| SessionStoreError::Invalid(error.to_string()))
+}
+
+fn validate_workspace_metadata(bytes: &[u8], workspace: &Path) -> Result<(), SessionStoreError> {
+    if bytes.len() > state::MAX_WORKSPACE_METADATA_BYTES {
+        return Err(SessionStoreError::Invalid("workspace metadata exceeds size limit".to_owned()));
+    }
+    let metadata: WorkspaceMetadata = serde_json::from_slice(bytes).map_err(|error| {
+        SessionStoreError::Invalid(format!("workspace metadata is invalid: {error}"))
+    })?;
+    if metadata.version != state::WORKSPACE_METADATA_VERSION {
+        return Err(SessionStoreError::Invalid(format!(
+            "unsupported workspace metadata version {}",
+            metadata.version
+        )));
+    }
+    let expected = workspace_metadata_bytes(workspace)?;
+    let expected: WorkspaceMetadata = serde_json::from_slice(&expected)
+        .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
+    if metadata.workspace != expected.workspace
+        || metadata.workspace_native != expected.workspace_native
+    {
+        return Err(SessionStoreError::Invalid(
+            "workspace metadata does not match the current canonical workspace".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_workspace_metadata(layout: &WorkspaceLayout) -> Result<(), SessionStoreError> {
+    let bytes = workspace_metadata_bytes(&layout.workspace)?;
+
+    #[cfg(unix)]
+    {
+        ensure_workspace_metadata_unix(layout, &bytes)
+    }
+
+    #[cfg(not(unix))]
+    {
+        ensure_workspace_metadata_std(layout, &bytes)
+    }
+}
+
+#[cfg(unix)]
+fn ensure_workspace_metadata_unix(
+    layout: &WorkspaceLayout,
+    bytes: &[u8],
+) -> Result<(), SessionStoreError> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, openat};
+    use std::os::fd::AsFd;
+
+    let workspace_fd = open_state_workspace_dir(layout)?;
+    match openat(
+        workspace_fd.as_fd(),
+        state::WORKSPACE_METADATA,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(fd) => {
+            fchmod(&fd, Mode::RUSR | Mode::WUSR)
+                .map_err(|error| io_err("restrict workspace metadata", error))?;
+            let stat = fstat(&fd).map_err(|error| io_err("stat workspace metadata", error))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(SessionStoreError::Invalid(
+                    "workspace metadata is not a regular file".to_owned(),
+                ));
+            }
+            let mut file = File::from(fd);
+            let write = (|| {
+                file.write_all(bytes)?;
+                file.flush()?;
+                file.sync_all()
+            })();
+            if let Err(error) = write {
+                let _ = rustix::fs::unlinkat(
+                    workspace_fd.as_fd(),
+                    state::WORKSPACE_METADATA,
+                    rustix::fs::AtFlags::empty(),
+                );
+                return Err(io_err("write workspace metadata", error));
+            }
+            Ok(())
+        }
+        Err(rustix::io::Errno::EXIST) => {
+            let fd = openat(
+                workspace_fd.as_fd(),
+                state::WORKSPACE_METADATA,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| map_unix_open_error("open workspace metadata", error))?;
+            fchmod(&fd, Mode::RUSR | Mode::WUSR)
+                .map_err(|error| io_err("restrict workspace metadata", error))?;
+            let stat = fstat(&fd).map_err(|error| io_err("stat workspace metadata", error))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(SessionStoreError::Invalid(
+                    "workspace metadata is not a regular file".to_owned(),
+                ));
+            }
+            let mut file = File::from(fd);
+            let existing = read_bounded(&mut file, "read workspace metadata")?;
+            validate_workspace_metadata(&existing, &layout.workspace)
+        }
+        Err(error) => Err(map_unix_open_error("create workspace metadata", error)),
+    }
 }
 
 #[cfg(not(unix))]
-fn path_inside(child: &Path, parent: &Path) -> bool {
-    child.starts_with(parent)
+fn ensure_workspace_metadata_std(
+    layout: &WorkspaceLayout,
+    bytes: &[u8],
+) -> Result<(), SessionStoreError> {
+    let path = layout.workspace_dir.join(state::WORKSPACE_METADATA);
+    reject_indirect_file(&path, "workspace metadata")?;
+    let mut options = open_options_nofollow();
+    options.read(true).write(true).create_new(true);
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(bytes)
+                .and_then(|()| file.flush())
+                .map_err(|error| io_err("write workspace metadata", error))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut options = open_options_nofollow();
+            options.read(true);
+            let mut file =
+                options.open(&path).map_err(|error| io_err("open workspace metadata", error))?;
+            let existing = read_bounded(&mut file, "read workspace metadata")?;
+            validate_workspace_metadata(&existing, &layout.workspace)
+        }
+        Err(error) => Err(io_err("create workspace metadata", error)),
+    }
 }
 
-fn io_err(operation: &str, error: impl ToString) -> SessionStoreError {
-    SessionStoreError::Io { operation: operation.to_owned(), message: error.to_string() }
+fn read_bounded(file: &mut File, operation: &str) -> Result<Vec<u8>, SessionStoreError> {
+    let limit = state::MAX_WORKSPACE_METADATA_BYTES;
+    let mut bytes = Vec::with_capacity(limit.min(4096));
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_err(operation, error))?;
+    if bytes.len() > limit {
+        return Err(SessionStoreError::Invalid("workspace metadata exceeds size limit".to_owned()));
+    }
+    Ok(bytes)
+}
+
+fn reject_indirect_file(path: &Path, what: &str) -> Result<(), SessionStoreError> {
+    reject_symlink(path, what)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_err("stat state file", error)),
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(SessionStoreError::Invalid(format!("{what} is not a regular file"))),
+    }
 }
 
 fn reject_symlink(path: &Path, what: &str) -> Result<(), SessionStoreError> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_err("stat session storage", error)),
+        Err(error) => Err(io_err("stat state storage", error)),
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
                 return Err(SessionStoreError::Invalid(format!(
@@ -148,27 +361,91 @@ fn is_reparse_point(_: &fs::Metadata) -> bool {
     false
 }
 
-fn reject_indirect_file(path: &Path) -> Result<(), SessionStoreError> {
-    reject_symlink(path, "session file")?;
+fn ensure_state_root_path(state_root: &Path) -> Result<(), SessionStoreError> {
+    if let Err(error) = fs::create_dir_all(state_root)
+        && error.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(io_err("create AETHER Fx state root", error));
+    }
+    reject_symlink(state_root, "AETHER Fx state root")?;
+    let metadata = fs::symlink_metadata(state_root)
+        .map_err(|error| io_err("stat AETHER Fx state root", error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(SessionStoreError::Invalid(
+            "AETHER Fx state root is not a directory".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn state_directories_exist(
+    state_root: &Path,
+    workspace_id: &str,
+) -> Result<bool, SessionStoreError> {
+    if !real_directory_exists(state_root, "AETHER Fx state root")? {
+        return Ok(false);
+    }
+    let workspaces = state_root.join(state::WORKSPACES_DIR);
+    if !real_directory_exists(&workspaces, "state workspaces directory")? {
+        return Ok(false);
+    }
+    let workspace_dir = workspaces.join(workspace_id);
+    if !real_directory_exists(&workspace_dir, "workspace state directory")? {
+        return Ok(false);
+    }
+    if !real_directory_exists(&workspace_dir.join(state::SESSION_DIR), "session directory")? {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    restrict_existing_directories(state_root, workspace_id)?;
+    Ok(true)
+}
+
+fn real_directory_exists(path: &Path, what: &str) -> Result<bool, SessionStoreError> {
     match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_err("stat session file", error)),
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(SessionStoreError::Invalid("session file is not a regular file".to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_err("stat state directory", error)),
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || is_reparse_point(&metadata)
+                || !metadata.file_type().is_dir() =>
+        {
+            Err(SessionStoreError::Invalid(format!(
+                "{what} is a symbolic link, reparse point, or not a directory"
+            )))
+        }
+        Ok(_) => Ok(true),
     }
 }
 
 #[cfg(unix)]
-fn prepare_directories(workspace: &Path) -> Result<(), SessionStoreError> {
-    use rustix::fs::{CWD, Mode, OFlags, openat};
+fn prepare_directories(state_root: &Path, workspace_id: &str) -> Result<(), SessionStoreError> {
+    use rustix::fs::{CWD, Mode, OFlags, fchmod, openat};
     use std::os::fd::AsFd;
 
-    let workspace_fd =
-        openat(CWD, workspace, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-            .map_err(|error| io_err("open workspace", error))?;
-    let aether = ensure_unix_dir(workspace_fd.as_fd(), AETHER_STATE_DIR)?;
-    let _sessions = ensure_unix_dir(aether.as_fd(), SESSION_DIR)?;
+    ensure_state_root_path(state_root)?;
+    let state = openat(
+        CWD,
+        state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open AETHER Fx state root", error))?;
+    fchmod(&state, Mode::RWXU).map_err(|error| io_err("restrict AETHER Fx state root", error))?;
+    let workspaces = ensure_unix_dir(state.as_fd(), state::WORKSPACES_DIR)?;
+    let workspace = ensure_unix_dir(workspaces.as_fd(), workspace_id)?;
+    let _sessions = ensure_unix_dir(workspace.as_fd(), state::SESSION_DIR)?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_directories(state_root: &Path, workspace_id: &str) -> Result<(), SessionStoreError> {
+    ensure_state_root_path(state_root)?;
+    let workspaces = state_root.join(state::WORKSPACES_DIR);
+    ensure_real_dir(&workspaces, state_root, "state workspaces directory")?;
+    let workspace = workspaces.join(workspace_id);
+    ensure_real_dir(&workspace, state_root, "workspace state directory")?;
+    ensure_real_dir(&workspace.join(state::SESSION_DIR), state_root, "session directory")
 }
 
 #[cfg(unix)]
@@ -180,7 +457,7 @@ fn ensure_unix_dir(
 
     match mkdirat(parent, name, Mode::RWXU) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-        Err(error) => return Err(map_unix_open_error("create session directory", error)),
+        Err(error) => return Err(map_unix_open_error("create state directory", error)),
     }
     let fd = openat(
         parent,
@@ -188,59 +465,137 @@ fn ensure_unix_dir(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(|error| map_unix_open_error("open session directory", error))?;
-    fchmod(&fd, Mode::RWXU).map_err(|error| io_err("restrict session directory", error))?;
-    let stat = fstat(&fd).map_err(|error| io_err("stat session directory", error))?;
+    .map_err(|error| map_unix_open_error("open state directory", error))?;
+    fchmod(&fd, Mode::RWXU).map_err(|error| io_err("restrict state directory", error))?;
+    let stat = fstat(&fd).map_err(|error| io_err("stat state directory", error))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-        return Err(SessionStoreError::Invalid("session directory is not a directory".to_owned()));
+        return Err(SessionStoreError::Invalid("state directory is not a directory".to_owned()));
     }
     Ok(fd)
 }
 
 #[cfg(unix)]
-fn map_unix_open_error(operation: &str, error: rustix::io::Errno) -> SessionStoreError {
-    if error == rustix::io::Errno::NOENT {
-        SessionStoreError::NotFound
-    } else if error == rustix::io::Errno::LOOP || error == rustix::io::Errno::NOTDIR {
-        SessionStoreError::Invalid("session storage is a symbolic link or reparse point".to_owned())
-    } else {
-        io_err(operation, error)
+fn restrict_existing_directories(
+    state_root: &Path,
+    workspace_id: &str,
+) -> Result<(), SessionStoreError> {
+    use rustix::fs::{CWD, Mode, OFlags, fchmod, openat};
+    use std::os::fd::AsFd;
+
+    let state = openat(
+        CWD,
+        state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open AETHER Fx state root", error))?;
+    fchmod(&state, Mode::RWXU).map_err(|error| io_err("restrict AETHER Fx state root", error))?;
+    let workspaces = openat(
+        state.as_fd(),
+        state::WORKSPACES_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open state workspaces directory", error))?;
+    fchmod(&workspaces, Mode::RWXU)
+        .map_err(|error| io_err("restrict state workspaces directory", error))?;
+    let workspace = openat(
+        workspaces.as_fd(),
+        workspace_id,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open workspace state directory", error))?;
+    fchmod(&workspace, Mode::RWXU)
+        .map_err(|error| io_err("restrict workspace state directory", error))?;
+    let sessions = openat(
+        workspace.as_fd(),
+        state::SESSION_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open session directory", error))?;
+    fchmod(&sessions, Mode::RWXU).map_err(|error| io_err("restrict session directory", error))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_real_dir(path: &Path, state_root: &Path, what: &str) -> Result<(), SessionStoreError> {
+    reject_symlink(path, what)?;
+    if let Err(error) = fs::create_dir(path)
+        && error.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(io_err("create state directory", error));
     }
+    reject_symlink(path, what)?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_err("stat state directory", error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(SessionStoreError::Invalid(format!("{what} is not a directory")));
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|error| io_err("canonicalize state directory", error))?;
+    let state_root = fs::canonicalize(state_root)
+        .map_err(|error| io_err("canonicalize AETHER Fx state root", error))?;
+    if !path_inside(&canonical, &state_root) {
+        return Err(SessionStoreError::Invalid("state path escapes the state root".to_owned()));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, SessionStoreError> {
-    use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, fstat, openat};
+fn open_state_workspace_dir(
+    layout: &WorkspaceLayout,
+) -> Result<rustix::fd::OwnedFd, SessionStoreError> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
     use std::os::fd::AsFd;
 
-    let workspace = canonical_workspace(workspace)?;
-    let workspace_fd = openat(
+    let state = openat(
         CWD,
-        &workspace,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        &layout.state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(|error| io_err("open workspace", error))?;
-    let aether = match openat(
-        workspace_fd.as_fd(),
-        AETHER_STATE_DIR,
+    .map_err(|error| map_unix_open_error("open AETHER Fx state root", error))?;
+    let workspaces = openat(
+        state.as_fd(),
+        state::WORKSPACES_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
-        Err(error) => return Err(map_unix_open_error("open session directory", error)),
-    };
-    let sessions = match openat(
-        aether.as_fd(),
-        SESSION_DIR,
+    )
+    .map_err(|error| map_unix_open_error("open state workspaces directory", error))?;
+    openat(
+        workspaces.as_fd(),
+        layout.workspace_id.as_str(),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
-        Err(error) => return Err(map_unix_open_error("open session directory", error)),
-    };
+    )
+    .map_err(|error| map_unix_open_error("open workspace state directory", error))
+}
+
+#[cfg(unix)]
+fn open_state_sessions(layout: &WorkspaceLayout) -> Result<rustix::fd::OwnedFd, SessionStoreError> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::os::fd::AsFd;
+
+    let workspace = open_state_workspace_dir(layout)?;
+    openat(
+        workspace.as_fd(),
+        state::SESSION_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open session directory", error))
+}
+
+#[cfg(unix)]
+fn contained_session_entries(
+    layout: &WorkspaceLayout,
+) -> Result<Vec<SessionEntry>, SessionStoreError> {
+    use rustix::fs::{Dir, FileType, Mode, OFlags, fstat, openat};
+    use std::os::fd::AsFd;
+
+    let sessions = open_state_sessions(layout)?;
     let directory =
         Dir::read_from(&sessions).map_err(|error| io_err("read session directory", error))?;
     let mut entries = Vec::new();
@@ -249,15 +604,13 @@ fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, Sess
         let Ok(name) = entry.file_name().to_str() else { continue };
         let Some(stem) = name.strip_suffix(".jsonl") else { continue };
         let Ok(session_id) = SessionId::new(stem.to_owned()) else { continue };
-        let fd = match openat(
+        let fd = openat(
             sessions.as_fd(),
             name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(error) => return Err(map_unix_open_error("open session file", error)),
-        };
+        )
+        .map_err(|error| map_unix_open_error("open session file", error))?;
         let stat = fstat(&fd).map_err(|error| io_err("stat session file", error))?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             continue;
@@ -274,26 +627,19 @@ fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, Sess
 
 #[cfg(unix)]
 fn open_contained_jsonl(layout: &SessionLayout, create: bool) -> Result<File, SessionStoreError> {
-    use rustix::fs::{CWD, FileType, Mode, OFlags, fchmod, fstat, openat};
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, openat};
     use std::os::fd::AsFd;
 
-    let workspace_fd = openat(
-        CWD,
-        &layout.workspace,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| io_err("open workspace", error))?;
-    let aether = openat(
-        workspace_fd.as_fd(),
-        AETHER_STATE_DIR,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|error| map_unix_open_error("open session directory", error))?;
+    let workspace = open_state_workspace_dir(&WorkspaceLayout {
+        workspace: layout.workspace.clone(),
+        state_root: layout.state_root.clone(),
+        workspace_id: layout.workspace_id.clone(),
+        workspace_dir: layout.workspace_dir.clone(),
+        sessions_dir: layout.sessions_dir.clone(),
+    })?;
     let sessions = openat(
-        aether.as_fd(),
-        SESSION_DIR,
+        workspace.as_fd(),
+        state::SESSION_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
@@ -314,26 +660,19 @@ fn open_contained_jsonl(layout: &SessionLayout, create: bool) -> Result<File, Se
 
 #[cfg(unix)]
 fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), SessionStoreError> {
-    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, fchmod, openat, renameat, statat};
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fchmod, openat, renameat, statat};
     use std::os::fd::AsFd;
 
-    let workspace_fd = openat(
-        CWD,
-        &layout.workspace,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| io_err("open workspace", error))?;
-    let aether = openat(
-        workspace_fd.as_fd(),
-        AETHER_STATE_DIR,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|error| map_unix_open_error("open session directory", error))?;
+    let workspace = open_state_workspace_dir(&WorkspaceLayout {
+        workspace: layout.workspace.clone(),
+        state_root: layout.state_root.clone(),
+        workspace_id: layout.workspace_id.clone(),
+        workspace_dir: layout.workspace_dir.clone(),
+        sessions_dir: layout.sessions_dir.clone(),
+    })?;
     let sessions = openat(
-        aether.as_fd(),
-        SESSION_DIR,
+        workspace.as_fd(),
+        state::SESSION_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
@@ -382,40 +721,27 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
 }
 
 #[cfg(not(unix))]
-fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, SessionStoreError> {
-    let workspace = canonical_workspace(workspace)?;
-    let aether = workspace.join(AETHER_STATE_DIR);
-    let sessions = aether.join(SESSION_DIR);
-    for directory in [&aether, &sessions] {
-        match fs::symlink_metadata(directory) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(io_err("stat session directory", error)),
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || is_reparse_point(&metadata)
-                    || !metadata.file_type().is_dir() =>
-            {
-                return Err(SessionStoreError::Invalid(
-                    "session storage is a symbolic link or reparse point".to_owned(),
-                ));
-            }
-            Ok(_) => {}
-        }
-    }
-    let canonical = fs::canonicalize(&sessions)
+fn contained_session_entries(
+    layout: &WorkspaceLayout,
+) -> Result<Vec<SessionEntry>, SessionStoreError> {
+    let canonical_sessions = fs::canonicalize(&layout.sessions_dir)
         .map_err(|error| io_err("canonicalize session directory", error))?;
-    if !path_inside(&canonical, &workspace) {
-        return Err(SessionStoreError::Invalid("session path escapes the workspace".to_owned()));
+    let canonical_root = fs::canonicalize(&layout.state_root)
+        .map_err(|error| io_err("canonicalize AETHER Fx state root", error))?;
+    if !path_inside(&canonical_sessions, &canonical_root) {
+        return Err(SessionStoreError::Invalid("state path escapes the state root".to_owned()));
     }
     let mut entries = Vec::new();
-    for entry in fs::read_dir(&sessions).map_err(|error| io_err("list sessions", error))? {
+    for entry in
+        fs::read_dir(&layout.sessions_dir).map_err(|error| io_err("list sessions", error))?
+    {
         let entry = entry.map_err(|error| io_err("read session directory", error))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(stem) = name.strip_suffix(".jsonl") else { continue };
         let Ok(session_id) = SessionId::new(stem.to_owned()) else { continue };
-        let path = sessions.join(name);
-        reject_indirect_file(&path)?;
+        let path = layout.sessions_dir.join(name);
+        reject_indirect_file(&path, "session file")?;
         let mut options = open_options_nofollow();
         options.read(true);
         let file = options.open(&path).map_err(|error| io_err("open session file", error))?;
@@ -430,53 +756,8 @@ fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, Sess
 }
 
 #[cfg(not(unix))]
-fn prepare_directories(workspace: &Path) -> Result<(), SessionStoreError> {
-    let aether = workspace.join(AETHER_STATE_DIR);
-    ensure_real_dir(&aether, workspace)?;
-    let sessions = aether.join(SESSION_DIR);
-    ensure_real_dir(&sessions, workspace)
-}
-
-#[cfg(not(unix))]
-fn ensure_real_dir(path: &Path, workspace: &Path) -> Result<(), SessionStoreError> {
-    reject_symlink(path, "session directory")?;
-    if let Err(error) = fs::create_dir(path)
-        && error.kind() != io::ErrorKind::AlreadyExists
-    {
-        return Err(io_err("create session directory", error));
-    }
-    reject_symlink(path, "session directory")?;
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_err("stat session directory", error))?;
-    if !metadata.file_type().is_dir() {
-        return Err(SessionStoreError::Invalid("session directory is not a directory".to_owned()));
-    }
-    let canonical =
-        fs::canonicalize(path).map_err(|error| io_err("canonicalize session directory", error))?;
-    if !path_inside(&canonical, workspace) {
-        return Err(SessionStoreError::Invalid("session path escapes the workspace".to_owned()));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn open_options_nofollow() -> std::fs::OpenOptions {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-    let mut options = std::fs::OpenOptions::new();
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    options
-}
-
-#[cfg(not(unix))]
-#[cfg(not(windows))]
-fn open_options_nofollow() -> std::fs::OpenOptions {
-    std::fs::OpenOptions::new()
-}
-
-#[cfg(not(unix))]
 fn open_contained_jsonl(layout: &SessionLayout, create: bool) -> Result<File, SessionStoreError> {
-    reject_indirect_file(&layout.path)?;
+    reject_indirect_file(&layout.path, "session file")?;
     let mut options = open_options_nofollow();
     options.read(true).write(true).append(true);
     if create {
@@ -498,9 +779,9 @@ fn open_contained_jsonl(layout: &SessionLayout, create: bool) -> Result<File, Se
 
 #[cfg(not(unix))]
 fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), SessionStoreError> {
-    reject_indirect_file(&layout.path)?;
+    reject_indirect_file(&layout.path, "session file")?;
     let directory = layout.path.parent().ok_or_else(|| {
-        SessionStoreError::Invalid("session path escapes the workspace".to_owned())
+        SessionStoreError::Invalid("session path escapes the state root".to_owned())
     })?;
     let temporary = directory.join(format!(
         "{SESSION_TEMP_PREFIX}-{}-{}.tmp",
@@ -512,8 +793,8 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
     options.create_new(true).write(true);
     let mut file =
         options.open(&temporary).map_err(|error| io_err("create compacted session", error))?;
-    let metadata =
-        fs::symlink_metadata(&temporary).map_err(|error| io_err("stat session file", error))?;
+    let metadata = fs::symlink_metadata(&temporary)
+        .map_err(|error| io_err("stat session temporary file", error))?;
     if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
         let _ = fs::remove_file(&temporary);
         return Err(SessionStoreError::Invalid(
@@ -534,5 +815,40 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
         let _ = fs::remove_file(&temporary);
         io_err("install compacted session", error)
     })?;
-    reject_indirect_file(&layout.path)
+    reject_indirect_file(&layout.path, "session file")
+}
+
+#[cfg(windows)]
+fn open_options_nofollow() -> std::fs::OpenOptions {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    let mut options = std::fs::OpenOptions::new();
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+}
+
+#[cfg(not(unix))]
+#[cfg(not(windows))]
+fn open_options_nofollow() -> std::fs::OpenOptions {
+    std::fs::OpenOptions::new()
+}
+
+#[cfg(not(unix))]
+fn path_inside(child: &Path, parent: &Path) -> bool {
+    child.starts_with(parent)
+}
+
+fn io_err(operation: &str, error: impl ToString) -> SessionStoreError {
+    SessionStoreError::Io { operation: operation.to_owned(), message: error.to_string() }
+}
+
+#[cfg(unix)]
+fn map_unix_open_error(operation: &str, error: rustix::io::Errno) -> SessionStoreError {
+    if error == rustix::io::Errno::NOENT {
+        SessionStoreError::NotFound
+    } else if error == rustix::io::Errno::LOOP || error == rustix::io::Errno::NOTDIR {
+        SessionStoreError::Invalid("state storage is a symbolic link or reparse point".to_owned())
+    } else {
+        io_err(operation, error)
+    }
 }
