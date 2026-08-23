@@ -6,6 +6,7 @@ mod agent;
 mod backend;
 mod cancellation;
 mod context;
+mod context_selection;
 mod fake;
 mod permission;
 mod repo_map;
@@ -18,6 +19,9 @@ pub use agent::{Agent, AgentError, AgentRequest, AgentRunResult};
 pub use backend::{BackendError, BackendFuture, BackendStream, ModelBackend, ModelCatalogItem};
 pub use cancellation::CancellationToken;
 pub use context::{ContextEngine, capture_git_snapshot};
+pub use context_selection::{
+    ContextCandidate, ContextKind, SelectedContext, SelectedContextItem, select_context,
+};
 pub use fake::{FakeBackend, FakeToolCall};
 pub use permission::{
     NoPermissionBroker, PermissionBroker, PermissionFuture, SessionPermissionBroker,

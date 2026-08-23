@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "repo_map"
 harness = false
+
+[[bench]]
+name = "context_selection"
+harness = false

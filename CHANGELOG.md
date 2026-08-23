@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (4) - Relevance-ranked model context
+
+> Status: unreleased work. No artifact has been published.
+
+### Changed
+
+- Stored recovery context is now selected separately for each model turn using deterministic
+  task, path, symbol, recency, modification, source/test, and freshness signals.
+- Model context is bounded by bytes and item count, deduplicates overlapping excerpts and
+  repeated observations, and continues to invalidate stale file content on workspace drift.
+
+### Performance
+
+- Context-selection benchmarks cover 100, 1,000, and 10,000 candidates with bounded hot-path
+  allocations.
+
 ## Unreleased - 2026-08-23 (3) - Lazy repository intelligence
 
 > Status: unreleased work. No artifact has been published.

@@ -10,6 +10,7 @@ use aether_core::{
 use serde_json::Value;
 
 use crate::repo_map::RepoMap;
+use crate::{ContextCandidate, ContextKind, select_context};
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
 
@@ -166,78 +167,151 @@ impl ContextEngine {
                 "workspace_changed: true; treat persisted hashes and excerpts as stale until re-read\n",
             );
         }
+        let repo_metadata = self
+            .repo_map
+            .as_ref()
+            .and_then(|map| map.compact(MAX_REPO_MAP_CONTEXT_BYTES).ok())
+            .unwrap_or_default();
+        let mut candidates = Vec::with_capacity(
+            self.snapshot.inspected.len()
+                + self.snapshot.modified.len()
+                + self.snapshot.tool_summaries.len()
+                + self.snapshot.excerpts.len()
+                + 2,
+        );
+        let mut recency = 0;
+        for file in &self.snapshot.inspected {
+            candidates.push(ContextCandidate {
+                kind: ContextKind::InspectedFile,
+                path: Some(&file.path),
+                content: "",
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: self.snapshot.modified.iter().any(|path| path == &file.path),
+                stale: file.stale,
+            });
+            recency += 1;
+        }
+        for path in &self.snapshot.modified {
+            candidates.push(ContextCandidate {
+                kind: ContextKind::ModifiedPath,
+                path: Some(path),
+                content: "",
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: true,
+                stale: false,
+            });
+            recency += 1;
+        }
+        for summary in &self.snapshot.tool_summaries {
+            candidates.push(ContextCandidate {
+                kind: ContextKind::ToolSummary,
+                path: None,
+                content: summary.summary.as_str(),
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: false,
+                stale: false,
+            });
+            recency += 1;
+        }
+        for excerpt in &self.snapshot.excerpts {
+            let stale = self
+                .snapshot
+                .inspected
+                .iter()
+                .find(|file| file.path == excerpt.path)
+                .is_some_and(|file| file.stale);
+            candidates.push(ContextCandidate {
+                kind: ContextKind::Excerpt,
+                path: Some(&excerpt.path),
+                content: excerpt.text.as_str(),
+                start_line: excerpt.start_line,
+                end_line: excerpt.end_line,
+                recency,
+                modified: self.snapshot.modified.iter().any(|path| path == &excerpt.path),
+                stale,
+            });
+            recency += 1;
+        }
         if let Some(git) = &self.snapshot.git {
-            out.push_str("git: ");
-            if git.available {
-                if let Some(branch) = &git.branch {
-                    out.push_str("branch ");
-                    out.push_str(branch);
-                    out.push_str("; ");
-                }
-                out.push_str(git.status.as_str());
-            } else {
-                out.push_str("unavailable");
+            candidates.push(ContextCandidate {
+                kind: ContextKind::GitMetadata,
+                path: git.branch.as_deref(),
+                content: git.status.as_str(),
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: false,
+                stale: self.snapshot.workspace_changed,
+            });
+            recency += 1;
+        }
+        if !repo_metadata.is_empty() {
+            candidates.push(ContextCandidate {
+                kind: ContextKind::RepositoryMetadata,
+                path: None,
+                content: &repo_metadata,
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: false,
+                stale: self.snapshot.workspace_changed,
+            });
+        }
+        let fixed_bytes = out.len() + CONTEXT_GUIDANCE.len() + 32;
+        let selection = select_context(
+            self.snapshot.current_task.as_str(),
+            &candidates,
+            MAX_CONTEXT_RENDER_BYTES.saturating_sub(fixed_bytes),
+            MAX_CONTEXT_ITEMS,
+        );
+        if !selection.items.is_empty() {
+            out.push_str("selected context (relevance-ranked):\n");
+        }
+        for item in selection.items {
+            let candidate = candidates[item.index];
+            out.push_str("- ");
+            out.push_str(match candidate.kind {
+                ContextKind::ModifiedPath => "modified",
+                ContextKind::Excerpt => "excerpt",
+                ContextKind::InspectedFile => "inspected",
+                ContextKind::ToolSummary => "tool",
+                ContextKind::RepositoryMetadata => "repository",
+                ContextKind::GitMetadata => "git",
+            });
+            if let Some(path) = candidate.path {
+                out.push(' ');
+                out.push_str(path);
+            }
+            if candidate.start_line != 0 {
+                out.push_str(&format!(":{}-{}", candidate.start_line, candidate.end_line));
+            }
+            if candidate.kind == ContextKind::InspectedFile
+                && let Some(path) = candidate.path
+                && let Some(file) = self.snapshot.inspected.iter().find(|file| file.path == path)
+                && !file.ranges.is_empty()
+            {
+                out.push_str(" ranges=");
+                out.push_str(&format_ranges(&file.ranges));
+            }
+            if candidate.stale {
+                out.push_str(" [STALE]");
+            } else if matches!(candidate.kind, ContextKind::Excerpt | ContextKind::InspectedFile) {
+                out.push_str(" [current]");
+            }
+            if !candidate.content.is_empty() {
+                out.push_str(":\n");
+                out.push_str(candidate.content);
+            }
+            if item.truncated {
+                out.push_str("\n[truncated]");
             }
             out.push('\n');
-        }
-        if let Some(repo_map) = &self.repo_map
-            && let Ok(compact) = repo_map.compact(MAX_REPO_MAP_CONTEXT_BYTES)
-            && !compact.is_empty()
-        {
-            out.push_str("repository map:\n");
-            out.push_str(&compact);
-            if !compact.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        if !self.snapshot.inspected.is_empty() {
-            out.push_str("inspected (do not reread unless stale):\n");
-            for file in self.snapshot.inspected.iter().take(MAX_CONTEXT_ITEMS) {
-                out.push_str("- ");
-                out.push_str(&file.path);
-                if let Some(hash) = &file.content_hash {
-                    out.push_str(" hash=");
-                    out.push_str(hash);
-                }
-                if !file.ranges.is_empty() {
-                    out.push_str(" ranges=");
-                    out.push_str(&format_ranges(&file.ranges));
-                }
-                if file.stale {
-                    out.push_str(" [STALE]");
-                } else {
-                    out.push_str(" [current]");
-                }
-                out.push('\n');
-            }
-        }
-        if !self.snapshot.modified.is_empty() {
-            out.push_str("modified:\n");
-            for path in self.snapshot.modified.iter().take(MAX_CONTEXT_ITEMS) {
-                out.push_str("- ");
-                out.push_str(path);
-                out.push('\n');
-            }
-        }
-        if !self.snapshot.tool_summaries.is_empty() {
-            out.push_str("recent tools:\n");
-            for summary in &self.snapshot.tool_summaries {
-                out.push_str("- ");
-                out.push_str(&summary.tool);
-                out.push_str(": ");
-                out.push_str(summary.summary.as_str());
-                out.push('\n');
-            }
-        }
-        if !self.snapshot.excerpts.is_empty() {
-            out.push_str("excerpts:\n");
-            for excerpt in &self.snapshot.excerpts {
-                out.push_str("- ");
-                out.push_str(&excerpt.path);
-                out.push_str(&format!(":{}-{}\n", excerpt.start_line, excerpt.end_line));
-                out.push_str(excerpt.text.as_str());
-                out.push('\n');
-            }
         }
         if include_guidance {
             out.push_str("guidance: ");
