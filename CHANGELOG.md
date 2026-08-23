@@ -13,6 +13,11 @@
   ignoring source-content edits and ignored or untracked files; cold and cached 1k/10k-file
   benchmarks cover the behavior.
 
+### Performance
+
+- Common Git index formats are discovered in-process, with fallback for indirect or unsupported
+  indexes; benchmarks isolate repository-map work from external `git` process startup.
+
 ## Unreleased - 2026-08-23 (2) - Low-overhead tool scheduling
 
 > Status: unreleased work. No artifact has been published.

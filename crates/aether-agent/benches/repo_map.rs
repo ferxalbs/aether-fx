@@ -61,14 +61,48 @@ fn benchmark_cached_map(c: &mut Criterion, file_count: usize) {
     });
 }
 
+fn benchmark_git_process(c: &mut Criterion, file_count: usize) {
+    let repo = BenchRepo::new(file_count);
+    c.bench_function(&format!("repo_map_git_process_{file_count}_tracked_files"), |bencher| {
+        bencher.iter(|| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo.path)
+                .args(["ls-files", "--cached", "-z"])
+                .output()
+                .expect("git ls-files");
+            assert!(output.status.success());
+            std::hint::black_box(output.stdout);
+        });
+    });
+}
+
+fn benchmark_discovery_components(c: &mut Criterion, file_count: usize) {
+    let repo = BenchRepo::new(file_count);
+    let index = repo.path.join(".git/index");
+    c.bench_function(&format!("repo_map_index_read_{file_count}_tracked_files"), |bencher| {
+        bencher.iter(|| std::hint::black_box(fs::read(&index).expect("git index")));
+    });
+    c.bench_function("repo_map_git_process_startup", |bencher| {
+        bencher.iter(|| {
+            let output = Command::new("git").arg("--version").output().expect("git startup");
+            assert!(output.status.success());
+            std::hint::black_box(output.stdout);
+        });
+    });
+}
+
 fn repo_map_1k(c: &mut Criterion) {
     benchmark_cold_map(c, 1_000);
     benchmark_cached_map(c, 1_000);
+    benchmark_git_process(c, 1_000);
 }
 
 fn repo_map_10k(c: &mut Criterion) {
     benchmark_cold_map(c, 10_000);
     benchmark_cached_map(c, 10_000);
+    benchmark_git_process(c, 10_000);
+    benchmark_discovery_components(c, 10_000);
 }
 
 criterion_group!(benches, repo_map_1k, repo_map_10k);

@@ -581,29 +581,11 @@ fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, Re
     if !root.is_dir() {
         return Err(RepoMapError::InvalidRoot(root.to_path_buf()));
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "--cached", "-z"])
-        .output()
-        .map_err(RepoMapError::Git)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(RepoMapError::GitCommand(if stderr.is_empty() {
-            "repository is not indexed by git".to_owned()
-        } else {
-            stderr
-        }));
-    }
     let index_path = git_index_path(root);
-    let index_stamp = file_stamp(&index_path);
-
-    let paths = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
-        .collect::<Vec<_>>();
+    let (paths, index_stamp) = match read_git_index(&index_path) {
+        Ok(index) => index,
+        Err(_) => (git_ls_files(root)?, file_stamp(&index_path)),
+    };
     let mut tracked_hasher = Hasher::new();
     for path in &paths {
         hash_path(&mut tracked_hasher, path);
@@ -642,6 +624,108 @@ fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, Re
     })
 }
 
+fn read_git_index(index_path: &Path) -> io::Result<(Vec<PathBuf>, Option<FileStamp>)> {
+    let mut file = File::open(index_path)?;
+    let metadata = file.metadata().ok();
+    let mut bytes = Vec::with_capacity(metadata.as_ref().map_or(0, fs::Metadata::len) as usize);
+    file.read_to_end(&mut bytes)?;
+    let paths = parse_git_index(&bytes)?;
+    let stamp = metadata.as_ref().map(file_stamp_from_metadata);
+    Ok((paths, stamp))
+}
+
+fn parse_git_index(bytes: &[u8]) -> io::Result<Vec<PathBuf>> {
+    const HEADER_LEN: usize = 12;
+    const ENTRY_LEN: usize = 62;
+    const EXTENDED_FLAG: u16 = 0x4000;
+    const NAME_LEN_MASK: u16 = 0x0fff;
+    const DIRECTORY_MODE: u32 = 0o040000;
+
+    if bytes.len() < HEADER_LEN || &bytes[..4] != b"DIRC" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid git index header"));
+    }
+    let version = u32::from_be_bytes(bytes[4..8].try_into().expect("fixed index version"));
+    if !matches!(version, 2 | 3) {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported git index version"));
+    }
+    let count = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed index count")) as usize;
+    let mut paths = Vec::with_capacity(count);
+    let mut offset = HEADER_LEN;
+    for _ in 0..count {
+        let entry_start = offset;
+        let fixed = bytes.get(offset..offset + ENTRY_LEN).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated git index entry")
+        })?;
+        let mode = u32::from_be_bytes(fixed[24..28].try_into().expect("fixed index mode"));
+        if mode & 0o170000 == DIRECTORY_MODE {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "sparse git index"));
+        }
+        let flags = u16::from_be_bytes(fixed[60..62].try_into().expect("fixed index flags"));
+        offset += ENTRY_LEN;
+        if flags & EXTENDED_FLAG != 0 {
+            offset = offset.checked_add(2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid git index entry")
+            })?;
+        }
+        let declared_len = usize::from(flags & NAME_LEN_MASK);
+        let path_end = if declared_len < usize::from(NAME_LEN_MASK) {
+            offset.checked_add(declared_len).filter(|end| *end < bytes.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated git index path")
+            })?
+        } else {
+            offset
+                + bytes[offset..].iter().position(|byte| *byte == 0).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "unterminated path")
+                })?
+        };
+        if bytes[path_end] != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid git index path"));
+        }
+        paths.push(PathBuf::from(String::from_utf8_lossy(&bytes[offset..path_end]).into_owned()));
+        offset = path_end + 1;
+        let entry_len = offset - entry_start;
+        offset += (8 - entry_len % 8) % 8;
+    }
+    while bytes.len().saturating_sub(offset) > 32 {
+        let header = bytes.get(offset..offset + 8).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated git index extension")
+        })?;
+        let size =
+            u32::from_be_bytes(header[4..8].try_into().expect("fixed extension size")) as usize;
+        if matches!(&header[..4], b"link" | b"sdir") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "indirect git index"));
+        }
+        offset =
+            offset.checked_add(8 + size).filter(|end| *end <= bytes.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid git index extension")
+            })?;
+    }
+    Ok(paths)
+}
+
+fn git_ls_files(root: &Path) -> Result<Vec<PathBuf>, RepoMapError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "-z"])
+        .output()
+        .map_err(RepoMapError::Git)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(RepoMapError::GitCommand(if stderr.is_empty() {
+            "repository is not indexed by git".to_owned()
+        } else {
+            stderr
+        }));
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        .collect())
+}
+
 fn git_index_path(root: &Path) -> PathBuf {
     let dot_git = root.join(".git");
     if dot_git.is_file()
@@ -660,12 +744,16 @@ fn git_index_path(root: &Path) -> PathBuf {
 
 fn file_stamp(path: &Path) -> Option<FileStamp> {
     let metadata = fs::metadata(path).ok()?;
+    Some(file_stamp_from_metadata(&metadata))
+}
+
+fn file_stamp_from_metadata(metadata: &fs::Metadata) -> FileStamp {
     let modified_nanos = metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |duration| duration.as_nanos());
-    Some(FileStamp { length: metadata.len(), modified_nanos })
+    FileStamp { length: metadata.len(), modified_nanos }
 }
 
 fn special_digest(file: &ReadContent) -> [u8; 32] {
@@ -1050,52 +1138,49 @@ fn selection_kind(kind: RepoFileKind) -> RepoSelectionKind {
 }
 
 fn manifest_kind(path: &Path) -> ManifestKind {
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |value| value.to_string_lossy().to_ascii_lowercase());
-    match name.as_str() {
-        "cargo.toml" => ManifestKind::Cargo,
-        "package.json" | "deno.json" | "deno.jsonc" => ManifestKind::Node,
-        "pyproject.toml" | "setup.py" | "setup.cfg" => ManifestKind::Python,
-        "go.mod" => ManifestKind::Go,
-        "pom.xml" | "build.gradle" | "build.gradle.kts" => ManifestKind::Java,
-        "package.swift" => ManifestKind::Swift,
-        "composer.json" => ManifestKind::Php,
-        "gemfile" => ManifestKind::Ruby,
-        "mix.exs" => ManifestKind::Elixir,
-        _ if name.ends_with(".csproj") || name.ends_with(".fsproj") || name.ends_with(".sln") => {
-            ManifestKind::DotNet
-        }
-        _ if name.ends_with(".gemspec") => ManifestKind::Ruby,
-        _ => ManifestKind::Other,
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return ManifestKind::Other;
+    };
+    if name.eq_ignore_ascii_case("cargo.toml") {
+        ManifestKind::Cargo
+    } else if ["package.json", "deno.json", "deno.jsonc"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        ManifestKind::Node
+    } else if ["pyproject.toml", "setup.py", "setup.cfg"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        ManifestKind::Python
+    } else if name.eq_ignore_ascii_case("go.mod") {
+        ManifestKind::Go
+    } else if ["pom.xml", "build.gradle", "build.gradle.kts"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        ManifestKind::Java
+    } else if name.eq_ignore_ascii_case("package.swift") {
+        ManifestKind::Swift
+    } else if name.eq_ignore_ascii_case("composer.json") {
+        ManifestKind::Php
+    } else if name.eq_ignore_ascii_case("gemfile") || ends_with_ignore_ascii_case(name, ".gemspec")
+    {
+        ManifestKind::Ruby
+    } else if name.eq_ignore_ascii_case("mix.exs") {
+        ManifestKind::Elixir
+    } else if [".csproj", ".fsproj", ".sln"]
+        .iter()
+        .any(|suffix| ends_with_ignore_ascii_case(name, suffix))
+    {
+        ManifestKind::DotNet
+    } else {
+        ManifestKind::Other
     }
 }
 
 fn is_manifest(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |value| value.to_string_lossy().to_ascii_lowercase());
-    matches!(
-        name.as_str(),
-        "cargo.toml"
-            | "package.json"
-            | "pyproject.toml"
-            | "setup.py"
-            | "setup.cfg"
-            | "go.mod"
-            | "pom.xml"
-            | "build.gradle"
-            | "build.gradle.kts"
-            | "package.swift"
-            | "composer.json"
-            | "gemfile"
-            | "mix.exs"
-            | "deno.json"
-            | "deno.jsonc"
-    ) || name.ends_with(".csproj")
-        || name.ends_with(".fsproj")
-        || name.ends_with(".sln")
-        || name.ends_with(".gemspec")
+    !matches!(manifest_kind(path), ManifestKind::Other)
 }
 
 fn is_instruction(path: &Path) -> bool {
@@ -1116,53 +1201,35 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 fn is_source_file(path: &Path) -> bool {
-    let extension = path
-        .extension()
-        .map_or_else(String::new, |value| value.to_string_lossy().to_ascii_lowercase());
-    matches!(
-        extension.as_str(),
-        "c" | "cc"
-            | "cpp"
-            | "cs"
-            | "ex"
-            | "exs"
-            | "go"
-            | "h"
-            | "hpp"
-            | "java"
-            | "js"
-            | "jsx"
-            | "kt"
-            | "m"
-            | "mm"
-            | "php"
-            | "py"
-            | "rb"
-            | "rs"
-            | "swift"
-            | "ts"
-            | "tsx"
-            | "zig"
-    )
+    path.extension().and_then(|value| value.to_str()).is_some_and(|extension| {
+        [
+            "c", "cc", "cpp", "cs", "ex", "exs", "go", "h", "hpp", "java", "js", "jsx", "kt", "m",
+            "mm", "php", "py", "rb", "rs", "swift", "ts", "tsx", "zig",
+        ]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
 }
 
 fn is_test_path(path: &Path) -> bool {
-    let lower = display_path(path).to_ascii_lowercase();
     let has_test_directory = path.components().any(|component| {
         matches!(
             component,
             Component::Normal(value)
-                if matches!(value.to_string_lossy().to_ascii_lowercase().as_str(), "test" | "tests" | "__tests__")
+                if value.to_str().is_some_and(|value| ["test", "tests", "__tests__"]
+                    .iter().any(|candidate| value.eq_ignore_ascii_case(candidate)))
         )
     });
+    let display = path.to_string_lossy();
     has_test_directory
-        || lower.contains(".test.")
-        || lower.contains(".spec.")
-        || lower.ends_with("_test.rs")
-        || lower.ends_with("_test.go")
+        || contains_ignore_ascii_case(&display, ".test.")
+        || contains_ignore_ascii_case(&display, ".spec.")
+        || ends_with_ignore_ascii_case(&display, "_test.rs")
+        || ends_with_ignore_ascii_case(&display, "_test.go")
         || path
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().starts_with("test_"))
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| starts_with_ignore_ascii_case(name, "test_"))
 }
 
 fn source_root(path: &Path) -> PathBuf {
@@ -1172,7 +1239,8 @@ fn source_root(path: &Path) -> PathBuf {
         if matches!(
             component,
             Component::Normal(value)
-                if matches!(value.to_string_lossy().to_ascii_lowercase().as_str(), "src" | "lib" | "app" | "cmd" | "internal")
+                if value.to_str().is_some_and(|value| ["src", "lib", "app", "cmd", "internal"]
+                    .iter().any(|candidate| value.eq_ignore_ascii_case(candidate)))
         ) {
             return current;
         }
@@ -1241,8 +1309,27 @@ fn simple_wildcard_match(pattern: &str, value: &str) -> bool {
 }
 
 fn hash_path(hasher: &mut Hasher, path: &Path) {
-    hasher.update(display_path(path).as_bytes());
+    hasher.update(path.as_os_str().as_encoded_bytes());
     hasher.update(&[0]);
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
+    value
+        .len()
+        .checked_sub(suffix.len())
+        .and_then(|start| value.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+fn contains_ignore_ascii_case(value: &str, needle: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn preview(content: &[u8]) -> Option<String> {
@@ -1422,6 +1509,19 @@ mod tests {
         assert!(second.tracked_files.iter().all(|file| file.path != Path::new("ignored.txt")));
         assert!(second.tracked_files.iter().all(|file| file.path != Path::new("untracked.rs")));
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn unsupported_index_versions_fall_back_to_git() {
+        let repo = TempRepo::new();
+        git(&repo.path, ["config", "index.version", "4"]);
+        repo.write("src/lib.rs", "pub fn stable() {}\n");
+        repo.track(&["src/lib.rs"]);
+
+        let snapshot = RepoMap::new(&repo.path).snapshot().expect("map");
+
+        assert_eq!(snapshot.tracked_file_count, 1);
+        assert_eq!(snapshot.tracked_files[0].path, Path::new("src/lib.rs"));
     }
 
     #[test]
