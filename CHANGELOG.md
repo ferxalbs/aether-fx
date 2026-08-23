@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (1) - Dependency-aware tool execution
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Independent read-only tool calls now execute concurrently through a bounded scheduler,
+  while workspace mutations, process effects, and conflicting footprints remain ordered.
+- Typed tool-effect metadata, deterministic result ordering, cancellation coverage, and
+  scheduler benchmarks were added.
+
 ## Unreleased - 2026-08-22 (11) - State-root and metadata initialization hardening
 
 > Status: unreleased work. No artifact has been published.

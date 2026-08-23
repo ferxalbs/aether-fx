@@ -3,7 +3,8 @@ use std::sync::Arc;
 use aether_core::tools::ToolFuture;
 use aether_core::{
     BoundedText, PermissionClass, PermissionEngine, PermissionRequest, ToolDefinition,
-    ToolExecutionContext, ToolExecutor, ToolInvocation, ToolResult,
+    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
+    WorkspacePath,
 };
 use serde_json::json;
 
@@ -191,6 +192,47 @@ impl ToolExecutor for ToolRegistry {
         self.permission_request(invocation)
     }
 
+    fn footprint(&self, invocation: &ToolInvocation) -> ToolFootprint {
+        match invocation.name.as_str() {
+            "read" => serde_json::from_value::<crate::ReadInput>(invocation.input.clone())
+                .map(|input| {
+                    workspace_read_footprint(input.files.into_iter().map(|file| file.path))
+                })
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
+            "list" => serde_json::from_value::<crate::ListInput>(invocation.input.clone())
+                .map(|input| {
+                    workspace_read_footprint(std::iter::once(
+                        input.path.unwrap_or_else(|| ".".to_owned()),
+                    ))
+                })
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
+            "find" => serde_json::from_value::<crate::FindInput>(invocation.input.clone())
+                .map(|input| {
+                    workspace_read_footprint(std::iter::once(
+                        input.path.unwrap_or_else(|| ".".to_owned()),
+                    ))
+                })
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
+            "search" => serde_json::from_value::<crate::SearchInput>(invocation.input.clone())
+                .map(|input| {
+                    workspace_read_footprint(std::iter::once(
+                        input.path.unwrap_or_else(|| ".".to_owned()),
+                    ))
+                })
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
+            "git" => serde_json::from_value::<crate::GitInput>(invocation.input.clone())
+                .map(|input| {
+                    workspace_read_footprint(std::iter::once(
+                        input.path.unwrap_or_else(|| ".".to_owned()),
+                    ))
+                })
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
+            "write" | "patch" => ToolFootprint::exclusive_workspace(),
+            "shell" | "process" => ToolFootprint::exclusive_global(),
+            _ => ToolFootprint::unknown(),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         invocation: ToolInvocation,
@@ -198,6 +240,17 @@ impl ToolExecutor for ToolRegistry {
     ) -> ToolFuture<'a> {
         Box::pin(async move { self.dispatch_with_context(invocation, context).await })
     }
+}
+
+fn workspace_read_footprint(paths: impl IntoIterator<Item = String>) -> ToolFootprint {
+    let mut resources = Vec::new();
+    for path in paths {
+        let Ok(path) = WorkspacePath::new(path) else {
+            return ToolFootprint::unknown();
+        };
+        resources.push(ToolResource::WorkspacePath(path.display()));
+    }
+    ToolFootprint::from_effects(resources.into_iter().map(aether_core::ToolEffect::Read).collect())
 }
 
 fn definitions() -> Vec<ToolDefinition> {

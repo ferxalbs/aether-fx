@@ -8,6 +8,7 @@ mod cancellation;
 mod context;
 mod fake;
 mod permission;
+mod scheduler;
 mod session;
 mod session_fs;
 mod state;

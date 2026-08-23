@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "aether-core",
  "blake3",
+ "criterion",
  "rustix",
  "serde",
  "serde_json",

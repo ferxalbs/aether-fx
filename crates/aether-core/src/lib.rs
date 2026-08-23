@@ -35,5 +35,6 @@ pub use permissions::{
 };
 pub use session::{SESSION_SCHEMA_VERSION, SessionLine, SessionRecord, TurnSnapshot};
 pub use tools::{
-    ExecutionPermit, ToolDefinition, ToolExecutionContext, ToolExecutor, ToolInvocation, ToolResult,
+    ExecutionPermit, MAX_TOOL_FOOTPRINT_RESOURCES, ToolDefinition, ToolEffect,
+    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
 };

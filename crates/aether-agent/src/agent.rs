@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aether_core::{
-    AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit,
-    ModelEvent, ModelRequest, OpaqueContinuation, PermissionDecision, SessionId, StepId,
-    ToolCallId, ToolExecutionContext, ToolExecutor, ToolInvocation, TurnId,
+    AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelRequest,
+    OpaqueContinuation, SessionId, StepId, ToolCallId, ToolExecutor, TurnId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,6 +11,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::context::{ContextEngine, capture_git_snapshot};
+use crate::scheduler::execute_tool_calls;
 use crate::{BackendError, CancellationToken, ModelBackend, NoPermissionBroker, PermissionBroker};
 
 /// A user-requested agent turn.
@@ -263,121 +263,17 @@ where
                 });
             }
 
-            let mut outputs = Vec::with_capacity(tool_calls.len());
-            for (call_id, name, arguments) in tool_calls {
-                if cancellation.is_cancelled() {
-                    return Err(AgentError::Cancelled);
-                }
-                let invocation = ToolInvocation {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    input: arguments,
-                };
-                let permission_request = self.tools.permission_request(&invocation);
-                let permit = if let Some(permission_request) = permission_request {
-                    let needs_prompt = broker.needs_prompt(&permission_request);
-                    let decision_future = broker.decide(permission_request.clone());
-                    if needs_prompt {
-                        send_event(
-                            &events,
-                            AgentEvent::PermissionRequested { request: permission_request.clone() },
-                        )
-                        .await?;
-                    }
-                    let decision = tokio::select! {
-                        _ = cancellation.cancelled() => {
-                            broker.cancel(&call_id);
-                            return Err(AgentError::Cancelled);
-                        }
-                        decision = decision_future => decision,
-                    };
-                    if cancellation.is_cancelled() {
-                        broker.cancel(&call_id);
-                        return Err(AgentError::Cancelled);
-                    }
-                    if needs_prompt {
-                        send_event(
-                            &events,
-                            AgentEvent::PermissionResolved { call_id: call_id.clone(), decision },
-                        )
-                        .await?;
-                    }
-                    match decision {
-                        PermissionDecision::AllowOnce | PermissionDecision::AllowSession => {
-                            Some(ExecutionPermit::new(
-                                call_id.clone(),
-                                name.clone(),
-                                permission_request.class,
-                            ))
-                        }
-                        PermissionDecision::Deny => None,
-                    }
-                } else {
-                    let class = self
-                        .tools
-                        .definitions()
-                        .iter()
-                        .find(|definition| definition.name == name)
-                        .map(|definition| definition.permission)
-                        .unwrap_or(aether_core::PermissionClass::ReadOnly);
-                    Some(ExecutionPermit::new(call_id.clone(), name.clone(), class))
-                };
-                let permission = self
-                    .tools
-                    .definitions()
-                    .iter()
-                    .find(|definition| definition.name == name)
-                    .map(|definition| definition.permission.to_string())
-                    .unwrap_or_else(|| "unknown".to_owned());
-                send_event(
-                    &events,
-                    AgentEvent::ToolStarted {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        permission,
-                        operation: name.clone(),
-                        step_id: None,
-                    },
-                )
-                .await?;
-                let tool_input = invocation.input.clone();
-                let result = if let Some(permit) = permit {
-                    let execution = self.tools.execute(
-                        invocation,
-                        ToolExecutionContext::new(cancellation.flag(), permit),
-                    );
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-                        result = execution => result,
-                    }
-                } else {
-                    aether_core::ToolResult::failure(
-                        call_id.clone(),
-                        "permission_denied",
-                        "user denied permission for this operation",
-                        false,
-                        DEFAULT_MAX_OUTPUT_BYTES,
-                    )
-                };
-                send_event(
-                    &events,
-                    AgentEvent::ToolOutput {
-                        call_id: call_id.clone(),
-                        output: result.output.clone(),
-                    },
-                )
-                .await?;
-                send_event(
-                    &events,
-                    AgentEvent::ToolFinished { call_id: call_id.clone(), ok: result.ok },
-                )
-                .await?;
-                self.with_context(|engine| {
-                    engine.observe_tool(&name, &tool_input, &result);
-                });
+            let completed =
+                execute_tool_calls(&self.tools, tool_calls, &events, &cancellation, broker).await?;
+            let mut outputs = Vec::with_capacity(completed.len());
+            for completed in completed {
+                let name = completed.name;
+                let tool_input = completed.input;
+                let result = completed.result;
+                self.with_context(|engine| engine.observe_tool(&name, &tool_input, &result));
                 outputs.push(json!({
                     "type": "function_call_output",
-                    "call_id": call_id.as_str(),
+                    "call_id": result.call_id.as_str(),
                     "output": result.output.as_str(),
                     "ok": result.ok,
                     "error": result.error.as_ref().map(|error| json!({
@@ -437,7 +333,7 @@ fn assemble_user_input(prompt: &str, context_packet: Option<String>) -> serde_js
     json!([{"type":"message","role":"user","content": content}])
 }
 
-async fn send_event(
+pub(crate) async fn send_event(
     sender: &mpsc::Sender<AgentEvent>,
     event: AgentEvent,
 ) -> Result<(), AgentError> {
@@ -469,8 +365,8 @@ mod tests {
     use crate::{BackendFuture, ModelCatalogItem, SessionPermissionBroker};
     use aether_core::tools::ToolFuture;
     use aether_core::{
-        ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass, ToolDefinition,
-        ToolExecutionContext, ToolResult,
+        ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass, PermissionDecision,
+        ToolDefinition, ToolExecutionContext, ToolInvocation, ToolResult,
     };
     use serde_json::json;
 
