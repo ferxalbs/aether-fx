@@ -9,6 +9,7 @@ mod context;
 mod fake;
 mod permission;
 mod session;
+mod session_fs;
 
 pub use agent::{Agent, AgentError, AgentRequest, AgentRunResult};
 pub use backend::{BackendError, BackendFuture, BackendStream, ModelBackend, ModelCatalogItem};

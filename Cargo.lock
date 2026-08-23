@@ -22,10 +22,12 @@ version = "0.1.0"
 dependencies = [
  "aether-core",
  "blake3",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -477,7 +477,7 @@ fn compact_test_output(stdout: &str, stderr: &str) -> Option<String> {
 }
 
 fn failed_test_names(output: &str) -> Vec<String> {
-    let mut names = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut seen = BTreeSet::new();
     for line in output.lines() {
         let trimmed = line.trim();

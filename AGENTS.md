@@ -78,6 +78,9 @@ Release rules:
    increment to `(2)`, `(3)`, and so on for each additional version or
    unreleased entry on the same date, then reset to `(1)` on the next date.
 4. Add one concise, outcome-focused tagline after the date and sequence.
+   Describe the public behavior change. Do not use internal engineering-phase
+   names such as `Phase 2.1` or `Phase 3` as the heading tagline. Prefer
+   titles such as `Session storage hardening` or `Native runtime reliability` but describe the work in the session and based on the changes not static or similar entrys.
 5. Organize each entry under only the sections that apply: `Added`,
    `Changed`, `Fixed`, `Security`, `Performance`, `Documentation`, and
    `Known Limitations`.

@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,7 @@ use aether_core::{
 use thiserror::Error;
 
 use crate::context::ContextEngine;
+use crate::session_fs;
 
 /// Session persistence failures with operation context.
 #[derive(Debug, Error)]
@@ -25,6 +26,7 @@ pub enum SessionStoreError {
 /// Append-friendly local JSONL session store.
 #[derive(Clone, Debug)]
 pub struct SessionStore {
+    workspace: PathBuf,
     path: PathBuf,
     session_id: SessionId,
     next_sequence: u64,
@@ -60,21 +62,19 @@ impl SessionStore {
         Self::directory_for(workspace).join(format!("{}.jsonl", session_id.as_str()))
     }
 
-    /// Open or create a session file and recover its next sequence number.
+    /// Open or create a session file inside a workspace and recover its next sequence.
     pub fn open(
-        path: impl Into<PathBuf>,
+        workspace: impl AsRef<Path>,
         session_id: SessionId,
     ) -> Result<Self, SessionStoreError> {
-        let path = path.into();
-        ensure_private_parents(&path)?;
+        let layout = session_fs::SessionLayout::prepare(workspace.as_ref(), &session_id)?;
         let mut next_sequence = 1;
-        if path.exists() {
-            restrict_file(&path)?;
-            for line in Self::replay(&path)? {
+        if let Some(file) = layout.try_open_existing()? {
+            for line in Self::replay_reader(file)? {
                 next_sequence = next_sequence.max(line.sequence.saturating_add(1));
             }
         }
-        Ok(Self { path, session_id, next_sequence })
+        Ok(Self { workspace: layout.workspace, path: layout.path, session_id, next_sequence })
     }
 
     /// Append a record, fsync it, and compact the file when bounds are exceeded.
@@ -98,25 +98,18 @@ impl SessionStore {
                 "session record refused because it contains a secret".to_owned(),
             ));
         }
-        let current_len = fs::metadata(&self.path).map(|metadata| metadata.len()).unwrap_or(0);
+        let current_len = fs::symlink_metadata(&self.path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         if current_len.saturating_add(encoded.len() as u64).saturating_add(1)
             > MAX_SESSION_FILE_BYTES as u64
         {
             self.compact()?;
         }
-        ensure_private_parents(&self.path)?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&self.path).map_err(|error| SessionStoreError::Io {
-            operation: "open session file".to_owned(),
-            message: error.to_string(),
-        })?;
-        restrict_file(&self.path)?;
+        let layout = session_fs::SessionLayout::prepare(&self.workspace, &self.session_id)?;
+        let mut file = layout.open_jsonl(true)?;
         file.write_all(encoded.as_bytes()).map_err(|error| SessionStoreError::Io {
             operation: "append session record".to_owned(),
             message: error.to_string(),
@@ -144,10 +137,20 @@ impl SessionStore {
     /// Read and validate bounded session lines for replay.
     pub fn replay(path: impl AsRef<Path>) -> Result<Vec<SessionLine>, SessionStoreError> {
         let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|error| SessionStoreError::Io {
+        let metadata = fs::symlink_metadata(path).map_err(|error| SessionStoreError::Io {
             operation: "stat session file".to_owned(),
             message: error.to_string(),
         })?;
+        if metadata.file_type().is_symlink() {
+            return Err(SessionStoreError::Invalid(
+                "session file is a symbolic link or reparse point".to_owned(),
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(SessionStoreError::Invalid(
+                "session file is not a regular file".to_owned(),
+            ));
+        }
         if metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
             return Err(SessionStoreError::Invalid("session file exceeds size limit".to_owned()));
         }
@@ -155,7 +158,21 @@ impl SessionStore {
             operation: "read session file".to_owned(),
             message: error.to_string(),
         })?;
-        let mut reader = BufReader::new(file);
+        Self::parse_lines(BufReader::new(file))
+    }
+
+    fn replay_reader(file: File) -> Result<Vec<SessionLine>, SessionStoreError> {
+        let metadata = file.metadata().map_err(|error| SessionStoreError::Io {
+            operation: "stat session file".to_owned(),
+            message: error.to_string(),
+        })?;
+        if metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
+            return Err(SessionStoreError::Invalid("session file exceeds size limit".to_owned()));
+        }
+        Self::parse_lines(BufReader::new(file))
+    }
+
+    fn parse_lines(mut reader: BufReader<File>) -> Result<Vec<SessionLine>, SessionStoreError> {
         let mut lines = Vec::new();
         let mut buffer = String::new();
         loop {
@@ -185,13 +202,8 @@ impl SessionStore {
                     }
                     lines.push(line);
                 }
-                Err(_) if !ended_with_newline => {
-                    // A truncated last record is an uncommitted crash window; ignore it.
-                    break;
-                }
-                Err(error) => {
-                    return Err(SessionStoreError::Invalid(error.to_string()));
-                }
+                Err(_) if !ended_with_newline => break,
+                Err(error) => return Err(SessionStoreError::Invalid(error.to_string())),
             }
             if lines.len() > MAX_SESSION_LINES {
                 return Err(SessionStoreError::Invalid(
@@ -207,7 +219,10 @@ impl SessionStore {
         path: impl AsRef<Path>,
         live_workspace: impl AsRef<Path>,
     ) -> Result<ResumableSession, SessionStoreError> {
-        let lines = Self::replay(path)?;
+        let layout =
+            session_fs::SessionLayout::from_existing_path(live_workspace.as_ref(), path.as_ref())?;
+        let file = layout.open_jsonl(false)?;
+        let lines = Self::replay_reader(file)?;
         if lines.is_empty() {
             return Err(SessionStoreError::Invalid("session file is empty".to_owned()));
         }
@@ -236,14 +251,7 @@ impl SessionStore {
                 SessionRecord::Finished => {}
             }
         }
-        let live_workspace =
-            fs::canonicalize(live_workspace.as_ref()).map_err(|error| SessionStoreError::Io {
-                operation: "canonicalize live workspace".to_owned(),
-                message: error.to_string(),
-            })?;
-        if !live_workspace.is_dir() {
-            return Err(SessionStoreError::Invalid("workspace is not a directory".to_owned()));
-        }
+        let live_workspace = layout.workspace.clone();
         let mut warnings = Vec::new();
         let mut workspace_changed = false;
         if let Some(stored) = workspace_root.as_deref() {
@@ -302,7 +310,9 @@ impl SessionStore {
     }
 
     fn compact(&mut self) -> Result<(), SessionStoreError> {
-        let lines = Self::replay(&self.path)?;
+        let layout = session_fs::SessionLayout::prepare(&self.workspace, &self.session_id)?;
+        let file = layout.open_jsonl(false)?;
+        let lines = Self::replay_reader(file)?;
         let mut started = None;
         let mut turns: Vec<SessionLine> = Vec::new();
         for line in lines {
@@ -338,7 +348,7 @@ impl SessionStore {
                 "compacted session still exceeds size limit".to_owned(),
             ));
         }
-        atomic_replace_file(&self.path, body.as_bytes())?;
+        layout.replace_with(body.as_bytes())?;
         self.next_sequence = kept.last().map(|line| line.sequence.saturating_add(1)).unwrap_or(1);
         Ok(())
     }
@@ -350,117 +360,6 @@ fn sanitize_record(record: SessionRecord) -> Result<SessionRecord, SessionStoreE
         other => other,
     };
     Ok(record)
-}
-
-fn ensure_private_parents(path: &Path) -> Result<(), SessionStoreError> {
-    let sessions = path.parent();
-    let aether = sessions.and_then(Path::parent);
-    if let Some(aether) = aether {
-        create_private_dir(aether)?;
-    }
-    if let Some(sessions) = sessions {
-        create_private_dir(sessions)?;
-    }
-    Ok(())
-}
-
-fn create_private_dir(path: &Path) -> Result<(), SessionStoreError> {
-    if !path.exists() {
-        fs::create_dir_all(path).map_err(|error| SessionStoreError::Io {
-            operation: "create session directory".to_owned(),
-            message: error.to_string(),
-        })?;
-    }
-    restrict_dir(path)
-}
-
-fn restrict_dir(path: &Path) -> Result<(), SessionStoreError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)
-            .map_err(|error| SessionStoreError::Io {
-                operation: "stat session directory".to_owned(),
-                message: error.to_string(),
-            })?
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).map_err(|error| SessionStoreError::Io {
-            operation: "restrict session directory".to_owned(),
-            message: error.to_string(),
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-fn restrict_file(path: &Path) -> Result<(), SessionStoreError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)
-            .map_err(|error| SessionStoreError::Io {
-                operation: "stat session file".to_owned(),
-                message: error.to_string(),
-            })?
-            .permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(path, permissions).map_err(|error| SessionStoreError::Io {
-            operation: "restrict session file".to_owned(),
-            message: error.to_string(),
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-fn atomic_replace_file(path: &Path, bytes: &[u8]) -> Result<(), SessionStoreError> {
-    ensure_private_parents(path)?;
-    let directory = path.parent().unwrap_or(Path::new("."));
-    let temporary = directory.join(format!(
-        ".aether-session-{}-{}.tmp",
-        std::process::id(),
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("session")
-    ));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary).map_err(|error| SessionStoreError::Io {
-        operation: "create compacted session".to_owned(),
-        message: error.to_string(),
-    })?;
-    restrict_file(&temporary)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(SessionStoreError::Io {
-            operation: "write compacted session".to_owned(),
-            message: error.to_string(),
-        });
-    }
-    drop(file);
-    fs::rename(&temporary, path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        SessionStoreError::Io {
-            operation: "install compacted session".to_owned(),
-            message: error.to_string(),
-        }
-    })?;
-    restrict_file(path)
 }
 
 /// Inputs for one bounded JSONL turn persist.
@@ -556,7 +455,7 @@ mod tests {
     #[test]
     fn session_write_read_round_trip_persists_continuation() {
         let (root, path, session) = temp_session("roundtrip");
-        let mut store = SessionStore::open(&path, session.clone()).unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.continuation = Some(OpaqueContinuation(serde_json::json!({
@@ -589,7 +488,7 @@ mod tests {
     #[test]
     fn truncated_final_record_is_ignored_and_previous_turn_remains() {
         let (root, path, session) = temp_session("truncated");
-        let mut store = SessionStore::open(&path, session.clone()).unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
         let first = ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         write_started_and_turn(
             &mut store,
@@ -610,7 +509,7 @@ mod tests {
     #[test]
     fn session_corruption_handling_skips_truncated_tail_and_rejects_middle() {
         let (first_root, path, session) = temp_session("corrupt");
-        let mut store = SessionStore::open(&path, session.clone()).unwrap();
+        let mut store = SessionStore::open(&first_root, session.clone()).unwrap();
         store
             .append(
                 None,
@@ -626,7 +525,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
 
         let (root, path, session) = temp_session("corrupt-middle");
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         store
             .append(
                 None,
@@ -642,7 +541,7 @@ mod tests {
     #[test]
     fn corrupt_session_compaction_fails_without_overwrite() {
         let (root, path, session) = temp_session("compact-corrupt");
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         store
             .append(
                 None,
@@ -675,7 +574,7 @@ mod tests {
     #[test]
     fn secret_bearing_and_raw_command_output_are_not_persisted() {
         let (root, path, session) = temp_session("secrets");
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         let mut context = ContextSnapshot::new(root.display().to_string(), None);
         context.current_task = aether_core::BoundedText::new("print RAINY_API_KEY", 1024);
         context.continuation = Some(OpaqueContinuation(serde_json::json!({
@@ -703,7 +602,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (root, path, session) = temp_session("perms");
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         store
             .append(
                 None,
@@ -723,7 +622,7 @@ mod tests {
         let (root, path, session) = temp_session("unchanged");
         std::fs::write(root.join("main.rs"), "old").unwrap();
         let hash = blake3::hash(b"old").to_hex().to_string();
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.inspected.push(inspected("main.rs", &hash));
@@ -747,7 +646,7 @@ mod tests {
         let (root, path, session) = temp_session("changed-file");
         std::fs::write(root.join("main.rs"), "old").unwrap();
         let hash = blake3::hash(b"old").to_hex().to_string();
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.inspected.push(inspected("main.rs", &hash));
@@ -770,7 +669,7 @@ mod tests {
         let (root, path, session) = temp_session("deleted-file");
         std::fs::write(root.join("main.rs"), "old").unwrap();
         let hash = blake3::hash(b"old").to_hex().to_string();
-        let mut store = SessionStore::open(&path, session).unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.inspected.push(inspected("main.rs", &hash));
@@ -789,24 +688,161 @@ mod tests {
 
     #[test]
     fn changed_workspace_root_invalidates_continuation() {
-        let (root, path, session) = temp_session("changed-root");
-        let other = std::env::temp_dir().join(format!(
-            "aether-other-{}-{}",
+        let (live, path, session) = temp_session("changed-root-live");
+        let stored = std::env::temp_dir().join(format!(
+            "aether-stored-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
-        std::fs::create_dir_all(&other).unwrap();
-        let mut store = SessionStore::open(&path, session).unwrap();
+        std::fs::create_dir_all(&stored).unwrap();
+        let mut store = SessionStore::open(&live, session).unwrap();
         write_started_and_turn(
             &mut store,
-            &root,
-            ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned())),
+            &stored,
+            ContextSnapshot::new(stored.display().to_string(), Some("model-a".to_owned())),
             Some(OpaqueContinuation(serde_json::json!({"previous_response_id": "resp_root"}))),
         );
-        let restored = SessionStore::restore(&path, &other).unwrap();
+        let restored = SessionStore::restore(&path, &live).unwrap();
         assert!(restored.workspace_changed);
         assert!(restored.continuation.is_none());
+        let _ = std::fs::remove_dir_all(live);
+        let _ = std::fs::remove_dir_all(stored);
+    }
+
+    fn outside_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aether-outside-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn try_dir_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    fn try_file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    #[test]
+    fn aether_symlink_escape_is_rejected() {
+        let (root, _, session) = temp_session("aether-link");
+        let outside = outside_dir("aether-link");
+        std::fs::write(outside.join("escaped.txt"), "outside").unwrap();
+        if !try_dir_symlink(&outside, &root.join(".aether")) {
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let error = SessionStore::open(&root, session).unwrap_err().to_string();
+        assert!(
+            error.contains("symbolic link")
+                || error.contains("reparse")
+                || error.contains("session directory")
+        );
+        assert_eq!(std::fs::read_to_string(outside.join("escaped.txt")).unwrap(), "outside");
         let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(other);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn sessions_symlink_escape_is_rejected() {
+        let (root, _, session) = temp_session("sessions-link");
+        let outside = outside_dir("sessions-link");
+        std::fs::create_dir_all(root.join(".aether")).unwrap();
+        if !try_dir_symlink(&outside, &root.join(".aether").join("sessions")) {
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let error = SessionStore::open(&root, session).unwrap_err().to_string();
+        assert!(
+            error.contains("symbolic link")
+                || error.contains("reparse")
+                || error.contains("session directory")
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn session_jsonl_symlink_escape_is_rejected() {
+        let (root, path, session) = temp_session("jsonl-link");
+        let outside = outside_dir("jsonl-link");
+        let target = outside.join("escaped.jsonl");
+        std::fs::write(&target, "outside\n").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if !try_file_symlink(&target, &path) {
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let error = SessionStore::open(&root, session).unwrap_err().to_string();
+        assert!(
+            error.contains("symbolic link")
+                || error.contains("reparse")
+                || error.contains("session file")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside\n");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn compaction_temp_symlink_does_not_escape() {
+        let (root, path, session) = temp_session("compact-temp");
+        let outside = outside_dir("compact-temp");
+        let target = outside.join("escaped.tmp");
+        std::fs::write(&target, "outside").unwrap();
+        let mut store = SessionStore::open(&root, session).unwrap();
+        store
+            .append(
+                None,
+                SessionRecord::Started { workspace_root: root.display().to_string(), model: None },
+            )
+            .unwrap();
+        let temp = path.parent().unwrap().join(format!(
+            ".aether-session-{}-{}.tmp",
+            std::process::id(),
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        if !try_file_symlink(&target, &temp) {
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(outside);
+            return;
+        }
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(store.compact().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

@@ -431,9 +431,9 @@ async fn open_session_store(
     root: &Path,
     session_id: &SessionId,
 ) -> Result<Arc<Mutex<SessionStore>>, AppError> {
-    let path = SessionStore::path_for(root, session_id);
+    let root = root.to_path_buf();
     let session_id = session_id.clone();
-    let store = tokio::task::spawn_blocking(move || SessionStore::open(path, session_id))
+    let store = tokio::task::spawn_blocking(move || SessionStore::open(root, session_id))
         .await
         .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
     Ok(Arc::new(Mutex::new(store)))

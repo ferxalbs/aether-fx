@@ -1,11 +1,28 @@
 # CHANGELOG
 
 All notable AETHER Fx changes are recorded here. The project remains
-unreleased, with changes grouped by implementation phase.
+unreleased, with changes grouped by public capability.
 
-## Unreleased - 2026-08-22 (5) - Phase 2.1 session and context safety closure
+## Unreleased - 2026-08-22 (6) - Session storage path hardening
 
-> Status: unreleased Phase 2.1 work. No artifact has been published.
+> Status: unreleased work. No artifact has been published.
+
+### Security
+
+- Session directories and JSONL files are created and opened without following
+  symbolic links or Windows reparse points, and must remain inside the
+  canonical workspace.
+- Compaction temps are created exclusively in `.aether/sessions` and cannot
+  redirect writes through a planted symlink.
+
+### Documentation
+
+- Documented session-path containment, no-follow open/create semantics, and
+  residual TOCTOU between validation and the final OS call.
+
+## Unreleased - 2026-08-22 (5) - Session and context safety hardening
+
+> Status: unreleased work. No artifact has been published.
 
 ### Changed
 
@@ -36,9 +53,9 @@ unreleased, with changes grouped by implementation phase.
   commit/recovery, continuation invalidation, and the Rainy SDK 0.6.14 mapping
   limitation for continuation errors.
 
-## Unreleased - 2026-08-22 (4) - Phase 2 context engine and session continuity
+## Unreleased - 2026-08-22 (4) - Context engine and session continuity
 
-> Status: unreleased Phase 2 work. No artifact has been published.
+> Status: unreleased work. No artifact has been published.
 
 ### Added
 
@@ -85,9 +102,9 @@ unreleased, with changes grouped by implementation phase.
 - Git awareness remains read-only; working-tree mutation is still out of
   scope.
 
-## Unreleased - 2026-08-22 (3) - Phase 1.1 correctness closure
+## Unreleased - 2026-08-22 (3) - Runtime correctness and concurrency hardening
 
-> Status: unreleased Phase 1.1 work. No artifact has been published.
+> Status: unreleased work. No artifact has been published.
 
 ### Fixed
 
@@ -131,9 +148,9 @@ unreleased, with changes grouped by implementation phase.
   the final window after AETHER revalidation and before the atomic OS call;
   same-path AETHER races are serialized and the limitation is documented.
 
-## Unreleased - 2026-08-22 (2) - Phase 1 native runtime hardening and interactive agent
+## Unreleased - 2026-08-22 (2) - Native runtime hardening and interactive agent
 
-> Status: unreleased Phase 1 work. No artifact has been published.
+> Status: unreleased work. No artifact has been published.
 
 ### Added
 
