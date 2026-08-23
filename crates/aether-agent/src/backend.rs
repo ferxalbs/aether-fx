@@ -36,6 +36,9 @@ pub enum BackendError {
     /// The backend is not available in this build/configuration.
     #[error("backend feature unavailable: {feature}")]
     FeatureUnavailable { feature: String },
+    /// Stored Rainy continuation is not usable for the next model step.
+    #[error("backend continuation is invalid: {message}")]
+    InvalidContinuation { message: String },
     /// The user cancelled the backend stream.
     #[error("backend stream cancelled")]
     Cancelled,

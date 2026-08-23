@@ -14,8 +14,6 @@ Permission requests contain operation data, not file bodies or environment secre
 
 File replacement stages a same-directory temporary file, writes/flushed/syncs it, preserves basic destination permissions, and installs it with an atomic same-filesystem operation. For an existing destination, Unix uses rename replacement and Windows uses `ReplaceFileW`; this is atomic replacement, not create-if-absent. For `create_only=true` (and for a destination that was missing when an ordinary write began), the commit uses a native no-replace install: Linux/macOS `renameat_with(NOREPLACE)` / `RENAME_EXCL`, Windows `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, and a hard-link fallback only when exclusive rename is unsupported on the filesystem. The destination is never replaced by that path. Filesystems that provide neither exclusive rename nor hard links cannot atomically create-if-absent; AETHER fails closed rather than copying over an existing file. The implementation does not claim preservation of xattrs, ACLs, alternate streams, or other extended metadata.
 
-Session JSONL never stores `RAINY_API_KEY`, environment secrets, raw chain-of-thought, or unbounded shell/process output. Continuation records keep only opaque identity keys (`previous_response_id`, plus the deterministic `fake_step` test key).
-
 `write` and `patch` share a weak-reference per-destination mutation coordinator inside a workspace. This serializes AETHER mutations to the same resolved destination without imposing one global filesystem lock. Multi-file patches normalize, sort, and deduplicate keys before acquiring locks, preventing lock-order deadlocks. A patch stages all replacements before committing and revalidates each source state immediately before its commit.
 
 `expected_hash` is an optimistic content precondition: AETHER hashes the target while holding its destination guard and hashes it again before commit, rejecting a changed hash as `concurrent_modification`. Existing-destination writes also retain and revalidate that content hash even without a caller-supplied precondition; missing-destination writes revalidate bounded filesystem metadata (existence, length, modification time, and symlink state). These checks are not a fully linearizable cross-process compare-and-swap: an external actor can still mutate the namespace after revalidation and before the final atomic OS call. The final replacement/create operation remains atomic, and AETHER-vs-AETHER same-path preparation/commit sections are serialized.
@@ -35,6 +33,26 @@ Ctrl+C in a permission prompt is a terminal `CancelTurn` outcome: it cancels the
 ## Secrets and network
 
 `RAINY_API_KEY` is read only when a Rainy backend is requested. It is not stored in sessions, tool results, logs, panic diagnostics, or user-visible errors. AETHER has zero telemetry. The only normal outbound operation is an explicit Rainy inference or model-catalog request.
+
+## Session persistence
+
+Local sessions are JSONL under `<workspace>/.aether/sessions/<session-id>.jsonl` (schema version 3). Persistence is minimized by construction, not by scanning for secrets. A session file stores:
+
+- session identity, workspace root, and model
+- committed turn metadata (`turn_id`, step count, cancelled)
+- inspected file paths, content hashes, and line ranges
+- modified paths
+- safe tool summaries (path/hash/count metadata; shell/process/git persist only `ok`/`failed`)
+- git branch availability without status/diff text
+- sanitized continuation identity (`previous_response_id` or the test `fake_step` key)
+
+It does not store raw prompts, assistant text, file excerpt bodies, shell/process stdout or stderr, environment content, credentials, authorization headers, private keys, or tokens. `payload_contains_secrets` is defense-in-depth after that minimization and is not complete secret detection.
+
+On Unix, `.aether/` and `.aether/sessions/` are created and kept at mode `0700`; session JSONL files and compaction temps are `0600`. Windows has no POSIX modes; the same paths are created without Unix permission bits.
+
+Each completed turn is one JSONL record. A truncated final record is an uncommitted crash window and is ignored; the previous committed turn remains valid. Corrupt middle records fail replay. Compaction never overwrites a file after a failed replay.
+
+Resume re-hashes inspected files. If the live workspace root differs, or an inspected file is stale or missing, Rainy continuation is discarded and the next model turn reconstructs from bounded local context. Stale remote continuation never outranks the filesystem.
 
 ## Dangerous operations
 

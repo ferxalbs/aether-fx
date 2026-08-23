@@ -10,6 +10,17 @@ Normal inference uses deterministic model precedence in the binary: `--model`, t
 
 Rainy's transport/retry behavior remains Rainy's/SDK's responsibility. AETHER emits semantic step IDs and does not blindly retry ambiguous tool/model operations. The verified 0.6.14 ResponsesRequest surface has no documented idempotency field, so AETHER does not invent one; the IDs remain the local semantic identity until an SDK contract exposes transport integration. Reasoning and continuation fields are opaque values; raw chain-of-thought is never rendered or exposed as a tool result.
 
+## Continuation invalidation and typed recovery
+
+`rainy-sdk 0.6.14` has no continuation-specific error type. AETHER maps to `BackendError::InvalidContinuation` only with structured protocol evidence:
+
+- locally, a continuation object is present but has no non-empty `previous_response_id` string;
+- a Rainy `InvalidRequest` whose machine-readable `code` is `previous_response_id`, `invalid_previous_response_id`, or `INVALID_PREVIOUS_RESPONSE_ID`, and only when that request attached a previous response id.
+
+Other SDK variants (`Network`, `Api`, `Provider`, `Authentication`, and `InvalidRequest` with any other code) stay ordinary backend errors. The agent never inspects user-facing error text. On `InvalidContinuation` at the first step of a turn that still has continuation, it clears continuation, reconstructs from bounded local context, and retries once. Unrelated backend errors are not retried as continuation failures.
+
+Resume also drops continuation when the live workspace root differs or inspected files are stale or missing, so Rainy remote context cannot outrank the filesystem.
+
 ## Responses stream completion
 
 The adapter treats `response.completed` as the only successful terminal event. It requires the event to carry a non-empty response ID and stores that ID as opaque `previous_response_id` continuation metadata; continuation is never fabricated when transport state disappears. Explicit `response.failed` and `response.incomplete` events become typed backend errors with bounded safe diagnostic text.

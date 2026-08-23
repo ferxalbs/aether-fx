@@ -213,7 +213,7 @@ async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Res
     let broker = NoPermissionBroker;
     let turn_result = run_agent_turn(&agent, request, &broker, None, &mut renderer).await;
     if let Ok(Some(result)) = &turn_result {
-        persist_completed_turn(&store, &turn_id, &prompt, result).await?;
+        persist_completed_turn(&store, &turn_id, result).await?;
     }
     let _ = persist_finished(&store).await;
     let cleanup = workspace.shutdown_processes().await;
@@ -311,7 +311,7 @@ async fn run_interactive(
             if let Some(result) =
                 run_agent_turn(&agent, request, &broker, Some(&broker), &mut renderer).await?
             {
-                persist_completed_turn(&store, &turn_id, &prompt, &result).await?;
+                persist_completed_turn(&store, &turn_id, &result).await?;
                 continuation = result.continuation;
                 context_seed = Some(result.context);
             }
@@ -460,29 +460,18 @@ async fn persist_started(
 async fn persist_completed_turn(
     store: &Arc<Mutex<SessionStore>>,
     turn_id: &TurnId,
-    prompt: &str,
     result: &AgentRunResult,
 ) -> Result<(), AppError> {
     let store = Arc::clone(store);
     let turn_id = turn_id.clone();
-    let prompt = prompt.to_owned();
     let steps = result.steps;
     let cancelled = result.cancelled;
-    let text = result.text.clone();
     let context = result.context.clone();
     let continuation = result.continuation.clone();
     tokio::task::spawn_blocking(move || {
         persist_turn(
             &mut store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-            PersistTurn {
-                turn_id: &turn_id,
-                prompt: &prompt,
-                steps,
-                cancelled,
-                text,
-                context: &context,
-                continuation,
-            },
+            PersistTurn { turn_id: &turn_id, steps, cancelled, context: &context, continuation },
         )
     })
     .await

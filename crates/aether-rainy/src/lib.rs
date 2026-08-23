@@ -36,7 +36,8 @@ impl RainyBackend {
             .ok_or(BackendError::CredentialsUnavailable)?
             .into_string()
             .map_err(|_| BackendError::CredentialsUnavailable)?;
-        let client = RainyClient::with_api_key(key).map_err(|error| map_rainy_error(&error))?;
+        let client =
+            RainyClient::with_api_key(key).map_err(|error| map_rainy_error(&error, false))?;
         Ok(Self { client, catalog: Arc::new(Mutex::new(None)) })
     }
 
@@ -53,8 +54,11 @@ impl RainyBackend {
                 return Ok(cache.models.clone());
             }
         }
-        let catalog =
-            self.client.get_models_catalog().await.map_err(|error| map_rainy_error(&error))?;
+        let catalog = self
+            .client
+            .get_models_catalog()
+            .await
+            .map_err(|error| map_rainy_error(&error, false))?;
         let models = catalog
             .into_iter()
             .map(|item| {
@@ -85,13 +89,8 @@ impl RainyBackend {
         let mut rainy_request =
             ResponsesRequest::new(model, request.input.clone()).with_stream(true).with_tools(tools);
         if let Some(continuation) = request.continuation.as_ref() {
-            let response_id =
-                continuation.0.get("previous_response_id").and_then(Value::as_str).ok_or_else(
-                    || BackendError::FeatureUnavailable {
-                        feature: "Rainy SDK continuation requires previous_response_id".to_owned(),
-                    },
-                )?;
-            rainy_request = rainy_request.with_previous_response_id(response_id);
+            rainy_request =
+                rainy_request.with_previous_response_id(previous_response_id(continuation)?);
         }
         Ok(rainy_request)
     }
@@ -115,15 +114,16 @@ impl ModelBackend for RainyBackend {
     fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
         Box::pin(async move {
             let model = self.model_for(request.model.clone()).await?;
+            let continuation_attached = request.continuation.is_some();
             let rainy_request = self.request(&request, model)?;
             let stream = self
                 .client
                 .create_response_stream(rainy_request)
                 .await
-                .map_err(|error| map_rainy_error(&error))?;
+                .map_err(|error| map_rainy_error(&error, continuation_attached))?;
             let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
             tokio::spawn(async move {
-                adapt_stream(stream, sender).await;
+                adapt_stream(stream, sender, continuation_attached).await;
             });
             Ok(receiver)
         })
@@ -156,6 +156,7 @@ async fn adapt_stream(
         Box<dyn futures_util::Stream<Item = Result<Value, RainyError>> + Send>,
     >,
     sender: mpsc::Sender<Result<ModelEvent, BackendError>>,
+    continuation_attached: bool,
 ) {
     let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut completed_tool_calls = HashSet::new();
@@ -172,7 +173,7 @@ async fn adapt_stream(
                 let event = match event {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = sender.send(Err(map_rainy_error(&error))).await;
+                        let _ = sender.send(Err(map_rainy_error(&error, continuation_attached))).await;
                         return;
                     }
                 };
@@ -366,13 +367,39 @@ fn event_string(event: &Value, keys: &[&str]) -> Result<String, BackendError> {
         })
 }
 
-fn map_rainy_error(error: &RainyError) -> BackendError {
+fn previous_response_id(continuation: &OpaqueContinuation) -> Result<&str, BackendError> {
+    continuation
+        .0
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| BackendError::InvalidContinuation {
+            message: "continuation omitted previous_response_id".to_owned(),
+        })
+}
+
+fn map_rainy_error(error: &RainyError, continuation_attached: bool) -> BackendError {
+    if continuation_attached
+        && let RainyError::InvalidRequest { code, .. } = error
+        && is_continuation_field_code(code)
+    {
+        return BackendError::InvalidContinuation {
+            message: "Rainy rejected previous_response_id".to_owned(),
+        };
+    }
     let request_id =
         error.request_id().map(|value| format!(" (request_id={value})")).unwrap_or_default();
     BackendError::Operation {
         message: format!("Rainy SDK request failed{request_id}"),
         retryable: error.is_retryable(),
     }
+}
+
+fn is_continuation_field_code(code: &str) -> bool {
+    matches!(
+        code,
+        "previous_response_id" | "INVALID_PREVIOUS_RESPONSE_ID" | "invalid_previous_response_id"
+    )
 }
 
 #[cfg(test)]
@@ -385,7 +412,7 @@ mod tests {
             events.into_iter().map(Ok::<Value, RainyError>).collect::<Vec<_>>(),
         ));
         let (sender, mut receiver) = mpsc::channel(16);
-        adapt_stream(stream, sender).await;
+        adapt_stream(stream, sender, false).await;
         let mut output = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             output.push(event);
@@ -420,6 +447,30 @@ mod tests {
             Err(BackendError::FeatureUnavailable { feature })
                 if feature.contains("no model selected")
         ));
+    }
+
+    #[test]
+    fn missing_previous_response_id_is_typed_invalid_continuation() {
+        let error =
+            previous_response_id(&OpaqueContinuation(json!({"fake_step": "x"}))).unwrap_err();
+        assert!(matches!(error, BackendError::InvalidContinuation { .. }));
+    }
+
+    #[test]
+    fn rainy_invalid_request_code_maps_to_invalid_continuation_only_when_attached() {
+        let error = RainyError::InvalidRequest {
+            code: "previous_response_id".to_owned(),
+            message: "ignored".to_owned(),
+            details: None,
+        };
+        assert!(matches!(map_rainy_error(&error, true), BackendError::InvalidContinuation { .. }));
+        assert!(matches!(map_rainy_error(&error, false), BackendError::Operation { .. }));
+        let network = RainyError::Network {
+            message: "previous_response_id expired".to_owned(),
+            retryable: true,
+            source_error: None,
+        };
+        assert!(matches!(map_rainy_error(&network, true), BackendError::Operation { .. }));
     }
 
     #[test]
@@ -630,7 +681,7 @@ mod tests {
     async fn receiver_drop_stops_stream_consumption() {
         let stream = Box::pin(stream::pending::<Result<Value, RainyError>>());
         let (sender, receiver) = mpsc::channel(1);
-        let task = tokio::spawn(adapt_stream(stream, sender));
+        let task = tokio::spawn(adapt_stream(stream, sender, false));
         drop(receiver);
         tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
     }

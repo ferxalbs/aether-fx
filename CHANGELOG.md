@@ -3,6 +3,39 @@
 All notable AETHER Fx changes are recorded here. The project remains
 unreleased, with changes grouped by implementation phase.
 
+## Unreleased - 2026-08-22 (5) - Phase 2.1 session and context safety closure
+
+> Status: unreleased Phase 2.1 work. No artifact has been published.
+
+### Changed
+
+- Session JSONL is schema version 3. Each completed turn is one committed
+  `TurnSnapshot` record. Truncated trailing records are ignored; previous
+  committed turns remain valid.
+- Persistence stores session identity, workspace, model, turn metadata, file
+  path/hash/range metadata, safe tool summaries, and sanitized continuation.
+  Raw prompts, assistant text, excerpt bodies, and shell/process/git output
+  are omitted by construction.
+- Resume discards Rainy `previous_response_id` when the workspace root differs
+  or inspected files are stale or missing, then reconstructs from bounded local
+  context.
+- Continuation recovery uses typed `BackendError::InvalidContinuation` instead
+  of matching user-facing error strings.
+
+### Security
+
+- Unix session directories are mode `0700` and session JSONL/temp files are
+  `0600`. `payload_contains_secrets` remains defense-in-depth after record
+  minimization and is not complete secret detection.
+- Compaction refuses to rewrite a session after corrupt replay, leaving the
+  original file untouched.
+
+### Documentation
+
+- Documented persisted versus omitted session fields, Unix session modes, turn
+  commit/recovery, continuation invalidation, and the Rainy SDK 0.6.14 mapping
+  limitation for continuation errors.
+
 ## Unreleased - 2026-08-22 (4) - Phase 2 context engine and session continuity
 
 > Status: unreleased Phase 2 work. No artifact has been published.

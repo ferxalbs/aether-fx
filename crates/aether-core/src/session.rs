@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    BoundedText, ContextSnapshot, OpaqueContinuation, SessionId, TurnId, persistable_continuation,
-};
+use crate::{ContextSnapshot, OpaqueContinuation, SessionId, TurnId, persistable_continuation};
 
 /// Version of the append-friendly local JSONL schema.
-pub const SESSION_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// One versioned line in a local session JSONL file.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -22,30 +20,40 @@ pub struct SessionLine {
     pub record: SessionRecord,
 }
 
+/// One committed, crash-atomic turn record.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TurnSnapshot {
+    /// Turn identity for this committed record.
+    pub turn_id: TurnId,
+    /// Semantic model steps used.
+    pub steps: u16,
+    /// Whether the turn ended cancelled.
+    pub cancelled: bool,
+    /// Minimized context metadata safe to persist.
+    pub context: ContextSnapshot,
+    /// Sanitized Rainy continuation identity, if any.
+    pub continuation: Option<OpaqueContinuation>,
+}
+
 /// Append-only local session records.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionRecord {
     /// Session header with workspace and model identity.
     Started { workspace_root: String, model: Option<String> },
-    /// Bounded user input.
-    UserPrompt { prompt: String },
-    /// Compact completed-turn metadata. Raw tool output is not stored.
-    TurnCompleted { steps: u16, cancelled: bool, text: BoundedText },
-    /// Opaque backend continuation needed by a later step.
-    Continuation { continuation: Option<OpaqueContinuation> },
-    /// Bounded working-context snapshot.
-    ContextSnapshot { context: Box<ContextSnapshot> },
+    /// One complete committed turn. Partial writes of this record are ignored on replay.
+    TurnSnapshot { snapshot: Box<TurnSnapshot> },
     /// Explicitly closed session.
     Finished,
 }
 
 impl SessionRecord {
-    /// Persist only opaque continuation identity keys.
-    pub fn continuation(continuation: Option<OpaqueContinuation>) -> Self {
-        Self::Continuation {
-            continuation: continuation.as_ref().and_then(persistable_continuation),
-        }
+    /// Construct a committed turn after applying persistable-context minimization.
+    pub fn turn_snapshot(snapshot: TurnSnapshot) -> Self {
+        let mut snapshot = snapshot;
+        snapshot.context = snapshot.context.persistable();
+        snapshot.continuation = snapshot.continuation.as_ref().and_then(persistable_continuation);
+        Self::TurnSnapshot { snapshot: Box::new(snapshot) }
     }
 }
 
@@ -72,7 +80,10 @@ mod tests {
             1,
             session,
             None,
-            SessionRecord::UserPrompt { prompt: "hello".to_owned() },
+            SessionRecord::Started {
+                workspace_root: "/workspace".to_owned(),
+                model: Some("model-a".to_owned()),
+            },
         );
         let encoded = serde_json::to_string(&line).unwrap();
         assert_eq!(serde_json::from_str::<SessionLine>(&encoded).unwrap(), line);

@@ -178,7 +178,7 @@ where
                         if steps == 1
                             && !reconstructed
                             && continuation.is_some()
-                            && continuation_unusable(&error) =>
+                            && matches!(error, BackendError::InvalidContinuation { .. }) =>
                     {
                         continuation = None;
                         reconstructed = true;
@@ -435,11 +435,6 @@ fn assemble_user_input(prompt: &str, context_packet: Option<String>) -> serde_js
         _ => prompt.to_owned(),
     };
     json!([{"type":"message","role":"user","content": content}])
-}
-
-fn continuation_unusable(error: &BackendError) -> bool {
-    let message = error.to_string();
-    message.contains("previous_response_id") || message.contains("previous_response")
 }
 
 async fn send_event(
@@ -890,8 +885,8 @@ mod tests {
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::Relaxed);
                 if request.continuation.is_some() {
-                    return Err(BackendError::FeatureUnavailable {
-                        feature: "Rainy SDK continuation requires previous_response_id".to_owned(),
+                    return Err(BackendError::InvalidContinuation {
+                        message: "stored previous_response_id is not usable".to_owned(),
                     });
                 }
                 let (sender, receiver) = mpsc::channel(4);
@@ -935,6 +930,57 @@ mod tests {
         let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
         assert_eq!(result.text.as_str(), "reconstructed");
         assert!(result.continuation.is_none());
+    }
+
+    #[derive(Clone, Default)]
+    struct UnrelatedContinuationErrorBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelBackend for UnrelatedContinuationErrorBackend {
+        fn stream_step<'a>(&'a self, _: ModelRequest) -> BackendFuture<'a> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(BackendError::Operation {
+                    message: "transport failure".to_owned(),
+                    retryable: true,
+                })
+            })
+        }
+
+        fn discover_models<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<ModelCatalogItem>, BackendError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_backend_error_does_not_reconstruct_or_retry() {
+        let backend = UnrelatedContinuationErrorBackend::default();
+        let calls = backend.calls.clone();
+        let agent = Agent::new(backend, tools());
+        let mut request = AgentRequest::new(
+            SessionId::new("session-no-retry").unwrap(),
+            TurnId::new("turn-no-retry").unwrap(),
+            "continue",
+        );
+        request.continuation =
+            Some(OpaqueContinuation(json!({"previous_response_id": "resp_keep"})));
+        let (sender, _receiver) = mpsc::channel(8);
+        let result = agent.run(request, sender, CancellationToken::new()).await;
+        assert!(matches!(
+            result,
+            Err(AgentError::Backend(BackendError::Operation { retryable: true, .. }))
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

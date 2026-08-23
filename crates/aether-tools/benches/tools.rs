@@ -360,7 +360,10 @@ fn session_replay(c: &mut Criterion) {
                 sequence,
                 session.clone(),
                 None,
-                SessionRecord::UserPrompt { prompt: "benchmark".to_owned() },
+                SessionRecord::Started {
+                    workspace_root: "/workspace".to_owned(),
+                    model: Some("bench".to_owned()),
+                },
             ))
             .expect("session serialization")
         })

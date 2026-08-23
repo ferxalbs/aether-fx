@@ -149,6 +149,36 @@ impl ContextSnapshot {
         }
     }
 
+    /// Minimize this snapshot for durable storage.
+    ///
+    /// Persistence keeps workspace, model, inspected path/hash/range metadata, modified
+    /// paths, and safe tool summaries. It omits raw prompts, assistant text, file excerpt
+    /// bodies, git diffs, and shell/process/git stdout. `payload_contains_secrets` is not
+    /// the primary boundary; this shape is.
+    pub fn persistable(&self) -> Self {
+        Self {
+            workspace_root: self.workspace_root.clone(),
+            current_task: BoundedText::new("", MAX_TASK_BYTES),
+            inspected: self.inspected.clone(),
+            modified: self.modified.clone(),
+            excerpts: Vec::new(),
+            tool_summaries: self
+                .tool_summaries
+                .iter()
+                .cloned()
+                .map(persistable_tool_summary)
+                .collect(),
+            git: self.git.as_ref().map(|git| GitSnapshot {
+                branch: git.branch.clone(),
+                status: BoundedText::new("", MAX_GIT_SNAPSHOT_BYTES),
+                available: git.available,
+            }),
+            continuation: self.continuation.as_ref().and_then(persistable_continuation),
+            model: self.model.clone(),
+            workspace_changed: self.workspace_changed,
+        }
+    }
+
     /// Return true when this snapshot has no working-state yet.
     pub fn is_empty(&self) -> bool {
         self.current_task.as_str().is_empty()
@@ -186,7 +216,28 @@ pub fn persistable_continuation(continuation: &OpaqueContinuation) -> Option<Opa
     if kept.is_empty() { None } else { Some(OpaqueContinuation(Value::Object(kept))) }
 }
 
-/// Return true when a serialized payload appears to contain environment secrets.
+fn persistable_tool_summary(summary: CompactToolSummary) -> CompactToolSummary {
+    match summary.tool.as_str() {
+        "shell" | "process" | "git" => CompactToolSummary {
+            tool: summary.tool.clone(),
+            ok: summary.ok,
+            summary: BoundedText::new(
+                if summary.ok {
+                    format!("{} ok", summary.tool)
+                } else {
+                    format!("{} failed", summary.tool)
+                },
+                MAX_COMPACT_SUMMARY_BYTES,
+            ),
+        },
+        _ => summary,
+    }
+}
+
+/// Defense-in-depth scan for obvious secret keys or `RAINY_API_KEY=` assignments.
+///
+/// This is not complete secret detection. Persistence relies on minimized records
+/// (`ContextSnapshot::persistable`) rather than this heuristic.
 pub fn payload_contains_secrets(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
@@ -549,6 +600,36 @@ mod tests {
         assert!(summary.summary.as_str().contains("2 failed"));
         assert!(summary.summary.as_str().contains("context_restore"));
         assert!(summary.summary.as_str().contains("stale_hash"));
+    }
+
+    #[test]
+    fn persistable_context_omits_raw_prompt_excerpts_and_command_output() {
+        let mut snapshot = ContextSnapshot::new("/workspace", Some("model-a".to_owned()));
+        snapshot.current_task = BoundedText::new("fix the failing tests", MAX_TASK_BYTES);
+        snapshot.excerpts.push(FileExcerpt {
+            path: "src/lib.rs".to_owned(),
+            start_line: 1,
+            end_line: 2,
+            text: BoundedText::new("fn secret() {}", MAX_EXCERPT_BYTES),
+            content_hash: Some("abc".to_owned()),
+        });
+        snapshot.tool_summaries.push(CompactToolSummary {
+            tool: "shell".to_owned(),
+            ok: false,
+            summary: BoundedText::new("cargo test\nRAINY_API_KEY=must-not-store", 1024),
+        });
+        snapshot.git = Some(GitSnapshot {
+            branch: Some("main".to_owned()),
+            status: BoundedText::new("M src/lib.rs\ndiff --git", MAX_GIT_SNAPSHOT_BYTES),
+            available: true,
+        });
+        let persisted = snapshot.persistable();
+        assert!(persisted.current_task.as_str().is_empty());
+        assert!(persisted.excerpts.is_empty());
+        assert_eq!(persisted.tool_summaries[0].summary.as_str(), "shell failed");
+        assert!(!persisted.tool_summaries[0].summary.as_str().contains("RAINY_API_KEY"));
+        assert_eq!(persisted.git.as_ref().unwrap().branch.as_deref(), Some("main"));
+        assert!(persisted.git.as_ref().unwrap().status.as_str().is_empty());
     }
 
     #[test]

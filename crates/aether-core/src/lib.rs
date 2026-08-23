@@ -33,7 +33,7 @@ pub use path::{WorkspacePath, WorkspaceRoot};
 pub use permissions::{
     PermissionClass, PermissionDecision, PermissionEngine, PermissionPolicy, PermissionRequest,
 };
-pub use session::{SESSION_SCHEMA_VERSION, SessionLine, SessionRecord};
+pub use session::{SESSION_SCHEMA_VERSION, SessionLine, SessionRecord, TurnSnapshot};
 pub use tools::{
     ExecutionPermit, ToolDefinition, ToolExecutionContext, ToolExecutor, ToolInvocation, ToolResult,
 };

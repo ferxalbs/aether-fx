@@ -63,7 +63,7 @@ Rainy adapter
 
 There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in this bootstrap.
 
-Local sessions are versioned JSONL files under `<workspace>/.aether/sessions/<session-id>.jsonl`. The schema is `SESSION_SCHEMA_VERSION` 2 and stores session identity, bounded turn history, sanitized Rainy continuation (`previous_response_id` only), model, workspace root, context metadata, and compact tool summaries. `aether resume <session-id>` restores that file, re-hashes inspected files against the live workspace, and continues the semantic session. Raw tool output, environment secrets, and chain-of-thought are not persisted.
+Local sessions are versioned JSONL files under `<workspace>/.aether/sessions/<session-id>.jsonl`. Schema version 3 stores `Started`, committed `TurnSnapshot` records, and `Finished`. Each completed turn is one JSONL record containing turn metadata, minimized context (paths/hashes/ranges and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. `aether resume <session-id>` restores the last committed turn, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
 
 Context bounds (also documented on the constants in `aether-core::context`):
 
