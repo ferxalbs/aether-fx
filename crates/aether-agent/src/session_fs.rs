@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aether_core::SessionId;
 
-use crate::session::SessionStoreError;
+use crate::session::{AETHER_STATE_DIR, SESSION_DIR, SESSION_TEMP_PREFIX, SessionStoreError};
 
 pub(crate) struct SessionEntry {
     pub session_id: SessionId,
@@ -31,7 +31,7 @@ impl SessionLayout {
     ) -> Result<Self, SessionStoreError> {
         let workspace = canonical_workspace(workspace.as_ref())?;
         let file_name = format!("{}.jsonl", session_id.as_str());
-        let path = workspace.join(".aether").join("sessions").join(&file_name);
+        let path = workspace.join(AETHER_STATE_DIR).join(SESSION_DIR).join(&file_name);
         prepare_directories(&workspace)?;
         reject_indirect_file(&path)?;
         Ok(Self { workspace, path, file_name })
@@ -60,8 +60,8 @@ impl SessionLayout {
         let claimed_workspace = aether_dir.parent().ok_or_else(|| {
             SessionStoreError::Invalid("session path escapes the workspace".to_owned())
         })?;
-        if sessions_dir.file_name() != Some(std::ffi::OsStr::new("sessions"))
-            || aether_dir.file_name() != Some(std::ffi::OsStr::new(".aether"))
+        if sessions_dir.file_name() != Some(std::ffi::OsStr::new(SESSION_DIR))
+            || aether_dir.file_name() != Some(std::ffi::OsStr::new(AETHER_STATE_DIR))
         {
             return Err(SessionStoreError::Invalid(
                 "session path escapes the workspace".to_owned(),
@@ -75,7 +75,7 @@ impl SessionLayout {
             ));
         }
         prepare_directories(&workspace)?;
-        let expected = workspace.join(".aether").join("sessions").join(&file_name);
+        let expected = workspace.join(AETHER_STATE_DIR).join(SESSION_DIR).join(&file_name);
         reject_indirect_file(&expected)?;
         Ok(Self { workspace, path: expected, file_name })
     }
@@ -166,8 +166,8 @@ fn prepare_directories(workspace: &Path) -> Result<(), SessionStoreError> {
     let workspace_fd =
         openat(CWD, workspace, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
             .map_err(|error| io_err("open workspace", error))?;
-    let aether = ensure_unix_dir(workspace_fd.as_fd(), ".aether")?;
-    let _sessions = ensure_unix_dir(aether.as_fd(), "sessions")?;
+    let aether = ensure_unix_dir(workspace_fd.as_fd(), AETHER_STATE_DIR)?;
+    let _sessions = ensure_unix_dir(aether.as_fd(), SESSION_DIR)?;
     Ok(())
 }
 
@@ -223,7 +223,7 @@ fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, Sess
     .map_err(|error| io_err("open workspace", error))?;
     let aether = match openat(
         workspace_fd.as_fd(),
-        ".aether",
+        AETHER_STATE_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     ) {
@@ -233,7 +233,7 @@ fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, Sess
     };
     let sessions = match openat(
         aether.as_fd(),
-        "sessions",
+        SESSION_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     ) {
@@ -286,14 +286,14 @@ fn open_contained_jsonl(layout: &SessionLayout, create: bool) -> Result<File, Se
     .map_err(|error| io_err("open workspace", error))?;
     let aether = openat(
         workspace_fd.as_fd(),
-        ".aether",
+        AETHER_STATE_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|error| map_unix_open_error("open session directory", error))?;
     let sessions = openat(
         aether.as_fd(),
-        "sessions",
+        SESSION_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
@@ -326,14 +326,14 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
     .map_err(|error| io_err("open workspace", error))?;
     let aether = openat(
         workspace_fd.as_fd(),
-        ".aether",
+        AETHER_STATE_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|error| map_unix_open_error("open session directory", error))?;
     let sessions = openat(
         aether.as_fd(),
-        "sessions",
+        SESSION_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
@@ -353,7 +353,7 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
         Err(error) => return Err(map_unix_open_error("stat session file", error)),
     }
     let temp_name =
-        format!(".aether-session-{}-{}.tmp", std::process::id(), layout.file_name.as_str());
+        format!("{SESSION_TEMP_PREFIX}-{}-{}.tmp", std::process::id(), layout.file_name.as_str());
     let fd = openat(
         sessions.as_fd(),
         temp_name.as_str(),
@@ -384,8 +384,8 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
 #[cfg(not(unix))]
 fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, SessionStoreError> {
     let workspace = canonical_workspace(workspace)?;
-    let aether = workspace.join(".aether");
-    let sessions = aether.join("sessions");
+    let aether = workspace.join(AETHER_STATE_DIR);
+    let sessions = aether.join(SESSION_DIR);
     for directory in [&aether, &sessions] {
         match fs::symlink_metadata(directory) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -431,9 +431,9 @@ fn contained_session_entries(workspace: &Path) -> Result<Vec<SessionEntry>, Sess
 
 #[cfg(not(unix))]
 fn prepare_directories(workspace: &Path) -> Result<(), SessionStoreError> {
-    let aether = workspace.join(".aether");
+    let aether = workspace.join(AETHER_STATE_DIR);
     ensure_real_dir(&aether, workspace)?;
-    let sessions = aether.join("sessions");
+    let sessions = aether.join(SESSION_DIR);
     ensure_real_dir(&sessions, workspace)
 }
 
@@ -503,7 +503,7 @@ fn replace_contained_jsonl(layout: &SessionLayout, bytes: &[u8]) -> Result<(), S
         SessionStoreError::Invalid("session path escapes the workspace".to_owned())
     })?;
     let temporary = directory.join(format!(
-        ".aether-session-{}-{}.tmp",
+        "{SESSION_TEMP_PREFIX}-{}-{}.tmp",
         std::process::id(),
         layout.file_name.as_str()
     ));

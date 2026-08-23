@@ -26,6 +26,10 @@ pub enum SessionStoreError {
     Invalid(String),
 }
 
+pub(crate) const AETHER_STATE_DIR: &str = ".aether-fx";
+pub(crate) const SESSION_DIR: &str = "sessions";
+pub(crate) const SESSION_TEMP_PREFIX: &str = ".aether-fx-session";
+
 /// Append-friendly local JSONL session store.
 #[derive(Clone, Debug)]
 pub struct SessionStore {
@@ -133,16 +137,19 @@ impl SessionStore {
             operation: "read session tail".to_owned(),
             message: error.to_string(),
         })?;
-        let ended_with_newline = tail.ends_with(b"\n");
-        let tail = std::str::from_utf8(&tail)
+        let mut tail_start = 0;
+        if length > tail_length as u64 {
+            tail_start =
+                tail.iter().position(|byte| *byte == b'\n').map_or(tail.len(), |index| index + 1);
+        }
+        let mut tail_end = tail.len();
+        if !tail.ends_with(b"\n") {
+            tail_end = tail.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+        }
+        let tail = &tail[tail_start.min(tail_end)..tail_end];
+        let tail = std::str::from_utf8(tail)
             .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
-        let mut lines: Vec<&str> = tail.split_terminator('\n').collect();
-        if !ended_with_newline && !lines.is_empty() {
-            lines.pop();
-        }
-        if length > tail_length as u64 && !tail.starts_with('\n') && !lines.is_empty() {
-            lines.remove(0);
-        }
+        let lines: Vec<&str> = tail.split_terminator('\n').collect();
         let mut last_turn = None;
         let mut latest_model = None;
         for text in lines.into_iter().rev() {
@@ -200,9 +207,9 @@ impl SessionStore {
         }
         Ok((None, issues))
     }
-    /// Return `{workspace}/.aether/sessions`.
+    /// Return `{workspace}/.aether-fx/sessions`.
     pub fn directory_for(workspace: impl AsRef<Path>) -> PathBuf {
-        workspace.as_ref().join(".aether").join("sessions")
+        workspace.as_ref().join(AETHER_STATE_DIR).join(SESSION_DIR)
     }
 
     /// Return the JSONL path for a session id inside a workspace.
@@ -302,21 +309,27 @@ impl SessionStore {
 
     fn parse_lines(mut reader: BufReader<File>) -> Result<Vec<SessionLine>, SessionStoreError> {
         let mut lines = Vec::new();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         loop {
             buffer.clear();
-            let read = reader.read_line(&mut buffer).map_err(|error| SessionStoreError::Io {
-                operation: "read session line".to_owned(),
-                message: error.to_string(),
-            })?;
+            let read =
+                reader.read_until(b'\n', &mut buffer).map_err(|error| SessionStoreError::Io {
+                    operation: "read session line".to_owned(),
+                    message: error.to_string(),
+                })?;
             if read == 0 {
                 break;
             }
             if read > MAX_SESSION_LINE_BYTES {
                 return Err(SessionStoreError::Invalid("session line exceeds limit".to_owned()));
             }
-            let ended_with_newline = buffer.ends_with('\n');
-            let trimmed = buffer.trim_end();
+            let ended_with_newline = buffer.ends_with(b"\n");
+            let text = match std::str::from_utf8(&buffer) {
+                Ok(text) => text,
+                Err(_) if !ended_with_newline => break,
+                Err(error) => return Err(SessionStoreError::Invalid(error.to_string())),
+            };
+            let trimmed = text.trim_end();
             if trimmed.is_empty() {
                 continue;
             }
@@ -583,6 +596,30 @@ mod tests {
         .unwrap();
     }
 
+    fn padded_started_line(
+        session: &SessionId,
+        sequence: u64,
+        target_len: usize,
+        fill: &[u8],
+    ) -> (Vec<u8>, usize) {
+        let prefix = format!(
+            r#"{{"schema_version":3,"sequence":{sequence},"session_id":"{}","turn_id":null,"record":{{"type":"started","workspace_root":"/workspace","model":"model","padding":""#,
+            session.as_str()
+        )
+        .into_bytes();
+        let suffix = b"\"}}\n";
+        assert!(target_len >= prefix.len() + suffix.len());
+        let padding_len = target_len - prefix.len() - suffix.len();
+        let mut bytes = prefix.clone();
+        while bytes.len() + fill.len() <= prefix.len() + padding_len {
+            bytes.extend_from_slice(fill);
+        }
+        bytes.extend(std::iter::repeat_n(b'a', prefix.len() + padding_len - bytes.len()));
+        bytes.extend_from_slice(suffix);
+        assert_eq!(bytes.len(), target_len);
+        (bytes, prefix.len())
+    }
+
     #[test]
     fn session_write_read_round_trip_persists_continuation() {
         let (root, _path, session) = temp_session("roundtrip");
@@ -634,6 +671,91 @@ mod tests {
             restored.continuation.unwrap().0.get("previous_response_id").unwrap(),
             "resp_first"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summary_tail_start_inside_utf8_character_finds_latest_turn() {
+        const TAIL_BYTES: usize = MAX_SESSION_LINE_BYTES * 2 + 2;
+
+        let (root, path, session) = temp_session("summary-utf8-boundary");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let header = serde_json::to_vec(&SessionLine::new(
+            1,
+            session.clone(),
+            None,
+            SessionRecord::Started {
+                workspace_root: root.display().to_string(),
+                model: Some("model-a".to_owned()),
+            },
+        ))
+        .unwrap();
+        let mut header = header;
+        header.push(b'\n');
+        let turn_id = TurnId::new("turn-utf8-boundary").unwrap();
+        let turn = serde_json::to_vec(&SessionLine::new(
+            4,
+            session.clone(),
+            Some(turn_id.clone()),
+            SessionRecord::turn_snapshot(TurnSnapshot {
+                turn_id: turn_id.clone(),
+                steps: 1,
+                cancelled: false,
+                context: ContextSnapshot::new(
+                    root.display().to_string(),
+                    Some("model-a".to_owned()),
+                ),
+                continuation: None,
+            }),
+        ))
+        .unwrap();
+        let mut turn = turn;
+        turn.push(b'\n');
+        let (boundary, boundary_prefix_len) =
+            padded_started_line(&session, 2, MAX_SESSION_LINE_BYTES, "🚀".as_bytes());
+        let middle_len = TAIL_BYTES - boundary.len() - turn.len() + boundary_prefix_len + 2;
+        assert!(middle_len <= MAX_SESSION_LINE_BYTES);
+        let (middle, _) = padded_started_line(&session, 3, middle_len, b"m");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&boundary);
+        bytes.extend_from_slice(&middle);
+        bytes.extend_from_slice(&turn);
+        let tail_offset = bytes.len() - TAIL_BYTES;
+        assert_eq!(tail_offset, header.len() + boundary_prefix_len + 2);
+        assert!((0x80..=0xbf).contains(&bytes[tail_offset]));
+        std::fs::write(&path, bytes).unwrap();
+
+        let (summaries, issues) = SessionStore::summaries(&root).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(summaries[0].session_id, session);
+        assert_eq!(summaries[0].last_turn, Some(turn_id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summary_ignores_crash_truncated_utf8_after_committed_turn() {
+        let (root, path, session) = temp_session("summary-utf8-truncated");
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
+        write_started_and_turn(
+            &mut store,
+            &root,
+            ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned())),
+            None,
+        );
+        let committed = std::fs::read(&path).unwrap();
+        let mut bytes = committed;
+        bytes.extend_from_slice(b"{\"partial\":\"");
+        bytes.extend_from_slice(&"🚀".as_bytes()[..3]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let (summaries, issues) = SessionStore::summaries(&root).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(summaries[0].last_turn, Some(TurnId::new("turn-1").unwrap()));
+        let (restored, restore_issues) = SessionStore::restore_latest(&root).unwrap();
+        assert_eq!(restored.unwrap().session_id, session);
+        assert!(restore_issues.is_empty(), "{restore_issues:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -740,8 +862,8 @@ mod tests {
                 SessionRecord::Started { workspace_root: root.display().to_string(), model: None },
             )
             .unwrap();
-        let aether = root.join(".aether");
-        let sessions = aether.join("sessions");
+        let aether = root.join(AETHER_STATE_DIR);
+        let sessions = aether.join(SESSION_DIR);
         assert_eq!(fs::metadata(&aether).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(&sessions).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -883,11 +1005,11 @@ mod tests {
     }
 
     #[test]
-    fn aether_symlink_escape_is_rejected() {
+    fn aether_fx_state_symlink_escape_is_rejected() {
         let (root, _, session) = temp_session("aether-link");
         let outside = outside_dir("aether-link");
         std::fs::write(outside.join("escaped.txt"), "outside").unwrap();
-        if !try_dir_symlink(&outside, &root.join(".aether")) {
+        if !try_dir_symlink(&outside, &root.join(AETHER_STATE_DIR)) {
             let _ = std::fs::remove_dir_all(root);
             let _ = std::fs::remove_dir_all(outside);
             return;
@@ -907,8 +1029,8 @@ mod tests {
     fn sessions_symlink_escape_is_rejected() {
         let (root, _, session) = temp_session("sessions-link");
         let outside = outside_dir("sessions-link");
-        std::fs::create_dir_all(root.join(".aether")).unwrap();
-        if !try_dir_symlink(&outside, &root.join(".aether").join("sessions")) {
+        std::fs::create_dir_all(root.join(AETHER_STATE_DIR)).unwrap();
+        if !try_dir_symlink(&outside, &root.join(AETHER_STATE_DIR).join(SESSION_DIR)) {
             let _ = std::fs::remove_dir_all(root);
             let _ = std::fs::remove_dir_all(outside);
             return;
@@ -947,14 +1069,19 @@ mod tests {
     }
 
     #[test]
-    fn summaries_reject_aether_and_sessions_directory_links() {
-        for name in [".aether", ".aether/sessions"] {
+    fn summaries_reject_state_and_sessions_directory_links() {
+        for name in [AETHER_STATE_DIR, SESSION_DIR] {
             let (root, _, _) = temp_session("summary-dir-link");
             let outside = outside_dir("summary-dir-link");
-            if name.contains('/') {
-                std::fs::create_dir_all(root.join(".aether")).unwrap();
+            if name == SESSION_DIR {
+                std::fs::create_dir_all(root.join(AETHER_STATE_DIR)).unwrap();
             }
-            if !try_dir_symlink(&outside, &root.join(name)) {
+            let link = if name == SESSION_DIR {
+                root.join(AETHER_STATE_DIR).join(name)
+            } else {
+                root.join(name)
+            };
+            if !try_dir_symlink(&outside, &link) {
                 let _ = std::fs::remove_dir_all(root);
                 let _ = std::fs::remove_dir_all(outside);
                 continue;
@@ -1028,7 +1155,7 @@ mod tests {
             )
             .unwrap();
         let temp = path.parent().unwrap().join(format!(
-            ".aether-session-{}-{}.tmp",
+            "{SESSION_TEMP_PREFIX}-{}-{}.tmp",
             std::process::id(),
             path.file_name().unwrap().to_string_lossy()
         ));

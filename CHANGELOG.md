@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-22 (9) - CLI state isolation and session reliability
+
+> Status: unreleased work. No artifact has been published.
+
+### Changed
+
+- Local sessions now use the product-specific `.aether-fx/sessions` namespace, while
+  legacy `.aether` state is ignored completely.
+- Bounded session summaries discard partial UTF-8 boundary records before decoding,
+  preserving discovery of the latest committed turn across tail and crash boundaries.
+
+### Security
+
+- Session containment and no-follow protections now cover the `.aether-fx` namespace,
+  including session JSONL files and compaction temporaries.
+
 ## Unreleased - 2026-08-22 (8) - Contained session discovery and reliable resume
 
 > Status: unreleased work. No artifact has been published.
@@ -13,7 +29,7 @@
 
 ### Security
 
-- Session enumeration opens `.aether`, `sessions`, and JSONL entries through contained no-follow
+- Session enumeration opens `.aether-fx`, `sessions`, and JSONL entries through contained no-follow
   filesystem operations, rejecting symbolic links and Windows reparse points.
 
 ## Unreleased - 2026-08-22 (7) - CLI and session workflow improvements
@@ -44,7 +60,7 @@ unreleased, with changes grouped by public capability.
 - Session directories and JSONL files are created and opened without following
   symbolic links or Windows reparse points, and must remain inside the
   canonical workspace.
-- Compaction temps are created exclusively in `.aether/sessions` and cannot
+- Compaction temps are created exclusively in `.aether-fx/sessions` and cannot
   redirect writes through a planted symlink.
 
 ### Documentation
@@ -95,7 +111,7 @@ unreleased, with changes grouped by public capability.
   inspected and modified files, targeted excerpts, compact tool summaries, git
   state, and sanitized Rainy continuation without resending full files or raw
   tool history on every model step.
-- Activated local versioned JSONL sessions under `.aether/sessions` and
+- Activated local versioned JSONL sessions under `.aether-fx/sessions` and
   implemented `aether resume <session-id>` with workspace, schema, path, and
   stale-hash validation.
 - Added deterministic local tool-result compaction and continuation

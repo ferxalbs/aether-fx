@@ -171,7 +171,7 @@ fn print_help() {
         "AETHER Fx {VERSION}\n\n\
          Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models\n  aether doctor\n\n\
          Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  --latest      Resume the newest valid local session\n  -h, --help    Show help\n  -V, --version Show version\n\n\
-         Sessions are stored as bounded JSONL under <root>/.aether/sessions."
+         Sessions are stored as bounded JSONL under <root>/.aether-fx/sessions."
     );
 }
 

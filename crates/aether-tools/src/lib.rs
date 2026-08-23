@@ -123,7 +123,7 @@ mod tests {
             fs::read_dir(&root)
                 .unwrap()
                 .filter_map(Result::ok)
-                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".aether-"))
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".aether-fx-"))
         );
         let _ = fs::remove_dir_all(root);
     }

@@ -36,7 +36,7 @@ Ctrl+C in a permission prompt is a terminal `CancelTurn` outcome: it cancels the
 
 ## Session persistence
 
-Local sessions are JSONL under `<workspace>/.aether/sessions/<session-id>.jsonl` (schema version 3). Persistence is minimized by construction, not by scanning for secrets. A session file stores:
+Local sessions are JSONL under `<workspace>/.aether-fx/sessions/<session-id>.jsonl` (schema version 3). Persistence is minimized by construction, not by scanning for secrets. A session file stores:
 
 - session identity, workspace root, and model
 - committed turn metadata (`turn_id`, step count, cancelled)
@@ -48,9 +48,9 @@ Local sessions are JSONL under `<workspace>/.aether/sessions/<session-id>.jsonl`
 
 It does not store raw prompts, assistant text, file excerpt bodies, shell/process stdout or stderr, environment content, credentials, authorization headers, private keys, or tokens. `payload_contains_secrets` is defense-in-depth after that minimization and is not complete secret detection.
 
-On Unix, `.aether/` and `.aether/sessions/` are created and kept at mode `0700`; session JSONL files and compaction temps are `0600`. Windows has no POSIX modes; the same paths are created without Unix permission bits.
+On Unix, `.aether-fx/` and `.aether-fx/sessions/` are created and kept at mode `0700`; session JSONL files and compaction temps are `0600`. Windows has no POSIX modes; the same paths are created without Unix permission bits.
 
-Session storage is workspace-contained. AETHER canonicalizes the workspace, then creates and opens `.aether`, `.aether/sessions`, session JSONL, and compaction temps without following symbolic links or Windows reparse points. Existing session directories must be real directories and existing session files must be regular files; a link or reparse point is rejected. Unix uses `openat`/`mkdirat` with `O_NOFOLLOW` (and `O_EXCL` for temps). Windows inspects `FILE_ATTRIBUTE_REPARSE_POINT` and opens with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse name cannot redirect the write. This is fail-closed containment, not a claim of perfect adversarial TOCTOU immunity: an external process can still mutate the namespace in the window after validation and before the OS create/open call. Session metadata is never intentionally written outside the canonical workspace.
+Session storage is workspace-contained. AETHER canonicalizes the workspace, then creates and opens `.aether-fx`, `.aether-fx/sessions`, session JSONL, and compaction temps without following symbolic links or Windows reparse points. Existing session directories must be real directories and existing session files must be regular files; a link or reparse point is rejected. Unix uses `openat`/`mkdirat` with `O_NOFOLLOW` (and `O_EXCL` for temps). Windows inspects `FILE_ATTRIBUTE_REPARSE_POINT` and opens with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse name cannot redirect the write. This is fail-closed containment, not a claim of perfect adversarial TOCTOU immunity: an external process can still mutate the namespace in the window after validation and before the OS create/open call. Session metadata is never intentionally written outside the canonical workspace.
 
 Each completed turn is one JSONL record. A truncated final record is an uncommitted crash window and is ignored; the previous committed turn remains valid. Corrupt middle records fail replay. Compaction never overwrites a file after a failed replay.
 

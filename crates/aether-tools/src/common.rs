@@ -607,7 +607,7 @@ pub(crate) fn temporary_path(path: &Path) -> PathBuf {
     let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
-    path.with_file_name(format!(".aether-{file_name}-{pid}-{id}.tmp"))
+    path.with_file_name(format!(".aether-fx-{file_name}-{pid}-{id}.tmp"))
 }
 
 pub(crate) struct StagedReplacement {

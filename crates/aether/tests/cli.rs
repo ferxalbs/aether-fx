@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aether_agent::SessionStore;
 use aether_core::{ContextSnapshot, SessionId, SessionLine, SessionRecord, TurnId, TurnSnapshot};
 
 fn temp_root(label: &str) -> PathBuf {
@@ -27,7 +28,12 @@ fn run(root: &Path, arguments: &[&str]) -> std::process::Output {
 
 fn write_session(root: &Path, name: &str) {
     let session = SessionId::new(name).unwrap();
-    let path = root.join(".aether/sessions").join(format!("{name}.jsonl"));
+    let path = SessionStore::path_for(root, &session);
+    write_session_at(root, name, &path);
+}
+
+fn write_session_at(root: &Path, name: &str, path: &Path) {
+    let session = SessionId::new(name).unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let line = SessionLine::new(
         1,
@@ -71,9 +77,35 @@ fn informational_commands_create_no_session_storage() {
         let root = temp_root("informational");
         let output = run(&root, arguments);
         assert!(output.status.success());
+        assert!(!root.join(".aether-fx").exists());
         assert!(!root.join(".aether").exists());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if arguments == ["--help"] || arguments == ["doctor"] {
+            assert!(stdout.contains(".aether-fx/sessions"), "{stdout}");
+            assert!(!stdout.contains(".aether/sessions"), "{stdout}");
+        }
         let _ = fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn legacy_aether_sessions_are_ignored() {
+    let root = temp_root("legacy-ignored");
+    let legacy_path = root.join(".aether/sessions/legacy-only.jsonl");
+    write_session_at(&root, "legacy-only", &legacy_path);
+
+    let listed = run(&root, &["sessions"]);
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("legacy-only"));
+    assert!(!root.join(".aether-fx").exists());
+
+    let resumed = run(&root, &["resume", "--latest"]);
+    assert!(!resumed.status.success());
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(stderr.contains("session not found"), "{stderr}");
+    assert!(!stderr.contains("legacy-only"), "{stderr}");
+    assert!(!root.join(".aether-fx").exists());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -99,7 +131,7 @@ fn resume_latest_skips_newer_corrupt_empty_and_unsupported_sessions() {
         let root = temp_root("resume-latest");
         write_session(&root, "older-valid");
         std::thread::sleep(std::time::Duration::from_millis(5));
-        fs::write(root.join(".aether/sessions/newest-invalid.jsonl"), invalid).unwrap();
+        fs::write(root.join(".aether-fx/sessions/newest-invalid.jsonl"), invalid).unwrap();
 
         let output = run(&root, &["resume", "--latest"]);
         assert!(!output.status.success());
@@ -119,14 +151,15 @@ fn sessions_does_not_follow_storage_directory_links() {
         let outside = temp_root("session-link-outside");
         write_session(&outside, "outside-session");
         if nested {
-            fs::create_dir_all(root.join(".aether")).unwrap();
+            fs::create_dir_all(root.join(".aether-fx")).unwrap();
         }
-        let link = if nested { root.join(".aether/sessions") } else { root.join(".aether") };
+        let link = if nested { root.join(".aether-fx/sessions") } else { root.join(".aether-fx") };
         #[cfg(unix)]
-        let linked = std::os::unix::fs::symlink(outside.join(".aether/sessions"), &link).is_ok();
+        let linked =
+            std::os::unix::fs::symlink(SessionStore::directory_for(&outside), &link).is_ok();
         #[cfg(windows)]
         let linked =
-            std::os::windows::fs::symlink_dir(outside.join(".aether/sessions"), &link).is_ok();
+            std::os::windows::fs::symlink_dir(SessionStore::directory_for(&outside), &link).is_ok();
         if !linked {
             let _ = fs::remove_dir_all(root);
             let _ = fs::remove_dir_all(outside);
@@ -138,4 +171,26 @@ fn sessions_does_not_follow_storage_directory_links() {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
     }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn sessions_reject_session_file_links() {
+    let root = temp_root("session-file-link");
+    let outside = temp_root("session-file-link-outside");
+    write_session(&outside, "outside-session");
+    let link = SessionStore::path_for(&root, &SessionId::new("outside-session").unwrap());
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    let target = SessionStore::path_for(&outside, &SessionId::new("outside-session").unwrap());
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    if linked {
+        let output = run(&root, &["sessions"]);
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("outside-session"));
+    }
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
 }
