@@ -8,6 +8,7 @@ mod cancellation;
 mod context;
 mod fake;
 mod permission;
+mod repo_map;
 mod scheduler;
 mod session;
 mod session_fs;
@@ -20,6 +21,14 @@ pub use context::{ContextEngine, capture_git_snapshot};
 pub use fake::{FakeBackend, FakeToolCall};
 pub use permission::{
     NoPermissionBroker, PermissionBroker, PermissionFuture, SessionPermissionBroker,
+};
+pub use repo_map::{
+    DEFAULT_MAX_REPO_FILES, DEFAULT_MAX_REPO_INSTRUCTION_BYTES, DEFAULT_MAX_REPO_MANIFEST_BYTES,
+    DEFAULT_MAX_REPO_MAP_BYTES, DEFAULT_MAX_REPO_MAP_ITEMS, DEFAULT_MAX_REPO_README_BYTES,
+    DEFAULT_MAX_REPO_SPECIAL_FILES, DocumentationFile, DocumentationKind, ManifestInfo,
+    ManifestKind, ManifestStatus, PackageInfo, RepoFile, RepoFileKind, RepoMap, RepoMapError,
+    RepoMapLimits, RepoMapSnapshot, RepoSelection, RepoSelectionKind, ScopedInstruction,
+    WorkspaceMember,
 };
 pub use scheduler::{DEFAULT_MAX_PARALLEL_TOOLS, schedule_ready_calls};
 pub use session::{

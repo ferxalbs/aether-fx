@@ -1,0 +1,1503 @@
+//! Lazy, bounded repository intelligence for coding-task context.
+//!
+//! Discovery deliberately uses the Git index as its source of truth. The map stores paths and
+//! bounded metadata, never source contents, and can therefore be refreshed without rereading the
+//! repository's source files.
+
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::{self, Read},
+    path::{Component, Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+    time::UNIX_EPOCH,
+};
+
+use aether_core::BoundedText;
+use blake3::Hasher;
+use serde_json::Value;
+use thiserror::Error;
+
+pub const DEFAULT_MAX_REPO_FILES: usize = 4_096;
+pub const DEFAULT_MAX_REPO_SPECIAL_FILES: usize = 1_024;
+pub const DEFAULT_MAX_REPO_MANIFEST_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_REPO_INSTRUCTION_BYTES: usize = 16 * 1024;
+pub const DEFAULT_MAX_REPO_README_BYTES: usize = 8 * 1024;
+pub const DEFAULT_MAX_REPO_MAP_BYTES: usize = 12 * 1024;
+pub const DEFAULT_MAX_REPO_MAP_ITEMS: usize = 64;
+
+/// Limits that keep both the retained map and metadata reads bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepoMapLimits {
+    pub max_files: usize,
+    pub max_special_files: usize,
+    pub max_manifest_bytes: usize,
+    pub max_instruction_bytes: usize,
+    pub max_readme_bytes: usize,
+    pub max_map_bytes: usize,
+    pub max_map_items: usize,
+}
+
+impl Default for RepoMapLimits {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_MAX_REPO_FILES,
+            max_special_files: DEFAULT_MAX_REPO_SPECIAL_FILES,
+            max_manifest_bytes: DEFAULT_MAX_REPO_MANIFEST_BYTES,
+            max_instruction_bytes: DEFAULT_MAX_REPO_INSTRUCTION_BYTES,
+            max_readme_bytes: DEFAULT_MAX_REPO_README_BYTES,
+            max_map_bytes: DEFAULT_MAX_REPO_MAP_BYTES,
+            max_map_items: DEFAULT_MAX_REPO_MAP_ITEMS,
+        }
+    }
+}
+
+impl RepoMapLimits {
+    fn normalized(self) -> Self {
+        Self {
+            max_files: self.max_files.max(1),
+            max_special_files: self.max_special_files.max(1),
+            max_manifest_bytes: self.max_manifest_bytes.max(1),
+            max_instruction_bytes: self.max_instruction_bytes.max(1),
+            max_readme_bytes: self.max_readme_bytes.max(1),
+            max_map_bytes: self.max_map_bytes.max(1),
+            max_map_items: self.max_map_items.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RepoMapError {
+    #[error("repository root is not a directory: {0}")]
+    InvalidRoot(PathBuf),
+    #[error("failed to execute git ls-files: {0}")]
+    Git(#[source] io::Error),
+    #[error("git ls-files failed: {0}")]
+    GitCommand(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoFileKind {
+    Manifest,
+    Instruction,
+    Documentation,
+    Test,
+    Source,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoFile {
+    pub path: PathBuf,
+    pub kind: RepoFileKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestKind {
+    Cargo,
+    Node,
+    Python,
+    Go,
+    Java,
+    Swift,
+    DotNet,
+    Php,
+    Ruby,
+    Elixir,
+    Other,
+}
+
+impl ManifestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Node => "node",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::Swift => "swift",
+            Self::DotNet => ".net",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+            Self::Elixir => "elixir",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestStatus {
+    Parsed,
+    Malformed,
+    Unreadable,
+}
+
+impl ManifestStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Parsed => "parsed",
+            Self::Malformed => "malformed",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestInfo {
+    pub path: PathBuf,
+    pub kind: ManifestKind,
+    pub package_name: Option<String>,
+    pub workspace_members: Vec<String>,
+    pub status: ManifestStatus,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageInfo {
+    pub name: Option<String>,
+    pub root: PathBuf,
+    pub manifest: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceMember {
+    pub declared_by: PathBuf,
+    pub pattern: String,
+    pub manifest: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentationKind {
+    Readme,
+    Markdown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentationFile {
+    pub path: PathBuf,
+    pub kind: DocumentationKind,
+    pub preview: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedInstruction {
+    pub path: PathBuf,
+    pub scope: PathBuf,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoSelectionKind {
+    File,
+    Manifest,
+    Package,
+    SourceRoot,
+    Test,
+    Documentation,
+    Instruction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoSelection {
+    pub path: PathBuf,
+    pub kind: RepoSelectionKind,
+    pub score: usize,
+}
+
+/// Bounded repository metadata produced by [`RepoMap`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoMapSnapshot {
+    pub root: PathBuf,
+    pub tracked_file_count: usize,
+    pub tracked_files: Vec<RepoFile>,
+    pub manifests: Vec<ManifestInfo>,
+    pub packages: Vec<PackageInfo>,
+    pub workspace_members: Vec<WorkspaceMember>,
+    pub source_roots: Vec<PathBuf>,
+    pub test_paths: Vec<PathBuf>,
+    pub documentation: Vec<DocumentationFile>,
+    pub instructions: Vec<ScopedInstruction>,
+    pub truncated: bool,
+}
+
+impl RepoMapSnapshot {
+    /// Return instructions in broad-to-specific order; later entries override earlier ones.
+    pub fn instructions_for(&self, path: impl AsRef<Path>) -> Vec<&ScopedInstruction> {
+        let Some(relative) = relative_path(&self.root, path.as_ref()) else {
+            return Vec::new();
+        };
+        let mut instructions = self
+            .instructions
+            .iter()
+            .filter(|instruction| scope_contains(&instruction.scope, &relative))
+            .collect::<Vec<_>>();
+        instructions.sort_by(|left, right| {
+            scope_depth(&left.scope)
+                .cmp(&scope_depth(&right.scope))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        instructions
+    }
+
+    /// Merge applicable instruction bodies in precedence order, bounded for context use.
+    pub fn effective_instructions(&self, path: impl AsRef<Path>, max_bytes: usize) -> String {
+        let mut output = String::new();
+        for instruction in self.instructions_for(path) {
+            push_line(&mut output, format!("# {}", display_path(&instruction.path)));
+            output.push_str(&instruction.content);
+            if !instruction.content.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        BoundedText::new(output, max_bytes).into_string()
+    }
+
+    /// Return a bounded, human-readable representation suitable for model context selection.
+    pub fn compact(&self, max_bytes: usize) -> String {
+        let mut output = String::new();
+        push_line(&mut output, format!("tracked files: {}", self.tracked_file_count));
+        if self.truncated {
+            push_line(&mut output, "tracked file listing truncated".to_owned());
+        }
+        push_section(
+            &mut output,
+            "manifests",
+            self.manifests.iter().map(|manifest| {
+                let package = manifest
+                    .package_name
+                    .as_deref()
+                    .map_or_else(String::new, |name| format!(" package={name}"));
+                let workspace = if manifest.workspace_members.is_empty() {
+                    String::new()
+                } else {
+                    format!(" members={}", manifest.workspace_members.len())
+                };
+                format!(
+                    "{} [{} {}{}{}]",
+                    display_path(&manifest.path),
+                    manifest.kind.as_str(),
+                    manifest.status.as_str(),
+                    package,
+                    workspace
+                )
+            }),
+        );
+        push_section(
+            &mut output,
+            "packages",
+            self.packages.iter().map(|package| {
+                let name = package.name.as_deref().unwrap_or("<unnamed>");
+                format!("{} ({name})", display_path(&package.root))
+            }),
+        );
+        push_section(
+            &mut output,
+            "workspace members",
+            self.workspace_members.iter().map(|member| {
+                let manifest = member
+                    .manifest
+                    .as_ref()
+                    .map_or_else(|| "unresolved".to_owned(), |path| display_path(path));
+                format!(
+                    "{} pattern={} -> {manifest}",
+                    display_path(&member.declared_by),
+                    member.pattern
+                )
+            }),
+        );
+        push_section(
+            &mut output,
+            "source roots",
+            self.source_roots.iter().map(|path| display_path(path)),
+        );
+        push_section(&mut output, "tests", self.test_paths.iter().map(|path| display_path(path)));
+        push_section(
+            &mut output,
+            "documentation",
+            self.documentation.iter().map(|document| {
+                let preview = document
+                    .preview
+                    .as_deref()
+                    .map_or_else(String::new, |line| format!(" — {line}"));
+                format!("{}{}", display_path(&document.path), preview)
+            }),
+        );
+        push_section(
+            &mut output,
+            "instructions (broad to specific)",
+            self.instructions.iter().map(|instruction| {
+                let preview = instruction
+                    .content
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map_or_else(String::new, |line| format!(" — {}", truncate_preview(line)));
+                format!(
+                    "{} scope={}{}",
+                    display_path(&instruction.path),
+                    display_scope(&instruction.scope),
+                    preview
+                )
+            }),
+        );
+        BoundedText::new(output, max_bytes).into_string()
+    }
+
+    /// Select the most relevant retained paths using simple path-token scoring.
+    pub fn select(&self, query: &str, limit: usize) -> Vec<RepoSelection> {
+        let query =
+            query.split_whitespace().map(|token| token.to_ascii_lowercase()).collect::<Vec<_>>();
+        let mut selections = Vec::new();
+        for file in &self.tracked_files {
+            add_selection(&mut selections, &file.path, selection_kind(file.kind), &query);
+        }
+        for manifest in &self.manifests {
+            add_selection(&mut selections, &manifest.path, RepoSelectionKind::Manifest, &query);
+        }
+        for package in &self.packages {
+            add_selection(&mut selections, &package.root, RepoSelectionKind::Package, &query);
+        }
+        for path in &self.source_roots {
+            add_selection(&mut selections, path, RepoSelectionKind::SourceRoot, &query);
+        }
+        for path in &self.test_paths {
+            add_selection(&mut selections, path, RepoSelectionKind::Test, &query);
+        }
+        for document in &self.documentation {
+            add_selection(
+                &mut selections,
+                &document.path,
+                RepoSelectionKind::Documentation,
+                &query,
+            );
+        }
+        for instruction in &self.instructions {
+            add_selection(
+                &mut selections,
+                &instruction.path,
+                RepoSelectionKind::Instruction,
+                &query,
+            );
+        }
+        selections.sort_by(|left, right| {
+            right.score.cmp(&left.score).then_with(|| left.path.cmp(&right.path))
+        });
+        selections.truncate(limit);
+        selections
+    }
+
+    /// Estimate retained heap-backed bytes for diagnostics and benchmarks.
+    pub fn estimated_bytes(&self) -> usize {
+        let mut bytes = self.root.as_os_str().len();
+        bytes += self
+            .tracked_files
+            .iter()
+            .map(|file| file.path.as_os_str().len() + std::mem::size_of::<RepoFile>())
+            .sum::<usize>();
+        bytes += self
+            .manifests
+            .iter()
+            .map(|manifest| {
+                manifest.path.as_os_str().len()
+                    + manifest.package_name.as_ref().map_or(0, String::len)
+                    + manifest.workspace_members.iter().map(String::len).sum::<usize>()
+            })
+            .sum::<usize>();
+        bytes += self
+            .packages
+            .iter()
+            .map(|package| {
+                package.root.as_os_str().len()
+                    + package.manifest.as_os_str().len()
+                    + package.name.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>();
+        bytes += self
+            .workspace_members
+            .iter()
+            .map(|member| {
+                member.declared_by.as_os_str().len()
+                    + member.pattern.len()
+                    + member.manifest.as_ref().map_or(0, |path| path.as_os_str().len())
+            })
+            .sum::<usize>();
+        bytes += self
+            .source_roots
+            .iter()
+            .chain(self.test_paths.iter())
+            .map(|path| path.as_os_str().len())
+            .sum::<usize>();
+        bytes += self
+            .documentation
+            .iter()
+            .map(|document| {
+                document.path.as_os_str().len() + document.preview.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>();
+        bytes += self
+            .instructions
+            .iter()
+            .map(|instruction| {
+                instruction.path.as_os_str().len()
+                    + instruction.scope.as_os_str().len()
+                    + instruction.content.len()
+            })
+            .sum::<usize>();
+        bytes
+    }
+}
+
+/// A lazy repository map. Constructing this value performs no filesystem or Git I/O.
+#[derive(Debug)]
+pub struct RepoMap {
+    root: PathBuf,
+    limits: RepoMapLimits,
+    cache: Arc<Mutex<Option<CacheEntry>>>,
+}
+
+impl Clone for RepoMap {
+    fn clone(&self) -> Self {
+        Self { root: self.root.clone(), limits: self.limits, cache: Arc::clone(&self.cache) }
+    }
+}
+
+impl RepoMap {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_limits(root, RepoMapLimits::default())
+    }
+
+    pub fn with_limits(root: impl Into<PathBuf>, limits: RepoMapLimits) -> Self {
+        Self { root: root.into(), limits: limits.normalized(), cache: Arc::new(Mutex::new(None)) }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Discover or return the cached map. Source-file contents never participate in invalidation.
+    pub fn snapshot(&self) -> Result<Arc<RepoMapSnapshot>, RepoMapError> {
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.as_ref()
+            && entry.is_current(&self.root, self.limits)
+        {
+            return Ok(Arc::clone(&entry.snapshot));
+        }
+        drop(cache);
+
+        let inventory = collect_inventory(&self.root, self.limits)?;
+        cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.as_ref()
+            && entry.fingerprint == inventory.fingerprint
+        {
+            return Ok(Arc::clone(&entry.snapshot));
+        }
+        let snapshot = Arc::new(build_snapshot(&self.root, &inventory, self.limits));
+        *cache = Some(CacheEntry {
+            fingerprint: inventory.fingerprint,
+            index_path: inventory.index_path,
+            index_stamp: inventory.index_stamp,
+            special_stamps: inventory.special_stamps,
+            snapshot: Arc::clone(&snapshot),
+        });
+        Ok(snapshot)
+    }
+
+    pub fn discover(&self) -> Result<Arc<RepoMapSnapshot>, RepoMapError> {
+        self.snapshot()
+    }
+
+    pub fn compact(&self, max_bytes: usize) -> Result<String, RepoMapError> {
+        Ok(self.snapshot()?.compact(max_bytes.min(self.limits.max_map_bytes)))
+    }
+
+    pub fn select(&self, query: &str, limit: usize) -> Result<Vec<RepoSelection>, RepoMapError> {
+        Ok(self.snapshot()?.select(query, limit))
+    }
+
+    pub fn estimated_bytes(&self) -> Result<usize, RepoMapError> {
+        Ok(self.snapshot()?.estimated_bytes())
+    }
+}
+
+impl CacheEntry {
+    fn is_current(&self, root: &Path, limits: RepoMapLimits) -> bool {
+        if file_stamp(&self.index_path) != self.index_stamp {
+            return false;
+        }
+        self.special_stamps.iter().all(|expected| {
+            let current = read_special_file(root, &expected.path, limits);
+            special_digest(&current) == expected.digest
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    tracked: [u8; 32],
+    special: [u8; 32],
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    fingerprint: Fingerprint,
+    index_path: PathBuf,
+    index_stamp: Option<FileStamp>,
+    special_stamps: Vec<SpecialStamp>,
+    snapshot: Arc<RepoMapSnapshot>,
+}
+
+struct Inventory {
+    paths: Vec<PathBuf>,
+    special: Vec<SpecialFile>,
+    index_path: PathBuf,
+    index_stamp: Option<FileStamp>,
+    special_stamps: Vec<SpecialStamp>,
+    fingerprint: Fingerprint,
+}
+
+struct SpecialFile {
+    path: PathBuf,
+    content: Vec<u8>,
+    truncated: bool,
+    readable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    length: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpecialStamp {
+    path: PathBuf,
+    digest: [u8; 32],
+}
+
+fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, RepoMapError> {
+    if !root.is_dir() {
+        return Err(RepoMapError::InvalidRoot(root.to_path_buf()));
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "-z"])
+        .output()
+        .map_err(RepoMapError::Git)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(RepoMapError::GitCommand(if stderr.is_empty() {
+            "repository is not indexed by git".to_owned()
+        } else {
+            stderr
+        }));
+    }
+    let index_path = git_index_path(root);
+    let index_stamp = file_stamp(&index_path);
+
+    let paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        .collect::<Vec<_>>();
+    let mut tracked_hasher = Hasher::new();
+    for path in &paths {
+        hash_path(&mut tracked_hasher, path);
+    }
+
+    let mut special = Vec::new();
+    let mut special_stamps = Vec::new();
+    let mut special_hasher = Hasher::new();
+    for path in &paths {
+        if !is_special_file(path) || special.len() >= limits.max_special_files {
+            continue;
+        }
+        let file = read_special_file(root, path, limits);
+        hash_path(&mut special_hasher, path);
+        let digest = special_digest(&file);
+        special_hasher.update(&digest);
+        special_stamps.push(SpecialStamp { path: path.clone(), digest });
+        special.push(SpecialFile {
+            path: path.clone(),
+            content: file.content,
+            truncated: file.truncated,
+            readable: file.readable,
+        });
+    }
+
+    Ok(Inventory {
+        paths,
+        special,
+        index_path,
+        index_stamp,
+        special_stamps,
+        fingerprint: Fingerprint {
+            tracked: *tracked_hasher.finalize().as_bytes(),
+            special: *special_hasher.finalize().as_bytes(),
+        },
+    })
+}
+
+fn git_index_path(root: &Path) -> PathBuf {
+    let dot_git = root.join(".git");
+    if dot_git.is_file()
+        && let Ok(contents) = fs::read_to_string(&dot_git)
+        && let Some(git_dir) = contents.trim().strip_prefix("gitdir:")
+    {
+        let git_dir = PathBuf::from(git_dir.trim());
+        return if git_dir.is_absolute() {
+            git_dir.join("index")
+        } else {
+            dot_git.parent().unwrap_or(root).join(git_dir).join("index")
+        };
+    }
+    dot_git.join("index")
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Some(FileStamp { length: metadata.len(), modified_nanos })
+}
+
+fn special_digest(file: &ReadContent) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(&(file.content.len() as u64).to_le_bytes());
+    hasher.update(&[u8::from(file.truncated), u8::from(file.readable)]);
+    hasher.update(&file.content);
+    *hasher.finalize().as_bytes()
+}
+
+struct ReadContent {
+    content: Vec<u8>,
+    truncated: bool,
+    readable: bool,
+}
+
+fn read_special_file(root: &Path, path: &Path, limits: RepoMapLimits) -> ReadContent {
+    let Some(full_path) = safe_join(root, path) else {
+        return ReadContent { content: Vec::new(), truncated: false, readable: false };
+    };
+    let Ok(metadata) = fs::symlink_metadata(&full_path) else {
+        return ReadContent { content: Vec::new(), truncated: false, readable: false };
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return ReadContent { content: Vec::new(), truncated: false, readable: false };
+    }
+    let limit = if is_manifest(path) {
+        limits.max_manifest_bytes
+    } else if is_instruction(path) {
+        limits.max_instruction_bytes
+    } else {
+        limits.max_readme_bytes
+    };
+    let Ok(mut file) = File::open(full_path) else {
+        return ReadContent { content: Vec::new(), truncated: false, readable: false };
+    };
+    let mut content = Vec::new();
+    let mut limited = (&mut file).take(limit as u64 + 1);
+    if limited.read_to_end(&mut content).is_err() {
+        return ReadContent { content: Vec::new(), truncated: false, readable: false };
+    }
+    let truncated = content.len() > limit;
+    content.truncate(limit);
+    ReadContent { content, truncated, readable: true }
+}
+
+fn build_snapshot(root: &Path, inventory: &Inventory, limits: RepoMapLimits) -> RepoMapSnapshot {
+    let mut tracked_files = inventory
+        .paths
+        .iter()
+        .take(limits.max_files)
+        .map(|path| RepoFile { path: path.clone(), kind: classify_file(path) })
+        .collect::<Vec<_>>();
+    tracked_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut manifests = Vec::new();
+    let mut documentation = Vec::new();
+    let mut instructions = Vec::new();
+    for special in &inventory.special {
+        if is_manifest(&special.path) {
+            manifests.push(parse_manifest(special));
+        }
+        if is_readme(&special.path) {
+            documentation.push(DocumentationFile {
+                path: special.path.clone(),
+                kind: DocumentationKind::Readme,
+                preview: preview(&special.content),
+                truncated: special.truncated,
+            });
+        }
+        if is_instruction(&special.path) {
+            instructions.push(ScopedInstruction {
+                scope: special.path.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+                path: special.path.clone(),
+                content: String::from_utf8_lossy(&special.content).into_owned(),
+                truncated: special.truncated,
+            });
+        }
+    }
+    for path in inventory.paths.iter().filter(|path| is_markdown(path) && !is_readme(path)) {
+        documentation.push(DocumentationFile {
+            path: path.clone(),
+            kind: DocumentationKind::Markdown,
+            preview: None,
+            truncated: false,
+        });
+    }
+    manifests.sort_by(|left, right| left.path.cmp(&right.path));
+    documentation.sort_by(|left, right| left.path.cmp(&right.path));
+    instructions.sort_by(|left, right| {
+        scope_depth(&left.scope)
+            .cmp(&scope_depth(&right.scope))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    manifests.truncate(limits.max_special_files);
+    documentation.truncate(limits.max_special_files);
+    instructions.truncate(limits.max_special_files);
+
+    let mut packages = manifests
+        .iter()
+        .filter_map(|manifest| {
+            manifest.package_name.as_ref().map(|name| PackageInfo {
+                name: Some(name.clone()),
+                root: manifest.path.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+                manifest: manifest.path.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    packages.truncate(limits.max_special_files);
+
+    let manifest_paths = manifests.iter().map(|manifest| manifest.path.clone()).collect::<Vec<_>>();
+    let mut workspace_members = Vec::new();
+    for manifest in &manifests {
+        for pattern in &manifest.workspace_members {
+            let member_manifest = manifest_paths.iter().find(|candidate| {
+                let relative = candidate.parent().unwrap_or(Path::new("."));
+                let base = manifest.path.parent().unwrap_or(Path::new("."));
+                let member = relative.strip_prefix(base).unwrap_or(relative);
+                wildcard_path_matches(pattern, member)
+            });
+            workspace_members.push(WorkspaceMember {
+                declared_by: manifest.path.clone(),
+                pattern: pattern.clone(),
+                manifest: member_manifest.cloned(),
+            });
+        }
+    }
+    workspace_members.truncate(limits.max_special_files);
+    for member in &workspace_members {
+        if let Some(manifest) = &member.manifest
+            && !packages.iter().any(|package| package.manifest == *manifest)
+        {
+            let name = manifests
+                .iter()
+                .find(|candidate| candidate.path == *manifest)
+                .and_then(|candidate| candidate.package_name.clone());
+            packages.push(PackageInfo {
+                name,
+                root: manifest.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+                manifest: manifest.clone(),
+            });
+        }
+    }
+    packages.truncate(limits.max_special_files);
+
+    let mut source_roots = BTreeSet::new();
+    let mut test_paths = Vec::new();
+    for path in &inventory.paths {
+        if is_source_file(path) && !is_test_path(path) {
+            source_roots.insert(source_root(path));
+        }
+        if is_test_path(path) {
+            test_paths.push(path.clone());
+        }
+    }
+    let source_roots = source_roots.into_iter().take(limits.max_special_files).collect::<Vec<_>>();
+    test_paths.sort();
+    test_paths.dedup();
+    test_paths.truncate(limits.max_special_files);
+
+    RepoMapSnapshot {
+        root: root.to_path_buf(),
+        tracked_file_count: inventory.paths.len(),
+        tracked_files,
+        manifests,
+        packages,
+        workspace_members,
+        source_roots,
+        test_paths,
+        documentation,
+        instructions,
+        truncated: inventory.paths.len() > limits.max_files,
+    }
+}
+
+fn parse_manifest(file: &SpecialFile) -> ManifestInfo {
+    let kind = manifest_kind(&file.path);
+    let text = String::from_utf8_lossy(&file.content);
+    let (package_name, workspace_members, status) = match kind {
+        ManifestKind::Node | ManifestKind::Php => parse_package_json(&file.content),
+        ManifestKind::Go => parse_go_mod(&text),
+        ManifestKind::Cargo | ManifestKind::Python | ManifestKind::Ruby | ManifestKind::Elixir => {
+            parse_toml_like(&text, kind)
+        }
+        ManifestKind::Java | ManifestKind::Swift | ManifestKind::DotNet | ManifestKind::Other => (
+            None,
+            Vec::new(),
+            if file.readable { ManifestStatus::Parsed } else { ManifestStatus::Unreadable },
+        ),
+    };
+    ManifestInfo {
+        path: file.path.clone(),
+        kind,
+        package_name,
+        workspace_members,
+        status: if !file.readable { ManifestStatus::Unreadable } else { status },
+        truncated: file.truncated,
+    }
+}
+
+fn parse_package_json(content: &[u8]) -> (Option<String>, Vec<String>, ManifestStatus) {
+    let Ok(value) = serde_json::from_slice::<Value>(content) else {
+        return (None, Vec::new(), ManifestStatus::Malformed);
+    };
+    let package_name = value.get("name").and_then(Value::as_str).map(str::to_owned);
+    let workspace_members = value
+        .get("workspaces")
+        .and_then(|workspaces| {
+            workspaces.as_array().or_else(|| workspaces.get("packages").and_then(Value::as_array))
+        })
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    (package_name, workspace_members, ManifestStatus::Parsed)
+}
+
+fn parse_go_mod(text: &str) -> (Option<String>, Vec<String>, ManifestStatus) {
+    let module = text.lines().find_map(|line| line.trim().strip_prefix("module "));
+    (
+        module.map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
+        Vec::new(),
+        if module.is_some() { ManifestStatus::Parsed } else { ManifestStatus::Malformed },
+    )
+}
+
+fn parse_toml_like(
+    text: &str,
+    kind: ManifestKind,
+) -> (Option<String>, Vec<String>, ManifestStatus) {
+    let mut section = String::new();
+    let mut package_name = None;
+    let mut members = Vec::new();
+    let mut saw_assignment = false;
+    let mut saw_malformed = false;
+    let mut pending_array: Option<(String, String)> = None;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = pending_array.as_mut() {
+            value.push_str(line);
+            if line.contains(']') {
+                let values = parse_array_values(value);
+                if values.is_empty() {
+                    saw_malformed = true;
+                } else if key == "members" {
+                    members.extend(values);
+                }
+                pending_array = None;
+            }
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.ends_with(']') {
+                saw_malformed = true;
+            } else {
+                section = line.trim_matches(['[', ']']).to_ascii_lowercase();
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            saw_malformed = true;
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if value.starts_with('[') && !value.contains(']') {
+            pending_array = Some((key.to_owned(), value.to_owned()));
+            continue;
+        }
+        saw_assignment = true;
+        if key == "name"
+            && ((section == "package")
+                || (kind == ManifestKind::Python && section == "project")
+                || section == "tool.poetry")
+        {
+            package_name = parse_quoted(value);
+        }
+        if key == "members" && section == "workspace" {
+            let values = parse_array_values(value);
+            if values.is_empty() {
+                saw_malformed = true;
+            } else {
+                members.extend(values);
+            }
+        }
+    }
+    if pending_array.is_some() {
+        saw_malformed = true;
+    }
+    let status = if saw_malformed {
+        ManifestStatus::Malformed
+    } else if saw_assignment || package_name.is_some() || !members.is_empty() {
+        ManifestStatus::Parsed
+    } else {
+        ManifestStatus::Malformed
+    };
+    (package_name, members, status)
+}
+
+fn parse_array_values(value: &str) -> Vec<String> {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(parse_quoted)
+        .collect()
+}
+
+fn parse_quoted(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches(',').trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        Some(value[1..value.len() - 1].to_owned())
+    } else {
+        None
+    }
+}
+
+fn add_selection(
+    selections: &mut Vec<RepoSelection>,
+    path: &Path,
+    kind: RepoSelectionKind,
+    query: &[String],
+) {
+    let score = path_score(path, query);
+    if score == 0 || selections.iter().any(|selection| selection.path == path) {
+        return;
+    }
+    selections.push(RepoSelection { path: path.to_path_buf(), kind, score });
+}
+
+fn path_score(path: &Path, query: &[String]) -> usize {
+    if query.is_empty() {
+        return 1;
+    }
+    let display = display_path(path).to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().to_ascii_lowercase());
+    query.iter().fold(0, |score, token| {
+        score
+            + if file_name == *token {
+                5
+            } else if file_name.contains(token) {
+                3
+            } else if display.contains(token) {
+                1
+            } else {
+                0
+            }
+    })
+}
+
+fn classify_file(path: &Path) -> RepoFileKind {
+    if is_manifest(path) {
+        RepoFileKind::Manifest
+    } else if is_instruction(path) {
+        RepoFileKind::Instruction
+    } else if is_readme(path) || is_markdown(path) {
+        RepoFileKind::Documentation
+    } else if is_test_path(path) {
+        RepoFileKind::Test
+    } else if is_source_file(path) {
+        RepoFileKind::Source
+    } else {
+        RepoFileKind::Other
+    }
+}
+
+fn selection_kind(kind: RepoFileKind) -> RepoSelectionKind {
+    match kind {
+        RepoFileKind::Manifest => RepoSelectionKind::Manifest,
+        RepoFileKind::Instruction => RepoSelectionKind::Instruction,
+        RepoFileKind::Documentation => RepoSelectionKind::Documentation,
+        RepoFileKind::Test => RepoSelectionKind::Test,
+        RepoFileKind::Source | RepoFileKind::Other => RepoSelectionKind::File,
+    }
+}
+
+fn manifest_kind(path: &Path) -> ManifestKind {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_ascii_lowercase());
+    match name.as_str() {
+        "cargo.toml" => ManifestKind::Cargo,
+        "package.json" | "deno.json" | "deno.jsonc" => ManifestKind::Node,
+        "pyproject.toml" | "setup.py" | "setup.cfg" => ManifestKind::Python,
+        "go.mod" => ManifestKind::Go,
+        "pom.xml" | "build.gradle" | "build.gradle.kts" => ManifestKind::Java,
+        "package.swift" => ManifestKind::Swift,
+        "composer.json" => ManifestKind::Php,
+        "gemfile" => ManifestKind::Ruby,
+        "mix.exs" => ManifestKind::Elixir,
+        _ if name.ends_with(".csproj") || name.ends_with(".fsproj") || name.ends_with(".sln") => {
+            ManifestKind::DotNet
+        }
+        _ if name.ends_with(".gemspec") => ManifestKind::Ruby,
+        _ => ManifestKind::Other,
+    }
+}
+
+fn is_manifest(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_ascii_lowercase());
+    matches!(
+        name.as_str(),
+        "cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "go.mod"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "package.swift"
+            | "composer.json"
+            | "gemfile"
+            | "mix.exs"
+            | "deno.json"
+            | "deno.jsonc"
+    ) || name.ends_with(".csproj")
+        || name.ends_with(".fsproj")
+        || name.ends_with(".sln")
+        || name.ends_with(".gemspec")
+}
+
+fn is_instruction(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        matches!(
+            name.to_string_lossy().to_ascii_uppercase().as_str(),
+            "AGENTS.MD" | "CLAUDE.MD" | "CONTRIBUTING.MD"
+        )
+    })
+}
+
+fn is_readme(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("README.md"))
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("md"))
+}
+
+fn is_source_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_ascii_lowercase());
+    matches!(
+        extension.as_str(),
+        "c" | "cc"
+            | "cpp"
+            | "cs"
+            | "ex"
+            | "exs"
+            | "go"
+            | "h"
+            | "hpp"
+            | "java"
+            | "js"
+            | "jsx"
+            | "kt"
+            | "m"
+            | "mm"
+            | "php"
+            | "py"
+            | "rb"
+            | "rs"
+            | "swift"
+            | "ts"
+            | "tsx"
+            | "zig"
+    )
+}
+
+fn is_test_path(path: &Path) -> bool {
+    let lower = display_path(path).to_ascii_lowercase();
+    let has_test_directory = path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(value)
+                if matches!(value.to_string_lossy().to_ascii_lowercase().as_str(), "test" | "tests" | "__tests__")
+        )
+    });
+    has_test_directory
+        || lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_test.go")
+        || path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().starts_with("test_"))
+}
+
+fn source_root(path: &Path) -> PathBuf {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(
+            component,
+            Component::Normal(value)
+                if matches!(value.to_string_lossy().to_ascii_lowercase().as_str(), "src" | "lib" | "app" | "cmd" | "internal")
+        ) {
+            return current;
+        }
+    }
+    path.parent().map_or_else(PathBuf::new, Path::to_path_buf)
+}
+
+fn is_special_file(path: &Path) -> bool {
+    is_manifest(path) || is_instruction(path) || is_readme(path)
+}
+
+fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        path.strip_prefix(root).ok().map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
+fn scope_contains(scope: &Path, path: &Path) -> bool {
+    scope.as_os_str().is_empty() || path.starts_with(scope)
+}
+
+fn scope_depth(scope: &Path) -> usize {
+    scope.components().count()
+}
+
+fn safe_join(root: &Path, relative: &Path) -> Option<PathBuf> {
+    if relative.is_absolute()
+        || relative.components().any(|component| component == Component::ParentDir)
+    {
+        return None;
+    }
+    Some(root.join(relative))
+}
+
+fn wildcard_path_matches(pattern: &str, path: &Path) -> bool {
+    let pattern = pattern.trim_matches('/');
+    let path = display_path(path);
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        let remainder = path.strip_prefix(prefix).unwrap_or("").trim_matches('/');
+        return !remainder.is_empty() && !remainder.contains('/');
+    }
+    simple_wildcard_match(pattern, &path)
+}
+
+fn simple_wildcard_match(pattern: &str, value: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if !value.starts_with(first) {
+        return false;
+    }
+    let mut offset = first.len();
+    for part in parts {
+        let Some(found) = value[offset..].find(part) else {
+            return false;
+        };
+        offset += found + part.len();
+    }
+    pattern.ends_with('*') || offset == value.len()
+}
+
+fn hash_path(hasher: &mut Hasher, path: &Path) {
+    hasher.update(display_path(path).as_bytes());
+    hasher.update(&[0]);
+}
+
+fn preview(content: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(content)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(truncate_preview)
+}
+
+fn truncate_preview(value: &str) -> String {
+    let mut preview = value.chars().take(160).collect::<String>();
+    if value.chars().count() > 160 {
+        preview.push('…');
+    }
+    preview
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn display_scope(scope: &Path) -> String {
+    if scope.as_os_str().is_empty() { ".".to_owned() } else { display_path(scope) }
+}
+
+fn push_line(output: &mut String, line: String) {
+    output.push_str(&line);
+    output.push('\n');
+}
+
+fn push_section<'a>(output: &mut String, title: &str, lines: impl Iterator<Item = String> + 'a) {
+    let lines = lines.collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    push_line(output, format!("{title}:"));
+    for line in lines.iter().take(DEFAULT_MAX_REPO_MAP_ITEMS) {
+        push_line(output, format!("- {line}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::Path,
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+            let path = std::env::temp_dir().join(format!("aether-repo-map-{nanos}-{sequence}"));
+            fs::create_dir_all(&path).expect("temp repo");
+            git(&path, ["init", "--quiet"]);
+            Self { path }
+        }
+
+        fn write(&self, path: &str, content: &str) {
+            let full = self.path.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("parent");
+            }
+            fs::write(full, content).expect("write");
+        }
+
+        fn track(&self, paths: &[&str]) {
+            let mut command = Command::new("git");
+            command.current_dir(&self.path).arg("add").arg("--");
+            for path in paths {
+                command.arg(path);
+            }
+            assert!(command.status().expect("git add").success());
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git<const N: usize>(root: &Path, args: [&str; N]) {
+        assert!(Command::new("git").current_dir(root).args(args).status().expect("git").success());
+    }
+
+    #[test]
+    fn monorepo_detects_manifests_packages_source_roots_and_tests() {
+        let repo = TempRepo::new();
+        repo.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        repo.write("crates/one/Cargo.toml", "[package]\nname = \"one\"\nversion = \"0.1.0\"\n");
+        repo.write("crates/one/src/lib.rs", "pub fn one() {}\n");
+        repo.write("crates/one/tests/one.rs", "#[test]\nfn it_works() {}\n");
+        repo.write("package.json", "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n");
+        repo.write("packages/web/package.json", "{\"name\":\"web\"}\n");
+        repo.write("packages/web/src/index.ts", "export const web = true;\n");
+        repo.track(&[
+            "Cargo.toml",
+            "crates/one/Cargo.toml",
+            "crates/one/src/lib.rs",
+            "crates/one/tests/one.rs",
+            "package.json",
+            "packages/web/package.json",
+            "packages/web/src/index.ts",
+        ]);
+
+        let snapshot = RepoMap::new(&repo.path).snapshot().expect("map");
+        assert_eq!(snapshot.tracked_file_count, 7);
+        assert_eq!(snapshot.manifests.len(), 4);
+        assert!(snapshot.packages.iter().any(|package| package.name.as_deref() == Some("one")));
+        assert!(snapshot.source_roots.iter().any(|path| path == Path::new("crates/one/src")));
+        assert!(
+            snapshot.test_paths.iter().any(|path| path == Path::new("crates/one/tests/one.rs"))
+        );
+        assert!(snapshot.workspace_members.iter().any(|member| member.pattern == "crates/*"));
+    }
+
+    #[test]
+    fn nested_instructions_use_scope_precedence() {
+        let repo = TempRepo::new();
+        repo.write("AGENTS.md", "root instructions\n");
+        repo.write("CONTRIBUTING.md", "contributing instructions\n");
+        repo.write("crates/AGENTS.md", "crate instructions\n");
+        repo.write("crates/foo/CLAUDE.md", "foo instructions\n");
+        repo.write("crates/foo/src/lib.rs", "pub fn foo() {}\n");
+        repo.track(&[
+            "AGENTS.md",
+            "CONTRIBUTING.md",
+            "crates/AGENTS.md",
+            "crates/foo/CLAUDE.md",
+            "crates/foo/src/lib.rs",
+        ]);
+        let snapshot = RepoMap::new(&repo.path).snapshot().expect("map");
+        let paths = snapshot
+            .instructions_for("crates/foo/src/lib.rs")
+            .into_iter()
+            .map(|instruction| instruction.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("AGENTS.md"),
+                PathBuf::from("CONTRIBUTING.md"),
+                PathBuf::from("crates/AGENTS.md"),
+                PathBuf::from("crates/foo/CLAUDE.md")
+            ]
+        );
+        assert_eq!(snapshot.instructions_for("docs/guide.md").len(), 2);
+        let effective = snapshot.effective_instructions("crates/foo/src/lib.rs", 512);
+        assert!(effective.contains("root instructions"));
+        assert!(effective.ends_with("foo instructions\n"));
+    }
+
+    #[test]
+    fn ignored_and_untracked_files_do_not_enter_or_invalidate_map() {
+        let repo = TempRepo::new();
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.write("src/lib.rs", "pub fn stable() {}\n");
+        repo.track(&[".gitignore", "src/lib.rs"]);
+        let map = RepoMap::new(&repo.path);
+        let first = map.snapshot().expect("map");
+        repo.write("ignored.txt", "ignored\n");
+        repo.write("untracked.rs", "pub fn no() {}\n");
+        let second = map.snapshot().expect("map");
+        assert!(second.tracked_files.iter().all(|file| file.path != Path::new("ignored.txt")));
+        assert!(second.tracked_files.iter().all(|file| file.path != Path::new("untracked.rs")));
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn malformed_manifest_is_retained_without_failing_discovery() {
+        let repo = TempRepo::new();
+        repo.write("package.json", "{ not valid json\n");
+        repo.write("Cargo.toml", "[package\nname = \"broken\"\n");
+        repo.track(&["package.json", "Cargo.toml"]);
+        let snapshot = RepoMap::new(&repo.path).snapshot().expect("map");
+        assert_eq!(snapshot.manifests.len(), 2);
+        assert!(
+            snapshot.manifests.iter().all(|manifest| manifest.status == ManifestStatus::Malformed)
+        );
+    }
+
+    #[test]
+    fn large_repository_is_bounded_and_reports_truncation() {
+        let repo = TempRepo::new();
+        let mut paths = Vec::new();
+        for index in 0..1_500 {
+            let path = format!("src/generated/file-{index}.rs");
+            repo.write(&path, "pub fn generated() {}\n");
+            paths.push(path);
+        }
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        repo.track(&path_refs);
+        let limits = RepoMapLimits { max_files: 128, ..RepoMapLimits::default() };
+        let snapshot = RepoMap::with_limits(&repo.path, limits).snapshot().expect("map");
+        assert_eq!(snapshot.tracked_file_count, 1_500);
+        assert_eq!(snapshot.tracked_files.len(), 128);
+        assert!(snapshot.truncated);
+        assert!(snapshot.estimated_bytes() < 100_000);
+    }
+
+    #[test]
+    fn relevant_metadata_changes_invalidate_but_source_changes_do_not() {
+        let repo = TempRepo::new();
+        repo.write("AGENTS.md", "old\n");
+        repo.write("src/lib.rs", "old source\n");
+        repo.track(&["AGENTS.md", "src/lib.rs"]);
+        let map = RepoMap::new(&repo.path);
+        let first = map.snapshot().expect("map");
+        repo.write("src/lib.rs", "new source with a different size\n");
+        let source_changed = map.snapshot().expect("map");
+        assert!(Arc::ptr_eq(&first, &source_changed));
+        repo.write("AGENTS.md", "new instructions\n");
+        let instruction_changed = map.snapshot().expect("map");
+        assert!(!Arc::ptr_eq(&source_changed, &instruction_changed));
+        assert_eq!(instruction_changed.instructions[0].content.trim(), "new instructions");
+        repo.write("src/new.rs", "pub fn new_file() {}\n");
+        repo.track(&["src/new.rs"]);
+        let tracked_structure_changed = map.snapshot().expect("map");
+        assert!(!Arc::ptr_eq(&instruction_changed, &tracked_structure_changed));
+        assert!(
+            tracked_structure_changed
+                .tracked_files
+                .iter()
+                .any(|file| file.path == Path::new("src/new.rs"))
+        );
+    }
+
+    #[test]
+    fn compact_output_and_selection_are_bounded() {
+        let repo = TempRepo::new();
+        repo.write("README.md", "# Project\nA useful repository.\n");
+        repo.write("src/feature.rs", "pub fn feature() {}\n");
+        repo.write("tests/feature_test.rs", "#[test]\nfn feature() {}\n");
+        repo.track(&["README.md", "src/feature.rs", "tests/feature_test.rs"]);
+        let snapshot = RepoMap::new(&repo.path).snapshot().expect("map");
+        assert!(snapshot.compact(128).len() <= 128);
+        assert!(snapshot.select("feature", 2).len() <= 2);
+        assert!(
+            snapshot
+                .select("feature", 2)
+                .iter()
+                .any(|selection| selection.path == Path::new("src/feature.rs"))
+        );
+    }
+}

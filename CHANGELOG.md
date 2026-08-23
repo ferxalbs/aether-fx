@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (3) - Lazy repository intelligence
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Coding-task context now has a lazy, bounded `RepoMap` for tracked workspace files,
+  manifests, package structure, source roots, tests, documentation, and scoped repository
+  instructions.
+- Repository-map invalidation tracks relevant structure and bounded metadata changes while
+  ignoring source-content edits and ignored or untracked files; cold and cached 1k/10k-file
+  benchmarks cover the behavior.
+
 ## Unreleased - 2026-08-23 (2) - Low-overhead tool scheduling
 
 > Status: unreleased work. No artifact has been published.

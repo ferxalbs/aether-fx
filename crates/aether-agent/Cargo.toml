@@ -29,3 +29,7 @@ criterion.workspace = true
 [[bench]]
 name = "scheduler"
 harness = false
+
+[[bench]]
+name = "repo_map"
+harness = false

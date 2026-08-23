@@ -9,16 +9,23 @@ use aether_core::{
 };
 use serde_json::Value;
 
+use crate::repo_map::RepoMap;
+
+const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
+
 /// In-memory bounded context engine for one AETHER session.
 #[derive(Clone, Debug)]
 pub struct ContextEngine {
     snapshot: ContextSnapshot,
+    repo_map: Option<RepoMap>,
 }
 
 impl ContextEngine {
     /// Create an empty engine for a workspace.
     pub fn new(workspace_root: impl Into<String>, model: Option<String>) -> Self {
-        Self { snapshot: ContextSnapshot::new(workspace_root, model) }
+        let workspace_root = workspace_root.into();
+        let repo_map = (!workspace_root.is_empty()).then(|| RepoMap::new(&workspace_root));
+        Self { snapshot: ContextSnapshot::new(workspace_root, model), repo_map }
     }
 
     /// Restore from persisted snapshot without trusting hashes yet.
@@ -27,7 +34,9 @@ impl ContextEngine {
         snapshot.excerpts.truncate(MAX_FILE_EXCERPTS);
         snapshot.tool_summaries.truncate(MAX_STORED_TOOL_SUMMARIES);
         snapshot.modified.truncate(MAX_CONTEXT_ITEMS);
-        Self { snapshot }
+        let repo_map =
+            (!snapshot.workspace_root.is_empty()).then(|| RepoMap::new(&snapshot.workspace_root));
+        Self { snapshot, repo_map }
     }
 
     /// Return the current bounded snapshot.
@@ -38,6 +47,11 @@ impl ContextEngine {
     /// Consume the engine and return the snapshot.
     pub fn into_snapshot(self) -> ContextSnapshot {
         self.snapshot
+    }
+
+    /// Return the lazy repository map associated with this context, if a workspace is known.
+    pub fn repository_map(&self) -> Option<&RepoMap> {
+        self.repo_map.as_ref()
     }
 
     /// Record the latest user task.
@@ -90,6 +104,9 @@ impl ContextEngine {
             self.snapshot.workspace_changed = true;
         }
         self.snapshot.workspace_root = live_root;
+        if self.repo_map.as_ref().is_none_or(|map| map.root() != workspace_root) {
+            self.repo_map = Some(RepoMap::new(workspace_root));
+        }
         let mut valid = Vec::new();
         for mut file in self.snapshot.inspected.drain(..) {
             if !path_is_workspace_relative(&file.path) {
@@ -162,6 +179,16 @@ impl ContextEngine {
                 out.push_str("unavailable");
             }
             out.push('\n');
+        }
+        if let Some(repo_map) = &self.repo_map
+            && let Ok(compact) = repo_map.compact(MAX_REPO_MAP_CONTEXT_BYTES)
+            && !compact.is_empty()
+        {
+            out.push_str("repository map:\n");
+            out.push_str(&compact);
+            if !compact.ends_with('\n') {
+                out.push('\n');
+            }
         }
         if !self.snapshot.inspected.is_empty() {
             out.push_str("inspected (do not reread unless stale):\n");

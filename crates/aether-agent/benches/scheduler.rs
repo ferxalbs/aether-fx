@@ -144,7 +144,9 @@ fn pure_scheduler_overhead(c: &mut Criterion) {
             bencher.iter(|| {
                 let count =
                     schedule_ready_calls(std::hint::black_box(&footprints), 4, &mut selected);
-                std::hint::black_box(count);
+                let selected_checksum =
+                    selected[..count].iter().copied().fold(0_usize, usize::wrapping_add);
+                std::hint::black_box((count, selected_checksum));
             });
         });
     }
