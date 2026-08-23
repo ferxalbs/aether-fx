@@ -29,12 +29,7 @@ impl WorkspaceLayout {
         create: bool,
     ) -> Result<Option<Self>, SessionStoreError> {
         let workspace = state::canonical_workspace(workspace.as_ref())?;
-        let state_root = state::resolve_state_root()?;
-        if state_root == workspace || state_root.starts_with(&workspace) {
-            return Err(SessionStoreError::Invalid(
-                "AETHER Fx state root must be outside the workspace".to_owned(),
-            ));
-        }
+        let state_root = state::validated_state_root(&workspace)?;
         let workspace_id = state::workspace_id(&workspace);
         let workspace_dir = state_root.join(state::WORKSPACES_DIR).join(&workspace_id);
         let sessions_dir = workspace_dir.join(state::SESSION_DIR);
@@ -141,12 +136,7 @@ pub(crate) fn session_entries(
 
 pub(crate) fn session_directory(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
     let workspace = state::canonical_workspace(workspace.as_ref())?;
-    let state_root = state::resolve_state_root()?;
-    if state_root == workspace || state_root.starts_with(&workspace) {
-        return Err(SessionStoreError::Invalid(
-            "AETHER Fx state root must be outside the workspace".to_owned(),
-        ));
-    }
+    let state_root = state::validated_state_root(&workspace)?;
     let workspace_id = state::workspace_id(&workspace);
     Ok(state_root.join(state::WORKSPACES_DIR).join(workspace_id).join(state::SESSION_DIR))
 }
@@ -225,63 +215,103 @@ fn ensure_workspace_metadata_unix(
     layout: &WorkspaceLayout,
     bytes: &[u8],
 ) -> Result<(), SessionStoreError> {
-    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, openat};
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fchmod, fstat, fsync, linkat, openat};
     use std::os::fd::AsFd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     let workspace_fd = open_state_workspace_dir(layout)?;
-    match openat(
+    let temp_name = format!(
+        ".aether-fx-workspace-{}-{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let fd = match openat(
         workspace_fd.as_fd(),
-        state::WORKSPACE_METADATA,
+        temp_name.as_str(),
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
     ) {
-        Ok(fd) => {
-            fchmod(&fd, Mode::RUSR | Mode::WUSR)
-                .map_err(|error| io_err("restrict workspace metadata", error))?;
-            let stat = fstat(&fd).map_err(|error| io_err("stat workspace metadata", error))?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-                return Err(SessionStoreError::Invalid(
-                    "workspace metadata is not a regular file".to_owned(),
-                ));
-            }
-            let mut file = File::from(fd);
-            let write = (|| {
-                file.write_all(bytes)?;
-                file.flush()?;
-                file.sync_all()
-            })();
-            if let Err(error) = write {
-                let _ = rustix::fs::unlinkat(
-                    workspace_fd.as_fd(),
-                    state::WORKSPACE_METADATA,
-                    rustix::fs::AtFlags::empty(),
-                );
-                return Err(io_err("write workspace metadata", error));
-            }
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::EXIST) => {
+            return Err(SessionStoreError::Invalid(
+                "workspace metadata temporary file already exists".to_owned(),
+            ));
+        }
+        Err(error) => {
+            return Err(map_unix_open_error("create workspace metadata temporary", error));
+        }
+    };
+    fchmod(&fd, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| io_err("restrict workspace metadata temporary", error))?;
+    let stat = fstat(&fd).map_err(|error| io_err("stat workspace metadata temporary", error))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(SessionStoreError::Invalid(
+            "workspace metadata temporary is not a regular file".to_owned(),
+        ));
+    }
+    let mut file = File::from(fd);
+    let write = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if let Err(error) = write {
+        let _ = rustix::fs::unlinkat(workspace_fd.as_fd(), temp_name.as_str(), AtFlags::empty());
+        return Err(io_err("write workspace metadata", error));
+    }
+    drop(file);
+    match linkat(
+        workspace_fd.as_fd(),
+        temp_name.as_str(),
+        workspace_fd.as_fd(),
+        state::WORKSPACE_METADATA,
+        AtFlags::empty(),
+    ) {
+        Ok(()) => {
+            let _ = fsync(&workspace_fd);
+            rustix::fs::unlinkat(workspace_fd.as_fd(), temp_name.as_str(), AtFlags::empty())
+                .map_err(|error| io_err("remove workspace metadata temporary", error))?;
             Ok(())
         }
         Err(rustix::io::Errno::EXIST) => {
-            let fd = openat(
-                workspace_fd.as_fd(),
-                state::WORKSPACE_METADATA,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(|error| map_unix_open_error("open workspace metadata", error))?;
-            fchmod(&fd, Mode::RUSR | Mode::WUSR)
-                .map_err(|error| io_err("restrict workspace metadata", error))?;
-            let stat = fstat(&fd).map_err(|error| io_err("stat workspace metadata", error))?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-                return Err(SessionStoreError::Invalid(
-                    "workspace metadata is not a regular file".to_owned(),
-                ));
-            }
-            let mut file = File::from(fd);
-            let existing = read_bounded(&mut file, "read workspace metadata")?;
-            validate_workspace_metadata(&existing, &layout.workspace)
+            let _ =
+                rustix::fs::unlinkat(workspace_fd.as_fd(), temp_name.as_str(), AtFlags::empty());
+            validate_workspace_metadata_unix(&workspace_fd, &layout.workspace)
         }
-        Err(error) => Err(map_unix_open_error("create workspace metadata", error)),
+        Err(error) => {
+            let _ =
+                rustix::fs::unlinkat(workspace_fd.as_fd(), temp_name.as_str(), AtFlags::empty());
+            Err(map_unix_open_error("install workspace metadata", error))
+        }
     }
+}
+
+#[cfg(unix)]
+fn validate_workspace_metadata_unix(
+    workspace_fd: &rustix::fd::OwnedFd,
+    workspace: &Path,
+) -> Result<(), SessionStoreError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    use std::os::fd::AsFd;
+
+    let fd = openat(
+        workspace_fd.as_fd(),
+        state::WORKSPACE_METADATA,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open workspace metadata", error))?;
+    let stat = fstat(&fd).map_err(|error| io_err("stat workspace metadata", error))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(SessionStoreError::Invalid(
+            "workspace metadata is not a regular file".to_owned(),
+        ));
+    }
+    let mut file = File::from(fd);
+    let existing = read_bounded(&mut file, "read workspace metadata")?;
+    validate_workspace_metadata(&existing, workspace)
 }
 
 #[cfg(not(unix))]
@@ -291,24 +321,57 @@ fn ensure_workspace_metadata_std(
 ) -> Result<(), SessionStoreError> {
     let path = layout.workspace_dir.join(state::WORKSPACE_METADATA);
     reject_indirect_file(&path, "workspace metadata")?;
+    let temporary = layout.workspace_dir.join(format!(
+        ".aether-fx-workspace-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io_err("name workspace metadata temporary", error))?
+            .as_nanos()
+    ));
+    reject_symlink(&temporary, "workspace metadata temporary file")?;
     let mut options = open_options_nofollow();
-    options.read(true).write(true).create_new(true);
-    match options.open(&path) {
+    options.write(true).create_new(true);
+    match options.open(&temporary) {
         Ok(mut file) => {
-            file.write_all(bytes)
-                .and_then(|()| file.flush())
-                .map_err(|error| io_err("write workspace metadata", error))?;
-            Ok(())
+            let write = (|| {
+                file.write_all(bytes)?;
+                file.flush()?;
+                file.sync_all()
+            })();
+            if let Err(error) = write {
+                let _ = fs::remove_file(&temporary);
+                return Err(io_err("write workspace metadata", error));
+            }
+            drop(file);
+            match fs::hard_link(&temporary, &path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&temporary);
+                    reject_indirect_file(&path, "workspace metadata")?;
+                    Ok(())
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&temporary);
+                    let mut options = open_options_nofollow();
+                    options.read(true);
+                    let mut installed = options
+                        .open(&path)
+                        .map_err(|error| io_err("open workspace metadata", error))?;
+                    let existing = read_bounded(&mut installed, "read workspace metadata")?;
+                    validate_workspace_metadata(&existing, &layout.workspace)
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary);
+                    Err(io_err("install workspace metadata", error))
+                }
+            }
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let mut options = open_options_nofollow();
-            options.read(true);
-            let mut file =
-                options.open(&path).map_err(|error| io_err("open workspace metadata", error))?;
-            let existing = read_bounded(&mut file, "read workspace metadata")?;
-            validate_workspace_metadata(&existing, &layout.workspace)
+            Err(SessionStoreError::Invalid(
+                "workspace metadata temporary file already exists".to_owned(),
+            ))
         }
-        Err(error) => Err(io_err("create workspace metadata", error)),
+        Err(error) => Err(io_err("create workspace metadata temporary", error)),
     }
 }
 
@@ -361,21 +424,55 @@ fn is_reparse_point(_: &fs::Metadata) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn ensure_state_root_path(state_root: &Path) -> Result<(), SessionStoreError> {
-    if let Err(error) = fs::create_dir_all(state_root)
+    use rustix::fs::{FileType, Mode, OFlags, fstat, mkdirat, openat};
+    use std::os::fd::AsFd;
+
+    if !state_root.is_absolute() {
+        return Err(SessionStoreError::Invalid("AETHER Fx state root must be absolute".to_owned()));
+    }
+    let mut directory = openat(
+        rustix::fs::CWD,
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| map_unix_open_error("open filesystem root", error))?;
+    for component in state_root.components() {
+        let std::path::Component::Normal(name) = component else { continue };
+        match mkdirat(directory.as_fd(), name, Mode::RWXU) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(map_unix_open_error("create AETHER Fx state root", error)),
+        }
+        directory = openat(
+            directory.as_fd(),
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| map_unix_open_error("open AETHER Fx state root", error))?;
+        let stat = fstat(&directory).map_err(|error| io_err("stat AETHER Fx state root", error))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(SessionStoreError::Invalid(
+                "AETHER Fx state root is not a directory".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_state_root_path(state_root: &Path) -> Result<(), SessionStoreError> {
+    reject_symlink(state_root, "AETHER Fx state root")?;
+    if let Err(error) = fs::create_dir(state_root)
         && error.kind() != io::ErrorKind::AlreadyExists
     {
         return Err(io_err("create AETHER Fx state root", error));
     }
-    reject_symlink(state_root, "AETHER Fx state root")?;
-    let metadata = fs::symlink_metadata(state_root)
-        .map_err(|error| io_err("stat AETHER Fx state root", error))?;
-    if !metadata.file_type().is_dir() {
-        return Err(SessionStoreError::Invalid(
-            "AETHER Fx state root is not a directory".to_owned(),
-        ));
-    }
-    Ok(())
+    real_directory_exists(state_root, "AETHER Fx state root")?.then_some(()).ok_or_else(|| {
+        SessionStoreError::Invalid("AETHER Fx state root is not a directory".to_owned())
+    })
 }
 
 fn state_directories_exist(

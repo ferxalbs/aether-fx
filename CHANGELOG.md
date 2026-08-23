@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-22 (11) - State-root and metadata initialization hardening
+
+> Status: unreleased work. No artifact has been published.
+
+### Security
+
+- State-root overrides now require an absolute, physically resolved path outside the canonical
+  workspace before any AETHER state is created; traversal components and workspace-directed
+  intermediate links are rejected.
+- Workspace metadata is staged as a private temporary file and atomically installed without
+  replacement, so concurrent initialization validates one binding and incomplete temps cannot
+  become `workspace.json`.
+
 ## Unreleased - 2026-08-22 (10) - Private application state and workspace isolation
 
 > Status: unreleased work. No artifact has been published.

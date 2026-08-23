@@ -22,13 +22,23 @@ fn state_root(root: &Path) -> PathBuf {
 }
 
 fn run(root: &Path, arguments: &[&str]) -> std::process::Output {
+    run_with_state(root, arguments, &state_root(root))
+}
+
+fn run_with_state(root: &Path, arguments: &[&str], state_dir: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_aether"))
         .args(arguments)
         .args(["--root", root.to_str().unwrap()])
-        .env("AETHER_FX_STATE_DIR", state_root(root))
+        .env("AETHER_FX_STATE_DIR", state_dir)
         .env_remove("RAINY_API_KEY")
         .output()
         .unwrap()
+}
+
+fn assert_no_workspace_state(root: &Path) {
+    assert!(!root.join("workspaces").exists());
+    assert!(!root.join(".aether").exists());
+    assert!(!root.join(".aether-fx").exists());
 }
 
 fn state_workspace_dir(root: &Path) -> PathBuf {
@@ -197,6 +207,60 @@ fn state_override_writes_only_outside_workspace() {
     assert!(state_root(&root).join("workspaces").exists());
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn relative_state_override_is_rejected_before_workspace_state_creation() {
+    let root = temp_root("relative-state-root");
+    let output = run_with_state(&root, ["sessions"].as_slice(), Path::new("relative-state"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be absolute"));
+    assert_no_workspace_state(&root);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn traversal_state_override_is_rejected_before_workspace_state_creation() {
+    let root = temp_root("traversal-state-root");
+    let override_path = root.join("outside").join("..").join("state");
+    let output = run_with_state(&root, ["sessions"].as_slice(), &override_path);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must not contain . or .."));
+    assert_no_workspace_state(&root);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn workspace_or_nested_state_override_is_rejected_before_creation() {
+    let root = temp_root("nested-state-root");
+    let nested = root.join("state");
+    for state_dir in [&root, &nested] {
+        let output = run_with_state(&root, ["sessions"].as_slice(), state_dir);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("outside the workspace"));
+        assert_no_workspace_state(&root);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn intermediate_state_symlink_into_workspace_is_rejected_before_creation() {
+    let root = temp_root("intermediate-state-link");
+    let parent = temp_root("intermediate-state-parent");
+    let linked = parent.join("redirect");
+    if !try_dir_symlink(&root, &linked) {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&parent);
+        return;
+    }
+    let output = run_with_state(&root, ["sessions"].as_slice(), &linked.join("state"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("outside the workspace"));
+    assert_no_workspace_state(&root);
+    remove_dir_link(&linked);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&parent);
 }
 
 #[cfg(any(unix, windows))]

@@ -632,6 +632,36 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
+    #[test]
+    fn concurrent_workspace_metadata_creation_converges_safely() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-session-metadata-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let workspace = root.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                SessionStore::open(
+                    &workspace,
+                    SessionId::new(format!("metadata-race-{index}")).unwrap(),
+                )
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert!(SessionStore::summaries(&root).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn inspected(path: &str, hash: &str) -> InspectedFile {
         InspectedFile {
             path: path.to_owned(),

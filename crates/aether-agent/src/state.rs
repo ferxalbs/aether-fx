@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::session::SessionStoreError;
 
@@ -80,10 +80,76 @@ fn absolute_path(path: PathBuf, name: &str) -> Result<PathBuf, SessionStoreError
     if path.is_absolute() {
         return Ok(path);
     }
-    env::current_dir().map(|current| current.join(path)).map_err(|error| SessionStoreError::Io {
-        operation: format!("resolve relative {name}"),
-        message: error.to_string(),
-    })
+    Err(SessionStoreError::Invalid(format!(
+        "cannot resolve AETHER Fx state directory: {name} must be absolute"
+    )))
+}
+
+/// Resolve an absolute state-root candidate to one physical path without creating it.
+/// Existing components are canonicalized; missing suffix components must be ordinary names.
+pub(crate) fn physical_state_root(candidate: &Path) -> Result<PathBuf, SessionStoreError> {
+    if !candidate.is_absolute() {
+        return Err(SessionStoreError::Invalid("AETHER Fx state root must be absolute".to_owned()));
+    }
+
+    let mut physical = PathBuf::new();
+    let mut missing = false;
+    for component in candidate.components() {
+        match component {
+            Component::Prefix(prefix) => physical.push(prefix.as_os_str()),
+            Component::RootDir => physical.push(component.as_os_str()),
+            Component::Normal(name) => {
+                if missing {
+                    physical.push(name);
+                    continue;
+                }
+                let next = physical.join(name);
+                match fs::symlink_metadata(&next) {
+                    Ok(_) => {
+                        physical =
+                            fs::canonicalize(&next).map_err(|error| SessionStoreError::Io {
+                                operation: "canonicalize AETHER Fx state root".to_owned(),
+                                message: error.to_string(),
+                            })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing = true;
+                        physical.push(name);
+                    }
+                    Err(error) => {
+                        return Err(SessionStoreError::Io {
+                            operation: "stat AETHER Fx state root".to_owned(),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(SessionStoreError::Invalid(
+                    "AETHER Fx state root must not contain . or .. components".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(physical)
+}
+
+pub(crate) fn validated_state_root(workspace: &Path) -> Result<PathBuf, SessionStoreError> {
+    let requested = resolve_state_root()?;
+    if let Ok(metadata) = fs::symlink_metadata(&requested)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(SessionStoreError::Invalid(
+            "AETHER Fx state root is a symbolic link or reparse point".to_owned(),
+        ));
+    }
+    let state_root = physical_state_root(&requested)?;
+    if state_root == workspace || state_root.starts_with(workspace) {
+        return Err(SessionStoreError::Invalid(
+            "AETHER Fx state root must be outside the workspace".to_owned(),
+        ));
+    }
+    Ok(state_root)
 }
 
 pub(crate) fn canonical_workspace(path: &Path) -> Result<PathBuf, SessionStoreError> {
