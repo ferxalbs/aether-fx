@@ -351,9 +351,10 @@ fn patch_operations(c: &mut Criterion) {
 }
 
 fn session_replay(c: &mut Criterion) {
-    let path =
-        std::env::temp_dir().join(format!("aether-bench-session-{}.jsonl", std::process::id()));
+    let root = std::env::temp_dir().join(format!("aether-bench-session-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("benchmark root");
     let session = SessionId::new("bench-session").expect("benchmark id");
+    let path = SessionStore::path_for(&root, &session);
     let lines = (1..=32)
         .map(|sequence| {
             serde_json::to_string(&SessionLine::new(
@@ -369,11 +370,19 @@ fn session_replay(c: &mut Criterion) {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    fs::create_dir_all(path.parent().expect("session parent")).expect("session directory");
     fs::write(&path, format!("{lines}\n")).expect("session fixture");
     c.bench_function("session_replay", |b| {
-        b.iter(|| black_box(SessionStore::replay(&path).expect("session replay")))
+        b.iter(|| {
+            black_box(
+                SessionStore::open(&root, session.clone())
+                    .expect("session store")
+                    .read()
+                    .expect("session replay"),
+            )
+        })
     });
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_dir_all(root);
 }
 
 criterion_group!(

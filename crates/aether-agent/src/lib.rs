@@ -19,4 +19,6 @@ pub use fake::{FakeBackend, FakeToolCall};
 pub use permission::{
     NoPermissionBroker, PermissionBroker, PermissionFuture, SessionPermissionBroker,
 };
-pub use session::{PersistTurn, ResumableSession, SessionStore, SessionStoreError, persist_turn};
+pub use session::{
+    PersistTurn, ResumableSession, SessionStore, SessionStoreError, SessionSummary, persist_turn,
+};

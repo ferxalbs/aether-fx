@@ -15,6 +15,9 @@ use crate::session_fs;
 /// Session persistence failures with operation context.
 #[derive(Debug, Error)]
 pub enum SessionStoreError {
+    /// A contained session entry was not present.
+    #[error("session not found")]
+    NotFound,
     /// Filesystem operation failed.
     #[error("session {operation} failed: {message}")]
     Io { operation: String, message: String },
@@ -51,7 +54,87 @@ pub struct ResumableSession {
     pub warnings: Vec<String>,
 }
 
+/// Bounded, non-secret metadata used by the local session picker.
+#[derive(Clone, Debug)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub model: Option<String>,
+    pub last_turn: Option<TurnId>,
+    pub workspace: Option<String>,
+    pub modified: std::time::SystemTime,
+}
+
 impl SessionStore {
+    /// Discover contained session files without exposing their contents.
+    pub fn summaries(
+        workspace: impl AsRef<Path>,
+    ) -> Result<(Vec<SessionSummary>, Vec<String>), SessionStoreError> {
+        let directory = Self::directory_for(workspace.as_ref());
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(error) => {
+                return Err(SessionStoreError::Io {
+                    operation: "list sessions".to_owned(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        let mut summaries = Vec::new();
+        let mut issues = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| SessionStoreError::Io {
+                operation: "read session directory".to_owned(),
+                message: error.to_string(),
+            })?;
+            let entry_path = entry.path();
+            let Some(stem) = entry_path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Ok(session_id) = SessionId::new(stem.to_owned()) else { continue };
+            let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let store = match Self::open(workspace.as_ref(), session_id.clone()) {
+                Ok(store) => store,
+                Err(error) => {
+                    issues.push(format!("{session_id}: {error}"));
+                    continue;
+                }
+            };
+            let lines = match store.read() {
+                Ok(lines) => lines,
+                Err(error) => {
+                    issues.push(format!("{session_id}: {error}"));
+                    continue;
+                }
+            };
+            let mut model = None;
+            let mut workspace = None;
+            let mut last_turn = None;
+            for line in lines {
+                match line.record {
+                    SessionRecord::Started { workspace_root, model: stored_model } => {
+                        workspace = Some(workspace_root);
+                        model = stored_model;
+                    }
+                    SessionRecord::TurnSnapshot { snapshot } => {
+                        last_turn = Some(snapshot.turn_id);
+                        if snapshot.context.model.is_some() {
+                            model = snapshot.context.model;
+                        }
+                    }
+                    SessionRecord::Finished => {}
+                }
+            }
+            summaries.push(SessionSummary { session_id, model, last_turn, workspace, modified });
+        }
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+        Ok((summaries, issues))
+    }
     /// Return `{workspace}/.aether/sessions`.
     pub fn directory_for(workspace: impl AsRef<Path>) -> PathBuf {
         workspace.as_ref().join(".aether").join("sessions")
@@ -127,38 +210,18 @@ impl SessionStore {
             message: error.to_string(),
         })?;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        let line_count = Self::replay(&self.path)?.len();
+        let layout = session_fs::SessionLayout::prepare(&self.workspace, &self.session_id)?;
+        let line_count = Self::replay_reader(layout.open_jsonl(false)?)?.len();
         if line_count > MAX_SESSION_LINES {
             self.compact()?;
         }
         Ok(line)
     }
 
-    /// Read and validate bounded session lines for replay.
-    pub fn replay(path: impl AsRef<Path>) -> Result<Vec<SessionLine>, SessionStoreError> {
-        let path = path.as_ref();
-        let metadata = fs::symlink_metadata(path).map_err(|error| SessionStoreError::Io {
-            operation: "stat session file".to_owned(),
-            message: error.to_string(),
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(SessionStoreError::Invalid(
-                "session file is a symbolic link or reparse point".to_owned(),
-            ));
-        }
-        if !metadata.file_type().is_file() {
-            return Err(SessionStoreError::Invalid(
-                "session file is not a regular file".to_owned(),
-            ));
-        }
-        if metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
-            return Err(SessionStoreError::Invalid("session file exceeds size limit".to_owned()));
-        }
-        let file = File::open(path).map_err(|error| SessionStoreError::Io {
-            operation: "read session file".to_owned(),
-            message: error.to_string(),
-        })?;
-        Self::parse_lines(BufReader::new(file))
+    /// Read bounded records only through this store's contained descriptor.
+    pub fn read(&self) -> Result<Vec<SessionLine>, SessionStoreError> {
+        let layout = session_fs::SessionLayout::prepare(&self.workspace, &self.session_id)?;
+        Self::replay_reader(layout.open_jsonl(false)?)
     }
 
     fn replay_reader(file: File) -> Result<Vec<SessionLine>, SessionStoreError> {
@@ -216,18 +279,20 @@ impl SessionStore {
 
     /// Reconstruct bounded resume state from a JSONL file and the live workspace.
     pub fn restore(
-        path: impl AsRef<Path>,
         live_workspace: impl AsRef<Path>,
+        session_id: SessionId,
     ) -> Result<ResumableSession, SessionStoreError> {
-        let layout =
-            session_fs::SessionLayout::from_existing_path(live_workspace.as_ref(), path.as_ref())?;
+        let path = Self::path_for(live_workspace.as_ref(), &session_id);
+        let layout = session_fs::SessionLayout::from_existing_path(live_workspace.as_ref(), &path)?;
         let file = layout.open_jsonl(false)?;
         let lines = Self::replay_reader(file)?;
         if lines.is_empty() {
             return Err(SessionStoreError::Invalid("session file is empty".to_owned()));
         }
-        let session_id = lines[0].session_id.clone();
-        if lines.iter().any(|line| line.session_id != session_id) {
+        let stored_session_id = lines[0].session_id.clone();
+        if stored_session_id != session_id
+            || lines.iter().any(|line| line.session_id != stored_session_id)
+        {
             return Err(SessionStoreError::Invalid("session id mismatch".to_owned()));
         }
         let mut workspace_root = None;
@@ -294,7 +359,7 @@ impl SessionStore {
         }
         let context = engine.into_snapshot();
         Ok(ResumableSession {
-            session_id,
+            session_id: stored_session_id,
             workspace_root: live_workspace,
             model: context.model.clone(),
             continuation,
@@ -454,7 +519,7 @@ mod tests {
 
     #[test]
     fn session_write_read_round_trip_persists_continuation() {
-        let (root, path, session) = temp_session("roundtrip");
+        let (root, _path, session) = temp_session("roundtrip");
         let mut store = SessionStore::open(&root, session.clone()).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
@@ -471,7 +536,7 @@ mod tests {
                 "reasoning": "hidden"
             }))),
         );
-        let lines = SessionStore::replay(&path).unwrap();
+        let lines = SessionStore::open(&root, session.clone()).unwrap().read().unwrap();
         assert_eq!(lines[0].schema_version, SESSION_SCHEMA_VERSION);
         match &lines[1].record {
             SessionRecord::TurnSnapshot { snapshot } => {
@@ -498,7 +563,7 @@ mod tests {
         );
         let committed = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{committed}{{\"truncated\"")).unwrap();
-        let restored = SessionStore::restore(&path, &root).unwrap();
+        let restored = SessionStore::restore(&root, session.clone()).unwrap();
         assert_eq!(
             restored.continuation.unwrap().0.get("previous_response_id").unwrap(),
             "resp_first"
@@ -521,11 +586,11 @@ mod tests {
             format!("{}{{\"truncated\"", std::fs::read_to_string(&path).unwrap()),
         )
         .unwrap();
-        let lines = SessionStore::replay(&path).unwrap();
+        let lines = SessionStore::open(&first_root, session.clone()).unwrap().read().unwrap();
         assert_eq!(lines.len(), 1);
 
         let (root, path, session) = temp_session("corrupt-middle");
-        let mut store = SessionStore::open(&root, session).unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
         store
             .append(
                 None,
@@ -533,7 +598,7 @@ mod tests {
             )
             .unwrap();
         std::fs::write(&path, "{\"schema_version\":3}\nnot-json\n").unwrap();
-        assert!(SessionStore::replay(&path).is_err());
+        assert!(SessionStore::open(&root, session.clone()).is_err());
         let _ = std::fs::remove_dir_all(first_root);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -558,7 +623,7 @@ mod tests {
 
     #[test]
     fn schema_version_rejection() {
-        let (root, path, _) = temp_session("schema");
+        let (root, path, session) = temp_session("schema");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
@@ -566,7 +631,7 @@ mod tests {
 "#,
         )
         .unwrap();
-        let error = SessionStore::replay(&path).unwrap_err().to_string();
+        let error = SessionStore::open(&root, session.clone()).unwrap_err().to_string();
         assert!(error.contains("unsupported session schema 2"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -619,10 +684,10 @@ mod tests {
 
     #[test]
     fn unchanged_workspace_preserves_continuation() {
-        let (root, path, session) = temp_session("unchanged");
+        let (root, _path, session) = temp_session("unchanged");
         std::fs::write(root.join("main.rs"), "old").unwrap();
         let hash = blake3::hash(b"old").to_hex().to_string();
-        let mut store = SessionStore::open(&root, session).unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.inspected.push(inspected("main.rs", &hash));
@@ -632,7 +697,7 @@ mod tests {
             context,
             Some(OpaqueContinuation(serde_json::json!({"previous_response_id": "resp_keep"}))),
         );
-        let restored = SessionStore::restore(&path, &root).unwrap();
+        let restored = SessionStore::restore(&root, session.clone()).unwrap();
         assert!(!restored.workspace_changed);
         assert_eq!(
             restored.continuation.unwrap().0.get("previous_response_id").unwrap(),
@@ -643,10 +708,10 @@ mod tests {
 
     #[test]
     fn changed_inspected_file_invalidates_continuation() {
-        let (root, path, session) = temp_session("changed-file");
+        let (root, _path, session) = temp_session("changed-file");
         std::fs::write(root.join("main.rs"), "old").unwrap();
         let hash = blake3::hash(b"old").to_hex().to_string();
-        let mut store = SessionStore::open(&root, session).unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.inspected.push(inspected("main.rs", &hash));
@@ -657,7 +722,7 @@ mod tests {
             Some(OpaqueContinuation(serde_json::json!({"previous_response_id": "resp_stale"}))),
         );
         std::fs::write(root.join("main.rs"), "new").unwrap();
-        let restored = SessionStore::restore(&path, &root).unwrap();
+        let restored = SessionStore::restore(&root, session.clone()).unwrap();
         assert!(restored.workspace_changed);
         assert!(restored.context.inspected[0].stale);
         assert!(restored.continuation.is_none());
@@ -666,10 +731,10 @@ mod tests {
 
     #[test]
     fn deleted_inspected_file_invalidates_continuation() {
-        let (root, path, session) = temp_session("deleted-file");
+        let (root, _path, session) = temp_session("deleted-file");
         std::fs::write(root.join("main.rs"), "old").unwrap();
         let hash = blake3::hash(b"old").to_hex().to_string();
-        let mut store = SessionStore::open(&root, session).unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
         let mut context =
             ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
         context.inspected.push(inspected("main.rs", &hash));
@@ -680,7 +745,7 @@ mod tests {
             Some(OpaqueContinuation(serde_json::json!({"previous_response_id": "resp_gone"}))),
         );
         std::fs::remove_file(root.join("main.rs")).unwrap();
-        let restored = SessionStore::restore(&path, &root).unwrap();
+        let restored = SessionStore::restore(&root, session.clone()).unwrap();
         assert!(restored.workspace_changed);
         assert!(restored.continuation.is_none());
         let _ = std::fs::remove_dir_all(root);
@@ -688,21 +753,21 @@ mod tests {
 
     #[test]
     fn changed_workspace_root_invalidates_continuation() {
-        let (live, path, session) = temp_session("changed-root-live");
+        let (live, _path, session) = temp_session("changed-root-live");
         let stored = std::env::temp_dir().join(format!(
             "aether-stored-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&stored).unwrap();
-        let mut store = SessionStore::open(&live, session).unwrap();
+        let mut store = SessionStore::open(&live, session.clone()).unwrap();
         write_started_and_turn(
             &mut store,
             &stored,
             ContextSnapshot::new(stored.display().to_string(), Some("model-a".to_owned())),
             Some(OpaqueContinuation(serde_json::json!({"previous_response_id": "resp_root"}))),
         );
-        let restored = SessionStore::restore(&path, &live).unwrap();
+        let restored = SessionStore::restore(&live, session.clone()).unwrap();
         assert!(restored.workspace_changed);
         assert!(restored.continuation.is_none());
         let _ = std::fs::remove_dir_all(live);

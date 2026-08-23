@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-22 (7) - CLI and session workflow improvements
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added `aether sessions` and safe `aether resume --latest` discovery within the selected workspace.
+
+### Changed
+
+- One-shot and interactive prompts now use the same session-backed agent runtime path.
+
+### Security
+
+- Session replay accepts only already-contained descriptors; missing sessions are handled with typed errors.
+
 All notable AETHER Fx changes are recorded here. The project remains
 unreleased, with changes grouped by public capability.
 

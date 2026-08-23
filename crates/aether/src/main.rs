@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use aether_agent::{
     Agent, AgentError, AgentRequest, AgentRunResult, CancellationToken, ModelBackend,
-    NoPermissionBroker, PermissionBroker, PersistTurn, SessionPermissionBroker, SessionStore,
-    SessionStoreError, persist_turn,
+    PermissionBroker, PersistTurn, SessionPermissionBroker, SessionStore, SessionStoreError,
+    persist_turn,
 };
 use aether_core::{
     AgentEvent, BoundedText, PermissionRequest, SessionId, SessionRecord, ToolExecutor, TurnId,
@@ -44,6 +44,8 @@ enum Command {
     Shell,
     Prompt(String),
     Resume(String),
+    ResumeLatest,
+    Sessions,
     Models,
     Doctor,
     Help,
@@ -79,15 +81,19 @@ fn run() -> Result<(), AppError> {
         }
         Command::Doctor => doctor(&cli.root),
         Command::Models => with_runtime(|runtime| runtime.block_on(models())),
+        Command::Sessions => sessions(&cli.root),
         Command::Resume(session) => {
             with_runtime(|runtime| runtime.block_on(run_resume(session, cli.model, cli.root)))
         }
-        Command::Shell => {
-            with_runtime(|runtime| runtime.block_on(run_interactive(cli.model, cli.root, None)))
+        Command::ResumeLatest => {
+            with_runtime(|runtime| runtime.block_on(run_resume_latest(cli.model, cli.root)))
         }
-        Command::Prompt(prompt) => {
-            with_runtime(|runtime| runtime.block_on(run_prompt(prompt, cli.model, cli.root)))
-        }
+        Command::Shell => with_runtime(|runtime| {
+            runtime.block_on(run_interactive(cli.model, cli.root, None, None, false))
+        }),
+        Command::Prompt(prompt) => with_runtime(|runtime| {
+            runtime.block_on(run_interactive(cli.model, cli.root, None, Some(prompt), true))
+        }),
     }
 }
 
@@ -95,6 +101,7 @@ fn parse_cli() -> Result<Cli, AppError> {
     let mut parser = lexopt::Parser::from_env();
     let mut positionals = Vec::<OsString>::new();
     let mut model = None;
+    let mut latest = false;
     let mut root = std::env::current_dir()?;
     while let Some(argument) = parser.next()? {
         match argument {
@@ -113,6 +120,7 @@ fn parse_cli() -> Result<Cli, AppError> {
             lexopt::Arg::Long("root") => {
                 root = PathBuf::from(parser.value()?);
             }
+            lexopt::Arg::Long("latest") => latest = true,
             lexopt::Arg::Value(value) => positionals.push(value),
             other => {
                 return Err(AppError::Message(format!("unsupported argument: {other:?}")));
@@ -128,13 +136,19 @@ fn parse_cli() -> Result<Cli, AppError> {
     let command = match first {
         "models" if positionals.len() == 1 => Command::Models,
         "doctor" if positionals.len() == 1 => Command::Doctor,
-        "resume" if positionals.len() == 2 => Command::Resume(
+        "sessions" if positionals.len() == 1 => Command::Sessions,
+        "resume" if latest && positionals.len() == 1 => Command::ResumeLatest,
+        "resume" if !latest && positionals.len() == 2 => Command::Resume(
             positionals[1]
                 .to_str()
                 .ok_or_else(|| AppError::Message("session id must be valid UTF-8".to_owned()))?
                 .to_owned(),
         ),
-        "resume" => return Err(AppError::Message("usage: aether resume <session>".to_owned())),
+        "resume" => {
+            return Err(AppError::Message(
+                "usage: aether resume <session> | aether resume --latest".to_owned(),
+            ));
+        }
         _ => {
             let mut prompt = String::new();
             for (index, value) in positionals.iter().enumerate() {
@@ -155,8 +169,8 @@ fn parse_cli() -> Result<Cli, AppError> {
 fn print_help() {
     println!(
         "AETHER Fx {VERSION}\n\n\
-         Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>\n  aether models\n  aether doctor\n\n\
-         Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  -h, --help    Show help\n  -V, --version Show version\n\n\
+         Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models\n  aether doctor\n\n\
+         Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  --latest      Resume the newest valid local session\n  -h, --help    Show help\n  -V, --version Show version\n\n\
          Sessions are stored as bounded JSONL under <root>/.aether/sessions."
     );
 }
@@ -171,6 +185,26 @@ fn doctor(root: &Path) -> Result<(), AppError> {
     println!("telemetry: disabled");
     println!("provider integrations: Rainy SDK only");
     println!("sessions: {}", SessionStore::directory_for(root).display());
+    Ok(())
+}
+
+fn sessions(root: &Path) -> Result<(), AppError> {
+    let (summaries, issues) = SessionStore::summaries(root)?;
+    for summary in summaries {
+        let modified =
+            summary.modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            summary.session_id,
+            summary.model.as_deref().unwrap_or("-"),
+            summary.last_turn.as_ref().map_or("-", |turn| turn.as_str()),
+            summary.workspace.as_deref().unwrap_or("-"),
+            modified
+        );
+    }
+    for issue in issues {
+        eprintln!("AETHER Fx: skipped corrupt session: {issue}");
+    }
     Ok(())
 }
 
@@ -194,45 +228,17 @@ async fn models() -> Result<(), AppError> {
     Ok(())
 }
 
-async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Result<(), AppError> {
-    let model = configured_model(model)?;
-    let backend = RainyBackend::from_env().map_err(|error| AppError::Message(error.to_string()))?;
-    let tools = new_tool_registry(root.clone()).await?;
-    let workspace = tools.workspace().clone();
-    let agent = Agent::new(backend, tools);
-    let session_id = new_session_id()?;
-    let store = open_session_store(&root, &session_id).await?;
-    persist_started(&store, &root, Some(model.clone())).await?;
-    announce_session(&session_id, &root);
-    let turn_id = TurnId::new(format!("turn-{}-1", std::process::id()))
-        .map_err(|error| AppError::Message(error.to_string()))?;
-    let mut request = AgentRequest::new(session_id, turn_id.clone(), prompt.clone());
-    request.model = Some(model);
-    request.workspace_root = Some(root.display().to_string());
-    let mut renderer = Renderer::new();
-    let broker = NoPermissionBroker;
-    let turn_result = run_agent_turn(&agent, request, &broker, None, &mut renderer).await;
-    if let Ok(Some(result)) = &turn_result {
-        persist_completed_turn(&store, &turn_id, result).await?;
-    }
-    let _ = persist_finished(&store).await;
-    let cleanup = workspace.shutdown_processes().await;
-    if let Err(error) = turn_result {
-        if !cleanup.is_clean() {
-            report_shutdown_failure(&cleanup);
-        }
-        return Err(error);
-    }
-    finish_shutdown(cleanup)
-}
-
 /// Keep the prompt local and visible before constructing the network backend.
 async fn run_interactive(
     model: Option<String>,
     root: PathBuf,
     resume: Option<aether_agent::ResumableSession>,
+    initial_prompt: Option<String>,
+    single_pass: bool,
 ) -> Result<(), AppError> {
-    let first_prompt = if resume.is_none() {
+    let first_prompt = if initial_prompt.is_some() {
+        initial_prompt
+    } else if resume.is_none() {
         let Some(prompt) = read_prompt().await? else {
             return Ok(());
         };
@@ -316,6 +322,10 @@ async fn run_interactive(
                 context_seed = Some(result.context);
             }
 
+            if single_pass {
+                break;
+            }
+
             let Some(next) = read_prompt().await? else {
                 break;
             };
@@ -339,18 +349,10 @@ async fn run_interactive(
 async fn run_resume(session: String, model: Option<String>, root: PathBuf) -> Result<(), AppError> {
     let session_id =
         SessionId::new(session).map_err(|error| AppError::Message(error.to_string()))?;
-    let path = SessionStore::path_for(&root, &session_id);
-    if !path.exists() {
-        return Err(AppError::Message(format!(
-            "session {} was not found in {}",
-            session_id,
-            SessionStore::directory_for(&root).display()
-        )));
-    }
     let restored = tokio::task::spawn_blocking({
-        let path = path.clone();
         let root = root.clone();
-        move || SessionStore::restore(path, root)
+        let session_id = session_id.clone();
+        move || SessionStore::restore(root, session_id)
     })
     .await
     .map_err(|error| AppError::Message(format!("session restore worker failed: {error}")))??;
@@ -360,7 +362,23 @@ async fn run_resume(session: String, model: Option<String>, root: PathBuf) -> Re
             restored.workspace_root.display()
         )));
     }
-    run_interactive(model, root, Some(restored)).await
+    run_interactive(model, root, Some(restored), None, false).await
+}
+
+async fn run_resume_latest(model: Option<String>, root: PathBuf) -> Result<(), AppError> {
+    let (summaries, issues) = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || SessionStore::summaries(root)
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
+    for issue in issues {
+        eprintln!("AETHER Fx: skipped corrupt session: {issue}");
+    }
+    let Some(session) = summaries.first() else {
+        return Err(AppError::Message("session not found".to_owned()));
+    };
+    run_resume(session.session_id.as_str().to_owned(), model, root).await
 }
 
 fn finish_shutdown(report: ProcessShutdownReport) -> Result<(), AppError> {

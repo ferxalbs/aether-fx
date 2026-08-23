@@ -75,11 +75,8 @@ impl SessionLayout {
     pub(crate) fn try_open_existing(&self) -> Result<Option<File>, SessionStoreError> {
         match self.open_jsonl(false) {
             Ok(file) => Ok(Some(file)),
-            Err(SessionStoreError::Io { message, .. }) if is_not_found(&message) => Ok(None),
-            Err(error) => match fs::symlink_metadata(&self.path) {
-                Err(io_error) if io_error.kind() == io::ErrorKind::NotFound => Ok(None),
-                _ => Err(error),
-            },
+            Err(SessionStoreError::NotFound) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -106,12 +103,6 @@ fn canonical_workspace(path: &Path) -> Result<PathBuf, SessionStoreError> {
 #[cfg(not(unix))]
 fn path_inside(child: &Path, parent: &Path) -> bool {
     child.starts_with(parent)
-}
-
-fn is_not_found(message: &str) -> bool {
-    message.contains("No such file")
-        || message.contains("not found")
-        || message.contains("os error 2")
 }
 
 fn io_err(operation: &str, error: impl ToString) -> SessionStoreError {
@@ -196,7 +187,9 @@ fn ensure_unix_dir(
 
 #[cfg(unix)]
 fn map_unix_open_error(operation: &str, error: rustix::io::Errno) -> SessionStoreError {
-    if error == rustix::io::Errno::LOOP {
+    if error == rustix::io::Errno::NOENT {
+        SessionStoreError::NotFound
+    } else if error == rustix::io::Errno::LOOP {
         SessionStoreError::Invalid("session storage is a symbolic link or reparse point".to_owned())
     } else {
         io_err(operation, error)
