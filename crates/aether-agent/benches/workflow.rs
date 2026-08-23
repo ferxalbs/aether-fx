@@ -1,4 +1,9 @@
-use aether_agent::ContextEngine;
+use std::path::PathBuf;
+
+use aether_agent::{
+    ContextEngine, LoopGuardrails, ManifestInfo, ManifestKind, ManifestStatus, PackageInfo,
+    RepoMapSnapshot, classify_command, plan_verification,
+};
 use aether_core::{ToolCallId, ToolResult, WorkflowState};
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::json;
@@ -54,5 +59,70 @@ fn benchmark_context_render(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_state_updates, benchmark_context_render);
+fn benchmark_verification_planning(c: &mut Criterion) {
+    let repo = RepoMapSnapshot {
+        root: PathBuf::from("."),
+        tracked_file_count: 100,
+        tracked_files: vec![],
+        manifests: vec![ManifestInfo {
+            path: "crates/demo/Cargo.toml".into(),
+            kind: ManifestKind::Cargo,
+            package_name: Some("demo".into()),
+            workspace_members: vec![],
+            status: ManifestStatus::Parsed,
+            truncated: false,
+        }],
+        packages: vec![PackageInfo {
+            name: Some("demo".into()),
+            root: "crates/demo".into(),
+            manifest: "crates/demo/Cargo.toml".into(),
+        }],
+        workspace_members: vec![],
+        source_roots: vec![],
+        test_paths: vec![],
+        documentation: vec![],
+        instructions: vec![],
+        truncated: false,
+    };
+    let modified = vec!["crates/demo/src/lib.rs".to_owned()];
+    c.bench_function("verification_plan/normal_rust_repository", |bencher| {
+        bencher.iter(|| std::hint::black_box(plan_verification(&repo, &modified)));
+    });
+    let args = vec!["test".to_owned(), "-p".to_owned(), "demo".to_owned()];
+    c.bench_function("verification_plan/classify_cargo_test", |bencher| {
+        bencher.iter(|| std::hint::black_box(classify_command("cargo", &args)));
+    });
+}
+
+fn benchmark_guardrails(c: &mut Criterion) {
+    let input = json!({"files":[{"path":"src/lib.rs","start_line":1,"end_line":20}]});
+    let result = read_result("src/lib.rs");
+    let state = WorkflowState::new();
+    let mut guard = LoopGuardrails::new();
+    guard.observe("read", &input, &result, &state, &state);
+    c.bench_function("loop_guardrails/fingerprint_lookup", |bencher| {
+        bencher.iter(|| {
+            std::hint::black_box(guard.preflight(
+                ToolCallId::new("lookup").unwrap(),
+                "read",
+                &input,
+                0,
+            ))
+        })
+    });
+    c.bench_function("loop_guardrails/progress_state_update", |bencher| {
+        bencher.iter(|| {
+            let mut guard = LoopGuardrails::new();
+            std::hint::black_box(guard.observe("read", &input, &result, &state, &state))
+        })
+    });
+}
+
+criterion_group!(
+    benches,
+    benchmark_state_updates,
+    benchmark_context_render,
+    benchmark_verification_planning,
+    benchmark_guardrails
+);
 criterion_main!(benches);

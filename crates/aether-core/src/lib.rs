@@ -43,6 +43,7 @@ pub use tools::{
     ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
 };
 pub use workflow::{
-    MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES, MAX_WORKFLOW_RELEVANT_FILES, WorkflowFailure,
+    MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES, MAX_WORKFLOW_RELEVANT_FILES,
+    MAX_WORKFLOW_VERIFICATIONS, VerificationStatus, VerificationStep, WorkflowFailure,
     WorkflowPhase, WorkflowProgress, WorkflowState, WorkflowVerification,
 };

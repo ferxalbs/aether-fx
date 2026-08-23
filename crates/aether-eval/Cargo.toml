@@ -1,0 +1,18 @@
+[package]
+name = "aether-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic coding-agent evaluation harness for AETHER Fx"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "aether-eval"
+path = "src/main.rs"

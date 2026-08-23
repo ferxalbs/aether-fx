@@ -8,6 +8,52 @@ pub const MAX_WORKFLOW_RELEVANT_FILES: usize = 32;
 pub const MAX_WORKFLOW_FAILURES: usize = 8;
 /// Maximum bytes retained for one workflow failure field.
 pub const MAX_WORKFLOW_FIELD_BYTES: usize = 256;
+/// Maximum number of focused verification commands retained.
+pub const MAX_WORKFLOW_VERIFICATIONS: usize = 16;
+
+/// Result retained for one planned verification command.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    #[default]
+    Pending,
+    Passed,
+    Failed,
+    Stale,
+}
+
+impl VerificationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// One deterministic, bounded verification step for the current workspace revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerificationStep {
+    pub command: BoundedText,
+    pub scope: BoundedText,
+    pub revision: u32,
+    pub required: bool,
+    pub status: VerificationStatus,
+}
+
+impl VerificationStep {
+    pub fn new(command: impl AsRef<str>, scope: impl AsRef<str>, revision: u32) -> Self {
+        Self {
+            command: BoundedText::new(command, MAX_WORKFLOW_FIELD_BYTES),
+            scope: BoundedText::new(scope, MAX_WORKFLOW_FIELD_BYTES),
+            revision,
+            required: true,
+            status: VerificationStatus::Pending,
+        }
+    }
+}
 
 /// Deterministic phase of a repository-aware coding task.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,6 +196,12 @@ pub struct WorkflowState {
     pub unresolved_failures: Vec<WorkflowFailure>,
     /// Bounded counters showing forward progress without retaining transcripts.
     pub progress: WorkflowProgress,
+    /// Monotonic local workspace revision advanced by observed mutations.
+    #[serde(default)]
+    pub workspace_revision: u32,
+    /// Ordered, deduplicated verification plan and its observed outcomes.
+    #[serde(default)]
+    pub verification_steps: Vec<VerificationStep>,
 }
 
 impl WorkflowState {
@@ -195,8 +247,58 @@ impl WorkflowState {
     /// Record a successful mutation and require focused verification.
     pub fn record_mutation(&mut self) {
         self.progress.note_mutation();
+        self.workspace_revision = self.workspace_revision.saturating_add(1);
+        for step in &mut self.verification_steps {
+            step.status = VerificationStatus::Stale;
+        }
         self.phase = WorkflowPhase::Verify;
         self.verification = WorkflowVerification::Pending;
+    }
+
+    /// Add deterministic planning output, deduplicated within the current revision.
+    pub fn set_verification_plan(&mut self, steps: impl IntoIterator<Item = VerificationStep>) {
+        for mut step in steps {
+            step.revision = self.workspace_revision;
+            if step.command.as_str().is_empty()
+                || self.verification_steps.iter().any(|existing| {
+                    existing.revision == step.revision && existing.command == step.command
+                })
+            {
+                continue;
+            }
+            self.verification_steps.push(step);
+        }
+        if self.verification_steps.len() > MAX_WORKFLOW_VERIFICATIONS {
+            let excess = self.verification_steps.len() - MAX_WORKFLOW_VERIFICATIONS;
+            self.verification_steps.drain(..excess);
+        }
+    }
+
+    /// Record an exact planned command outcome for the current revision.
+    pub fn record_verification_command(&mut self, command: &str, passed: bool) -> bool {
+        let Some(step) = self.verification_steps.iter_mut().find(|step| {
+            step.revision == self.workspace_revision
+                && step.status == VerificationStatus::Pending
+                && step.command.as_str() == command
+        }) else {
+            return false;
+        };
+        step.status = if passed { VerificationStatus::Passed } else { VerificationStatus::Failed };
+        let all_passed = self
+            .verification_steps
+            .iter()
+            .filter(|step| step.required && step.revision == self.workspace_revision)
+            .all(|step| step.status == VerificationStatus::Passed);
+        self.verification = if all_passed {
+            self.progress.note_verification();
+            WorkflowVerification::Passed
+        } else if passed {
+            WorkflowVerification::Pending
+        } else {
+            WorkflowVerification::Failed
+        };
+        self.phase = WorkflowPhase::Verify;
+        true
     }
 
     /// Record the outcome of a focused verification attempt.
@@ -233,6 +335,9 @@ impl WorkflowState {
         self.phase = WorkflowPhase::Discover;
         self.relevant_files.clear();
         self.verification = WorkflowVerification::NotRequired;
+        for step in &mut self.verification_steps {
+            step.status = VerificationStatus::Stale;
+        }
     }
 
     /// Mark the workflow complete only when all bounded completion criteria hold.
@@ -244,6 +349,11 @@ impl WorkflowState {
             );
         let ready = !self.relevant_files.is_empty()
             && self.unresolved_failures.is_empty()
+            && self
+                .verification_steps
+                .iter()
+                .filter(|step| step.required && step.revision == self.workspace_revision)
+                .all(|step| step.status == VerificationStatus::Passed)
             && (!verification_required || self.verification == WorkflowVerification::Passed);
         if ready {
             self.phase = WorkflowPhase::Complete;
@@ -277,6 +387,11 @@ impl WorkflowState {
         }
         self.relevant_files.retain(|path| !path.is_empty());
         self.unresolved_failures.truncate(MAX_WORKFLOW_FAILURES);
+        self.verification_steps.truncate(MAX_WORKFLOW_VERIFICATIONS);
+        for step in &mut self.verification_steps {
+            step.command = BoundedText::new(step.command.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+            step.scope = BoundedText::new(step.scope.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+        }
         for failure in &mut self.unresolved_failures {
             failure.key = BoundedText::new(failure.key.as_str(), MAX_WORKFLOW_FIELD_BYTES);
             failure.tool = BoundedText::new(failure.tool.as_str(), MAX_WORKFLOW_FIELD_BYTES);
@@ -339,5 +454,47 @@ mod tests {
         state.record_failure(WorkflowFailure::new("read:src/lib.rs", "read", "io", "retry"));
         assert_ne!(state.phase, WorkflowPhase::Complete);
         assert!(!state.complete_if_ready(&[]));
+    }
+
+    #[test]
+    fn verification_results_become_stale_after_later_mutation() {
+        let mut state = WorkflowState::new();
+        state.record_relevant_file("src/lib.rs");
+        state.record_mutation();
+        state.set_verification_plan([VerificationStep::new(
+            "cargo test -p demo",
+            "demo",
+            state.workspace_revision,
+        )]);
+        assert!(state.record_verification_command("cargo test -p demo", true));
+        assert!(state.complete_if_ready(&["src/lib.rs".into()]));
+
+        state.record_mutation();
+        assert_eq!(state.verification_steps[0].status, VerificationStatus::Stale);
+        assert!(!state.complete_if_ready(&["src/lib.rs".into()]));
+    }
+
+    #[test]
+    fn duplicate_commands_are_ignored_within_revision() {
+        let mut state = WorkflowState::new();
+        state.record_mutation();
+        let step = VerificationStep::new("cargo check", "workspace", state.workspace_revision);
+        state.set_verification_plan([step.clone(), step]);
+        assert_eq!(state.verification_steps.len(), 1);
+    }
+
+    #[test]
+    fn all_required_commands_must_pass_before_completion() {
+        let mut state = WorkflowState::new();
+        state.record_relevant_file("src/lib.rs");
+        state.record_mutation();
+        state.set_verification_plan([
+            VerificationStep::new("cargo test", "crate", state.workspace_revision),
+            VerificationStep::new("cargo check", "crate", state.workspace_revision),
+        ]);
+        assert!(state.record_verification_command("cargo test", true));
+        assert!(!state.complete_if_ready(&["src/lib.rs".into()]));
+        assert!(state.record_verification_command("cargo check", false));
+        assert!(!state.complete_if_ready(&["src/lib.rs".into()]));
     }
 }

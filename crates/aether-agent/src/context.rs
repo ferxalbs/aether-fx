@@ -11,7 +11,10 @@ use aether_core::{
 use serde_json::Value;
 
 use crate::repo_map::RepoMap;
-use crate::{ContextCandidate, ContextKind, select_context};
+use crate::{
+    CommandIntent, ContextCandidate, ContextKind, classify_command, plan_verification,
+    select_context,
+};
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
 
@@ -97,7 +100,7 @@ impl ContextEngine {
     pub fn observe_tool(&mut self, name: &str, input: &Value, result: &ToolResult) {
         let failure_key = workflow_failure_key(name, input);
         let focused_verification = self.is_focused_verification(name, input);
-        let mutation = is_workspace_mutation(name);
+        let mutation = is_workspace_mutation(name, input);
         self.snapshot.workflow.progress.note_tool_result();
         if mutation {
             self.snapshot.workflow.begin_modification();
@@ -119,10 +122,16 @@ impl ContextEngine {
         }
         if mutation && mutation_applied(name, input, result) {
             self.snapshot.workflow.record_mutation();
+            self.refresh_verification_plan();
         }
         if focused_verification {
             let passed = verification_passed(name, result);
-            self.snapshot.workflow.record_verification(passed);
+            let planned = shell_command_display(input).is_some_and(|command| {
+                self.snapshot.workflow.record_verification_command(&command, passed)
+            });
+            if !planned && self.snapshot.workflow.verification_steps.is_empty() {
+                self.snapshot.workflow.record_verification(passed);
+            }
             if passed {
                 self.snapshot.workflow.clear_failure(&failure_key);
             } else {
@@ -414,6 +423,19 @@ impl ContextEngine {
         }
         render_workflow_paths(out, "workflow_relevant", &workflow.relevant_files);
         render_workflow_paths(out, "workflow_modified", &self.snapshot.modified);
+        for step in workflow
+            .verification_steps
+            .iter()
+            .filter(|step| step.revision == workflow.workspace_revision)
+        {
+            out.push_str("workflow_verify: ");
+            out.push_str(step.status.as_str());
+            out.push(' ');
+            out.push_str(step.command.as_str());
+            out.push_str(" scope=");
+            out.push_str(step.scope.as_str());
+            out.push('\n');
+        }
         let action = match workflow.phase {
             WorkflowPhase::Discover => "identify relevant files before editing",
             WorkflowPhase::Inspect => "inspect identified files before editing",
@@ -431,6 +453,16 @@ impl ContextEngine {
         if !self.snapshot.modified.is_empty() {
             self.snapshot.workflow.verification = WorkflowVerification::Pending;
         }
+    }
+
+    fn refresh_verification_plan(&mut self) {
+        let Some(repo_map) = &self.repo_map else { return };
+        let Ok(snapshot) = repo_map.snapshot() else { return };
+        let plan = plan_verification(&snapshot, &self.snapshot.modified);
+        let revision = self.snapshot.workflow.workspace_revision;
+        self.snapshot.workflow.set_verification_plan(
+            plan.commands.iter().map(|command| command.workflow_step(revision)),
+        );
     }
 
     fn observe_relevant(&mut self, name: &str, input: &Value, result: &ToolResult) {
@@ -718,12 +750,13 @@ fn path_is_workspace_relative(path: &str) -> bool {
     WorkspacePath::new(path).is_ok()
 }
 
-fn is_workspace_mutation(name: &str) -> bool {
+fn is_workspace_mutation(name: &str, input: &Value) -> bool {
     matches!(name, "write" | "patch")
+        || (name == "shell" && shell_command_intent(input) == CommandIntent::Mutation)
 }
 
 fn mutation_applied(name: &str, input: &Value, result: &ToolResult) -> bool {
-    if !result.ok || !is_workspace_mutation(name) {
+    if !result.ok || !is_workspace_mutation(name, input) {
         return false;
     }
     if name == "patch"
@@ -736,7 +769,8 @@ fn mutation_applied(name: &str, input: &Value, result: &ToolResult) -> bool {
     {
         return false;
     }
-    name == "write"
+    name == "shell"
+        || name == "write"
         || result
             .data
             .as_ref()
@@ -765,22 +799,37 @@ fn read_targets_modified(input: &Value, modified: &[String]) -> bool {
 }
 
 fn is_verification_command(input: &Value) -> bool {
+    shell_command_intent(input) == CommandIntent::Verification
+}
+
+fn shell_command_intent(input: &Value) -> CommandIntent {
     let Some(program) = input.get("program").and_then(Value::as_str) else {
-        return false;
+        return CommandIntent::Unknown;
     };
-    let program =
-        std::path::Path::new(program).file_name().and_then(|name| name.to_str()).unwrap_or(program);
-    if matches!(program, "rustc" | "clippy-driver") {
-        return true;
-    }
-    if program != "cargo" {
-        return false;
-    }
-    input.get("args").and_then(Value::as_array).is_some_and(|args| {
-        args.iter().filter_map(Value::as_str).any(|command| {
-            matches!(command, "check" | "test" | "clippy" | "fmt" | "build" | "bench")
-        })
-    })
+    let args = input
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    classify_command(program, &args)
+}
+
+fn shell_command_display(input: &Value) -> Option<String> {
+    let program = input.get("program")?.as_str()?;
+    let args = input
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
+    Some(
+        crate::PlannedCommand {
+            program: program.to_owned(),
+            args,
+            cwd: input.get("cwd").and_then(Value::as_str).unwrap_or("").to_owned(),
+            scope: String::new(),
+        }
+        .workflow_key(),
+    )
 }
 
 fn verification_passed(name: &str, result: &ToolResult) -> bool {

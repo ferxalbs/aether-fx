@@ -4,10 +4,12 @@ members = [
     "crates/aether",
     "crates/aether-core",
     "crates/aether-agent",
+    "crates/aether-eval",
     "crates/aether-rainy",
     "crates/aether-tools",
     "crates/aether-terminal",
 ]
+exclude = ["evals/fixtures"]
 default-members = ["crates/aether"]
 
 [workspace.package]

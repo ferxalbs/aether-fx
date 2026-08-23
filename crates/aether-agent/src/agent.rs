@@ -13,7 +13,10 @@ use tokio::sync::mpsc;
 
 use crate::context::{ContextEngine, capture_git_snapshot};
 use crate::scheduler::{ToolCallGate, execute_tool_calls_with_gate};
-use crate::{BackendError, CancellationToken, ModelBackend, NoPermissionBroker, PermissionBroker};
+use crate::{
+    BackendError, CancellationToken, LoopGuardrails, ModelBackend, NoPermissionBroker,
+    PermissionBroker,
+};
 
 /// A user-requested agent turn.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -146,6 +149,7 @@ where
             assemble_user_input(&request.prompt, self.context_packet(continuation.is_some()));
         let mut steps = 0_u16;
         let mut reconstructed = false;
+        let mut guardrails = LoopGuardrails::new();
 
         loop {
             if cancellation.is_cancelled() {
@@ -267,7 +271,11 @@ where
                 });
             }
 
-            let gate = WorkflowMutationGate { snapshot: self.current_context() };
+            let snapshot = self.current_context();
+            let gate = AgentToolGate {
+                workflow: WorkflowMutationGate { snapshot: snapshot.clone() },
+                guardrails: &guardrails,
+            };
             let completed = execute_tool_calls_with_gate(
                 self.tools.as_ref(),
                 tool_calls,
@@ -282,7 +290,10 @@ where
                 let name = completed.name;
                 let tool_input = completed.input;
                 let result = completed.result;
+                let before = self.current_context().workflow;
                 self.with_context(|engine| engine.observe_tool(&name, &tool_input, &result));
+                let after = self.current_context().workflow;
+                let feedback = guardrails.observe(&name, &tool_input, &result, &before, &after);
                 outputs.push(json!({
                     "type": "function_call_output",
                     "call_id": result.call_id.as_str(),
@@ -294,6 +305,9 @@ where
                         "retryable": error.retryable,
                     })),
                 }));
+                if let Some(feedback) = feedback {
+                    outputs.push(json!({"type":"message","role":"developer","content":feedback}));
+                }
             }
             input = serde_json::Value::Array(outputs);
         }
@@ -339,6 +353,24 @@ where
 
 struct WorkflowMutationGate {
     snapshot: ContextSnapshot,
+}
+
+struct AgentToolGate<'a> {
+    workflow: WorkflowMutationGate,
+    guardrails: &'a LoopGuardrails,
+}
+
+impl ToolCallGate for AgentToolGate<'_> {
+    fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult> {
+        self.guardrails
+            .preflight(
+                invocation.call_id.clone(),
+                &invocation.name,
+                &invocation.input,
+                self.workflow.snapshot.workflow.workspace_revision,
+            )
+            .or_else(|| self.workflow.preflight(invocation))
+    }
 }
 
 impl ToolCallGate for WorkflowMutationGate {

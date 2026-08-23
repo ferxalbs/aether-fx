@@ -1,5 +1,57 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (8) - Deterministic coding-agent evaluations
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added five isolated Rust coding fixtures covering targeted repair, repository navigation,
+  multi-file edits, failed-first recovery, redundant-read avoidance, and focused verification.
+- Added an offline deterministic evaluation runner with replaceable model integration, bounded
+  step and tool budgets, clean workspace copies, machine-readable JSON, and compact summaries.
+
+### Performance
+
+- CI regression gates now cover evaluation correctness, model steps, executed tool calls, and
+  context bytes while reporting wall time and harness overhead without unstable timing gates.
+
+## Unreleased - 2026-08-23 (7) - Deterministic loop guardrails
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Agent turns reuse bounded successful read, search, find, list, and verification observations
+  within the same workspace revision and emit compact feedback for redundant or no-progress work.
+- Successful required verification with no unresolved failures emits a deterministic completion
+  signal, while failures, changed arguments, and workspace revisions remain retryable.
+
+### Performance
+
+- Added fingerprint lookup and progress-state update benchmarks for the loop guardrail hot path.
+
+## Unreleased - 2026-08-23 (6) - Focused verification planning
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Modified Rust, Node.js, and Python packages now receive deterministic focused verification
+  plans, ordered from targeted tests through package-scoped checks with a safe unsupported-repo
+  fallback.
+- Bounded workflow state tracks required commands, affected scope, workspace revision, outcomes,
+  and stale results; later mutations invalidate earlier verification.
+
+### Changed
+
+- Direct process commands are conservatively classified as verification, mutation, or unknown,
+  preventing ambiguous shell commands from satisfying workflow completion.
+
+### Performance
+
+- Added benchmarks for verification planning and direct command classification.
+
 ## Unreleased - 2026-08-23 (5) - Repository-aware coding workflow
 
 > Status: unreleased work. No artifact has been published.

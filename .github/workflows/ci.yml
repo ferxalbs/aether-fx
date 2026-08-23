@@ -42,6 +42,11 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Deterministic coding-agent evaluations
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo run --locked -p aether-eval -- target/aether-eval-results.json
+
       - name: Nextest
         run: |
           cargo install --locked --version 0.9.143 cargo-nextest
