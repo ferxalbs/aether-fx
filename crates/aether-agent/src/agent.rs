@@ -264,7 +264,8 @@ where
             }
 
             let completed =
-                execute_tool_calls(&self.tools, tool_calls, &events, &cancellation, broker).await?;
+                execute_tool_calls(self.tools.as_ref(), tool_calls, &events, &cancellation, broker)
+                    .await?;
             let mut outputs = Vec::with_capacity(completed.len());
             for completed in completed {
                 let name = completed.name;

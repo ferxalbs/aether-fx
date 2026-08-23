@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use aether_agent::{
     Agent, AgentRequest, BackendError, BackendFuture, CancellationToken, ModelBackend,
+    schedule_ready_calls,
 };
 use aether_core::{
     ModelEvent, ModelRequest, PermissionClass, ToolDefinition, ToolExecutionContext, ToolExecutor,
@@ -131,13 +132,53 @@ fn benchmark_agent(c: &mut Criterion, calls: usize, name: &str) {
     });
 }
 
-fn scheduler_overhead(c: &mut Criterion) {
-    benchmark_agent(c, 1, "scheduler_overhead_single_call");
+fn pure_scheduler_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scheduler_overhead_pure");
+    for calls in [1_usize, 2, 4] {
+        let footprints = (0..calls)
+            .map(|index| ToolFootprint::read_workspace(vec![format!("ready-{index}")]))
+            .collect::<Vec<_>>();
+        let name = format!("ready_independent_{calls}");
+        let mut selected = [usize::MAX; 4];
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let count =
+                    schedule_ready_calls(std::hint::black_box(&footprints), 4, &mut selected);
+                std::hint::black_box(count);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn end_to_end_scheduler(c: &mut Criterion) {
+    benchmark_agent(c, 1, "agent_turn_end_to_end_one_tool");
 }
 
 fn parallel_independent_tools(c: &mut Criterion) {
     benchmark_agent(c, 8, "parallel_independent_tool_execution");
 }
 
-criterion_group!(benches, scheduler_overhead, parallel_independent_tools);
+fn tokio_fixture_latency(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("benchmark runtime");
+    c.bench_function("fixture_sleep_2ms_with_tokio_wakeup", |bencher| {
+        bencher.iter(|| {
+            runtime.block_on(async {
+                sleep(Duration::from_millis(2)).await;
+                std::hint::black_box(());
+            });
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    pure_scheduler_overhead,
+    end_to_end_scheduler,
+    parallel_independent_tools,
+    tokio_fixture_latency
+);
 criterion_main!(benches);

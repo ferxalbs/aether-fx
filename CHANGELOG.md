@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (2) - Low-overhead tool scheduling
+
+> Status: unreleased work. No artifact has been published.
+
+### Performance
+
+- Ready-call selection uses caller-owned fixed buffers and active tool futures are
+  polled directly, removing per-batch scheduler vectors, task spawning, and joins.
+- Scheduler benchmarks now distinguish pure selection from end-to-end agent execution
+  and the 2 ms Tokio-backed fixture.
+
 ## Unreleased - 2026-08-23 (1) - Dependency-aware tool execution
 
 > Status: unreleased work. No artifact has been published.

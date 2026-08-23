@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, task::Poll};
 
 use aether_core::{
     AgentEvent, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit, PermissionDecision,
     ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResult,
 };
 use serde_json::Value;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::mpsc;
 
 use crate::agent::send_event;
 use crate::{AgentError, CancellationToken, PermissionBroker};
@@ -14,17 +14,17 @@ use crate::{AgentError, CancellationToken, PermissionBroker};
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
 const MAX_TOOL_CALLS_PER_STEP: usize = 64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CallState {
-    Pending,
-    Done,
-}
-
 struct ScheduledCall {
     invocation: ToolInvocation,
     permit: Option<ExecutionPermit>,
     footprint: ToolFootprint,
     permission: String,
+}
+
+struct CompletedCall {
+    call_id: aether_core::ToolCallId,
+    name: String,
+    input: Value,
 }
 
 /// A completed tool result with the original invocation needed for context observation.
@@ -34,52 +34,58 @@ pub(crate) struct ScheduledToolResult {
     pub(crate) result: ToolResult,
 }
 
+/// Select a conservative prefix of ready calls without allocating or waiting.
+pub fn schedule_ready_calls(
+    footprints: &[ToolFootprint],
+    max_parallel: usize,
+    selected: &mut [usize],
+) -> usize {
+    let limit = max_parallel.min(selected.len());
+    let mut count = 0;
+    for index in 0..footprints.len() {
+        if count == limit {
+            break;
+        }
+        if selected[..count].iter().any(|&prior| footprints[index].conflicts(&footprints[prior])) {
+            break;
+        }
+        selected[count] = index;
+        count += 1;
+    }
+    count
+}
+
 /// Resolve permissions, schedule safe calls, and return deterministic model output.
 pub async fn execute_tool_calls<T, P>(
-    tools: &Arc<T>,
+    tools: &T,
     tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
     events: &mpsc::Sender<AgentEvent>,
     cancellation: &CancellationToken,
     broker: &P,
 ) -> Result<Vec<ScheduledToolResult>, AgentError>
 where
-    T: ToolExecutor + 'static,
+    T: ToolExecutor,
     P: PermissionBroker + ?Sized,
 {
-    let calls = prepare_calls(tools, tool_calls, events, cancellation, broker).await?;
-    let mut states = vec![CallState::Pending; calls.len()];
-    let mut results = (0..calls.len()).map(|_| None).collect::<Vec<Option<ToolResult>>>();
+    let mut calls = prepare_calls(tools, tool_calls, events, cancellation, broker).await?;
     let mut completed = 0_usize;
     let mut outputs = Vec::with_capacity(calls.len());
+    let mut selected = [0_usize; DEFAULT_MAX_PARALLEL_TOOLS];
 
     while completed < calls.len() {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
 
-        let mut selected = Vec::with_capacity(DEFAULT_MAX_PARALLEL_TOOLS);
-        for index in 0..calls.len() {
-            if states[index] != CallState::Pending {
-                continue;
-            }
-            if calls[index].permit.is_none() || !blocked_by_pending_conflict(index, &calls, &states)
-            {
-                selected.push(index);
-                if selected.len() == DEFAULT_MAX_PARALLEL_TOOLS {
-                    break;
-                }
-            } else {
-                // Preserve model-order event visibility: a later call is not
-                // admitted around an earlier unresolved dependency.
-                break;
-            }
-        }
-        if selected.is_empty() {
+        let selected_len = select_pending_calls(&calls, &mut selected);
+        if selected_len == 0 {
             return Err(AgentError::Tool("tool dependency scheduler made no progress".to_owned()));
         }
 
-        for &index in &selected {
-            let call = &calls[index];
+        for &index in &selected[..selected_len] {
+            let call = calls[index]
+                .as_ref()
+                .ok_or_else(|| AgentError::Tool("tool scheduler lost a pending call".to_owned()))?;
             send_event(
                 events,
                 AgentEvent::ToolStarted {
@@ -93,12 +99,29 @@ where
             .await?;
         }
 
-        let mut handles = Vec::with_capacity(selected.len());
-        for &index in &selected {
-            let call = &calls[index];
-            let Some(permit) = call.permit.clone() else {
-                results[index] = Some(ToolResult::failure(
-                    call.invocation.call_id.clone(),
+        let mut futures = std::array::from_fn(|_| None);
+        let mut batch_results = std::array::from_fn(|_| None);
+        let mut metadata: [Option<CompletedCall>; DEFAULT_MAX_PARALLEL_TOOLS] =
+            std::array::from_fn(|_| None);
+        for (slot, &index) in selected[..selected_len].iter().enumerate() {
+            let call = calls[index].take().ok_or_else(|| {
+                AgentError::Tool("tool scheduler lost a selected call".to_owned())
+            })?;
+            let ScheduledCall { invocation, permit, .. } = call;
+            let completed_call = CompletedCall {
+                call_id: invocation.call_id.clone(),
+                name: invocation.name.clone(),
+                input: invocation.input.clone(),
+            };
+            metadata[slot] = Some(completed_call);
+            let Some(permit) = permit else {
+                let call_id = metadata[slot]
+                    .as_ref()
+                    .expect("metadata inserted for every selected call")
+                    .call_id
+                    .clone();
+                batch_results[slot] = Some(ToolResult::failure(
+                    call_id,
                     "permission_denied",
                     "user denied permission for this operation",
                     false,
@@ -106,97 +129,122 @@ where
                 ));
                 continue;
             };
-            let tools = Arc::clone(tools);
-            let invocation = call.invocation.clone();
-            let tool_cancellation = cancellation.flag();
-            handles.push((
-                index,
-                tokio::spawn(async move {
-                    tools
-                        .execute(invocation, ToolExecutionContext::new(tool_cancellation, permit))
-                        .await
-                }),
-            ));
-        }
-
-        for position in 0..handles.len() {
-            let wait = wait_for_tool(&mut handles[position].1, cancellation).await;
-            if wait.is_err() {
-                for (_, active) in &mut handles {
-                    active.abort();
+            let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tools.execute(invocation, ToolExecutionContext::new(cancellation.flag(), permit))
+            }));
+            match future {
+                Ok(future) => futures[slot] = Some(future),
+                Err(_) => {
+                    let call_id = metadata[slot]
+                        .as_ref()
+                        .expect("metadata inserted for every selected call")
+                        .call_id
+                        .clone();
+                    batch_results[slot] = Some(tool_panic_result(call_id));
                 }
-                return Err(AgentError::Cancelled);
             }
-            let result = match wait.unwrap_or_else(|_| unreachable!()) {
-                Ok(result) => result,
-                Err(error) => ToolResult::failure(
-                    calls[handles[position].0].invocation.call_id.clone(),
-                    "operation_failed",
-                    format!("tool task failed: {error}"),
-                    false,
-                    DEFAULT_MAX_OUTPUT_BYTES,
-                ),
-            };
-            results[handles[position].0] = Some(result);
         }
 
-        for &index in &selected {
-            states[index] = CallState::Done;
-            completed += 1;
-            let call = &calls[index];
-            let result = results[index]
+        wait_for_batch(&mut futures, &mut batch_results, &metadata, selected_len, cancellation)
+            .await?;
+
+        for slot in 0..selected_len {
+            let metadata = metadata[slot]
+                .take()
+                .ok_or_else(|| AgentError::Tool("tool scheduler lost call metadata".to_owned()))?;
+            let result = batch_results[slot]
                 .take()
                 .ok_or_else(|| AgentError::Tool("tool scheduler lost a result".to_owned()))?;
+            completed += 1;
             send_event(
                 events,
                 AgentEvent::ToolOutput {
-                    call_id: call.invocation.call_id.clone(),
+                    call_id: metadata.call_id.clone(),
                     output: result.output.clone(),
                 },
             )
             .await?;
             send_event(
                 events,
-                AgentEvent::ToolFinished {
-                    call_id: call.invocation.call_id.clone(),
-                    ok: result.ok,
-                },
+                AgentEvent::ToolFinished { call_id: metadata.call_id.clone(), ok: result.ok },
             )
             .await?;
-            outputs.push((index, result));
+            outputs.push((metadata, result));
         }
     }
 
-    outputs.sort_unstable_by_key(|(index, _)| *index);
     Ok(outputs
         .into_iter()
-        .map(|(index, result)| ScheduledToolResult {
-            name: calls[index].invocation.name.clone(),
-            input: calls[index].invocation.input.clone(),
+        .map(|(metadata, result)| ScheduledToolResult {
+            name: metadata.name,
+            input: metadata.input,
             result,
         })
         .collect())
 }
 
-async fn wait_for_tool(
-    handle: &mut JoinHandle<ToolResult>,
+async fn wait_for_batch<'a>(
+    futures: &mut [Option<aether_core::tools::ToolFuture<'a>>; DEFAULT_MAX_PARALLEL_TOOLS],
+    results: &mut [Option<ToolResult>; DEFAULT_MAX_PARALLEL_TOOLS],
+    metadata: &[Option<CompletedCall>; DEFAULT_MAX_PARALLEL_TOOLS],
+    count: usize,
     cancellation: &CancellationToken,
-) -> Result<Result<ToolResult, tokio::task::JoinError>, ()> {
-    tokio::select! {
-        _ = cancellation.cancelled() => Err(()),
-        result = handle => Ok(result),
-    }
+) -> Result<(), AgentError> {
+    let cancellation_wait = cancellation.cancelled();
+    tokio::pin!(cancellation_wait);
+    std::future::poll_fn(|cx| {
+        if cancellation.is_cancelled() || cancellation_wait.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(AgentError::Cancelled));
+        }
+
+        let mut pending = false;
+        for slot in 0..count {
+            let Some(future) = futures[slot].as_mut() else {
+                continue;
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Pin::new(future).poll(cx)
+            })) {
+                Ok(Poll::Ready(result)) => {
+                    results[slot] = Some(result);
+                    futures[slot] = None;
+                }
+                Ok(Poll::Pending) => pending = true,
+                Err(_) => {
+                    let call_id = metadata[slot]
+                        .as_ref()
+                        .expect("metadata inserted for every selected call")
+                        .call_id
+                        .clone();
+                    results[slot] = Some(tool_panic_result(call_id));
+                    futures[slot] = None;
+                }
+            }
+        }
+        if pending { Poll::Pending } else { Poll::Ready(Ok(())) }
+    })
+    .await
+}
+
+fn tool_panic_result(call_id: aether_core::ToolCallId) -> ToolResult {
+    ToolResult::failure(
+        call_id,
+        "operation_failed",
+        "tool task panicked",
+        false,
+        DEFAULT_MAX_OUTPUT_BYTES,
+    )
 }
 
 async fn prepare_calls<T, P>(
-    tools: &Arc<T>,
+    tools: &T,
     tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
     events: &mpsc::Sender<AgentEvent>,
     cancellation: &CancellationToken,
     broker: &P,
-) -> Result<Vec<ScheduledCall>, AgentError>
+) -> Result<Vec<Option<ScheduledCall>>, AgentError>
 where
-    T: ToolExecutor + 'static,
+    T: ToolExecutor,
     P: PermissionBroker + ?Sized,
 {
     if tool_calls.len() > MAX_TOOL_CALLS_PER_STEP {
@@ -211,6 +259,7 @@ where
         }
         let invocation =
             ToolInvocation { call_id: call_id.clone(), name: name.clone(), input: arguments };
+        let class = definition_class(tools, &name);
         let permission_request = tools.permission_request(&invocation);
         let permit = if let Some(permission_request) = permission_request {
             let needs_prompt = broker.needs_prompt(&permission_request);
@@ -247,13 +296,12 @@ where
                 PermissionDecision::Deny => None,
             }
         } else {
-            let class = definition_class(tools.as_ref(), &name);
             Some(ExecutionPermit::new(call_id.clone(), name.clone(), class))
         };
-        let permission = definition_class(tools.as_ref(), &name).to_string();
+        let permission = class.to_string();
         let footprint =
             if permit.is_some() { tools.footprint(&invocation) } else { ToolFootprint::empty() };
-        calls.push(ScheduledCall { invocation, permit, footprint, permission });
+        calls.push(Some(ScheduledCall { invocation, permit, footprint, permission }));
     }
     Ok(calls)
 }
@@ -270,19 +318,38 @@ fn definition_class<T: ToolExecutor + ?Sized>(
         .unwrap_or(aether_core::PermissionClass::ReadOnly)
 }
 
-fn blocked_by_pending_conflict(
-    index: usize,
-    calls: &[ScheduledCall],
-    states: &[CallState],
-) -> bool {
+fn blocked_by_pending_conflict(index: usize, calls: &[Option<ScheduledCall>]) -> bool {
     (0..index).any(|prior| {
-        states[prior] == CallState::Pending
-            && calls[index].footprint.conflicts(&calls[prior].footprint)
+        let Some(prior_call) = calls[prior].as_ref() else {
+            return false;
+        };
+        calls[index].as_ref().is_some_and(|call| call.footprint.conflicts(&prior_call.footprint))
     })
 }
 
-#[allow(dead_code)]
-fn _join_handle_type_is_used(_: JoinHandle<ToolResult>) {}
+fn select_pending_calls(
+    calls: &[Option<ScheduledCall>],
+    selected: &mut [usize; DEFAULT_MAX_PARALLEL_TOOLS],
+) -> usize {
+    let mut count = 0;
+    for index in 0..calls.len() {
+        if count == DEFAULT_MAX_PARALLEL_TOOLS {
+            break;
+        }
+        let Some(call) = calls[index].as_ref() else {
+            continue;
+        };
+        if call.permit.is_none() || !blocked_by_pending_conflict(index, calls) {
+            selected[count] = index;
+            count += 1;
+        } else {
+            // Preserve model-order event visibility: a later call is not
+            // admitted around an earlier unresolved dependency.
+            break;
+        }
+    }
+    count
+}
 
 #[cfg(test)]
 mod tests {
@@ -421,6 +488,18 @@ mod tests {
         )
     }
 
+    #[test]
+    fn pure_scheduler_selects_ready_independent_prefix_without_crossing_conflict() {
+        let footprints = [
+            ToolFootprint::read_workspace(vec!["one".to_owned()]),
+            ToolFootprint::read_workspace(vec!["two".to_owned()]),
+            ToolFootprint::exclusive_workspace(),
+        ];
+        let mut selected = [usize::MAX; DEFAULT_MAX_PARALLEL_TOOLS];
+        assert_eq!(schedule_ready_calls(&footprints, 4, &mut selected), 2);
+        assert_eq!(&selected[..2], &[0, 1]);
+    }
+
     async fn run_scheduler(
         tools: TestTools,
         calls: Vec<(aether_core::ToolCallId, String, Value)>,
@@ -429,7 +508,8 @@ mod tests {
         let tools = Arc::new(tools);
         let (sender, mut receiver) = mpsc::channel(128);
         let result =
-            execute_tool_calls(&tools, calls, &sender, cancellation, &NoPermissionBroker).await;
+            execute_tool_calls(tools.as_ref(), calls, &sender, cancellation, &NoPermissionBroker)
+                .await;
         while receiver.try_recv().is_ok() {}
         result
     }
@@ -543,7 +623,7 @@ mod tests {
         let tools = Arc::new(TestTools::new());
         let (sender, mut receiver) = mpsc::channel(32);
         execute_tool_calls(
-            &tools,
+            tools.as_ref(),
             vec![call(1, "read", "one", 30), call(2, "read", "two", 1)],
             &sender,
             &CancellationToken::new(),

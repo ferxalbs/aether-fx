@@ -21,6 +21,7 @@ pub use fake::{FakeBackend, FakeToolCall};
 pub use permission::{
     NoPermissionBroker, PermissionBroker, PermissionFuture, SessionPermissionBroker,
 };
+pub use scheduler::{DEFAULT_MAX_PARALLEL_TOOLS, schedule_ready_calls};
 pub use session::{
     PersistTurn, ResumableSession, SessionStore, SessionStoreError, SessionSummary, persist_turn,
 };
