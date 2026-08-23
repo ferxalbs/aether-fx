@@ -204,7 +204,7 @@ fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read".to_owned(),
-            description: "Read one or more bounded workspace files with optional line ranges.".to_owned(),
+            description: "Read targeted workspace file ranges. Do not reread unchanged inspected files; prefer line ranges over whole files.".to_owned(),
             permission: PermissionClass::ReadOnly,
             input_schema: json!({
                 "type": "object",
@@ -224,7 +224,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list".to_owned(),
-            description: "List bounded workspace directory entries with depth and ignore controls.".to_owned(),
+            description: "List bounded workspace directory entries. Start discovery here or with find; do not scan the whole repository.".to_owned(),
             permission: PermissionClass::ReadOnly,
             input_schema: json!({
                 "type": "object",
@@ -240,7 +240,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "find".to_owned(),
-            description: "Find workspace paths by one or more glob patterns.".to_owned(),
+            description: "Find workspace paths by glob. Use before search or read; do not preload every file.".to_owned(),
             permission: PermissionClass::ReadOnly,
             input_schema: json!({
                 "type": "object",
@@ -257,7 +257,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "search".to_owned(),
-            description: "Search bounded workspace text using literal or regular-expression patterns.".to_owned(),
+            description: "Search bounded workspace text after find/list. Follow with targeted reads of matching ranges.".to_owned(),
             permission: PermissionClass::ReadOnly,
             input_schema: json!({
                 "type": "object",
@@ -279,7 +279,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "write".to_owned(),
-            description: "Atomically create or replace one bounded workspace file with an optional hash precondition.".to_owned(),
+            description: "Atomically create or replace one bounded workspace file. Inspect git status/diff first and pass expected_hash when replacing.".to_owned(),
             permission: PermissionClass::WorkspaceWrite,
             input_schema: json!({
                 "type": "object",
@@ -295,7 +295,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "patch".to_owned(),
-            description: "Apply strict, preconditioned unified-style line hunks to multiple files.".to_owned(),
+            description: "Apply strict preconditioned hunks. Inspect git status/diff first and do not overwrite unrelated user changes.".to_owned(),
             permission: PermissionClass::WorkspaceWrite,
             input_schema: json!({
                 "type": "object",
@@ -363,7 +363,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "git".to_owned(),
-            description: "Run bounded read-only Git status, diff, show, log, and branch inspection.".to_owned(),
+            description: "Inspect read-only git status, diff, branch, and recent changes before mutating files.".to_owned(),
             permission: PermissionClass::ReadOnly,
             input_schema: json!({
                 "type": "object",

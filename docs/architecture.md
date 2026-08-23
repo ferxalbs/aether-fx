@@ -32,6 +32,7 @@ agent runtime
   ├── cancellation token + std-only cancellation flag
   ├── permission broker + session grants
   ├── stable SessionId / TurnId and opaque continuation
+  ├── bounded context engine + JSONL SessionStore
   └── one RainyBackend instance per session
 tool executor
   ├── execution permit bound to call_id + tool + permission class
@@ -50,9 +51,9 @@ Rainy adapter
   └── verified terminal Responses events and opaque continuation data
 ```
 
-`aether-core` owns IDs, bounded values, typed errors, paths, permissions, events, and model/tool request primitives. It has no terminal, Rainy, or platform dependency.
+`aether-core` owns IDs, bounded values, typed errors, paths, permissions, events, context snapshot types, and model/tool request primitives. It has no terminal, Rainy, or platform dependency.
 
-`aether-agent` owns the backend-neutral turn loop, cancellation, permission handshake, continuation, and session state. Its `ModelBackend` contract uses bounded Tokio channels and does not expose Rainy types. Interactive turns reuse the agent, tool registry, process registry, permission grants, and backend; cancellation returns control to the next prompt without destroying established session processes. A permission prompt reports terminal cancellation separately from an ordinary denial, so Ctrl+C cancels the whole turn and cannot become a model-visible denial.
+`aether-agent` owns the backend-neutral turn loop, cancellation, permission handshake, continuation, bounded context engine, and local JSONL session store. Its `ModelBackend` contract uses bounded Tokio channels and does not expose Rainy types. Interactive turns reuse the agent, tool registry, process registry, permission grants, backend, and working context; cancellation returns control to the next prompt without destroying established session processes. A permission prompt reports terminal cancellation separately from an ordinary denial, so Ctrl+C cancels the whole turn and cannot become a model-visible denial. Session append/replay/compact run in `spawn_blocking` so the current-thread control task does not perform session I/O.
 
 `aether-rainy` is the only crate that imports `rainy_sdk`. It maps the SDK's dynamic Responses stream values into AETHER `ModelEvent` values and treats provider reasoning metadata as opaque continuation data. A successful `ModelEvent::Done` requires a verified `response.completed` event and a response identity; failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No provider endpoint, model catalog, or key appears elsewhere.
 
@@ -62,4 +63,21 @@ Rainy adapter
 
 There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in this bootstrap.
 
-The existing bounded JSONL `SessionStore` remains an opt-in persistence primitive; Phase 1 interactive continuity is in-process and does not call its synchronous replay/append methods from the Tokio control task. Full resume is intentionally unsupported.
+Local sessions are versioned JSONL files under `<workspace>/.aether/sessions/<session-id>.jsonl`. The schema is `SESSION_SCHEMA_VERSION` 2 and stores session identity, bounded turn history, sanitized Rainy continuation (`previous_response_id` only), model, workspace root, context metadata, and compact tool summaries. `aether resume <session-id>` restores that file, re-hashes inspected files against the live workspace, and continues the semantic session. Raw tool output, environment secrets, and chain-of-thought are not persisted.
+
+Context bounds (also documented on the constants in `aether-core::context`):
+
+| Limit | Value |
+| --- | ---: |
+| Session file size | 2 MiB |
+| Session JSONL line | 256 KiB |
+| Session lines | 4,096 |
+| Stored turns | 64 |
+| Tool summaries | 32 |
+| Context items / modified paths | 48 |
+| Inspected files | 64 |
+| File excerpts | 16 |
+| Excerpt size | 4 KiB |
+| Compact summary | 2 KiB |
+| Git snapshot | 4 KiB |
+| Context packet | 24 KiB |

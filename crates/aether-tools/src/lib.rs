@@ -427,7 +427,7 @@ mod tests {
             if !status.data.unwrap()["running"].as_bool().unwrap_or(false) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let mut dropped_bytes = 0;
         for number in 0..16 {

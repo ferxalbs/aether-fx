@@ -5,12 +5,15 @@ use std::{
     process::ExitCode,
 };
 
+use std::sync::{Arc, Mutex};
+
 use aether_agent::{
     Agent, AgentError, AgentRequest, AgentRunResult, CancellationToken, ModelBackend,
-    NoPermissionBroker, PermissionBroker, SessionPermissionBroker,
+    NoPermissionBroker, PermissionBroker, PersistTurn, SessionPermissionBroker, SessionStore,
+    SessionStoreError, persist_turn,
 };
 use aether_core::{
-    AgentEvent, BoundedText, OpaqueContinuation, PermissionRequest, SessionId, ToolExecutor, TurnId,
+    AgentEvent, BoundedText, PermissionRequest, SessionId, SessionRecord, ToolExecutor, TurnId,
 };
 use aether_rainy::RainyBackend;
 use aether_terminal::Renderer;
@@ -31,6 +34,8 @@ enum AppError {
     Lexopt(#[from] lexopt::Error),
     #[error(transparent)]
     Agent(#[from] AgentError),
+    #[error(transparent)]
+    Session(#[from] SessionStoreError),
     #[error("runtime initialization failed: {0}")]
     Runtime(String),
 }
@@ -74,11 +79,11 @@ fn run() -> Result<(), AppError> {
         }
         Command::Doctor => doctor(&cli.root),
         Command::Models => with_runtime(|runtime| runtime.block_on(models())),
-        Command::Resume(session) => Err(AppError::Message(format!(
-            "resume is not implemented in bootstrap (requested session {session})"
-        ))),
+        Command::Resume(session) => {
+            with_runtime(|runtime| runtime.block_on(run_resume(session, cli.model, cli.root)))
+        }
         Command::Shell => {
-            with_runtime(|runtime| runtime.block_on(run_interactive(cli.model, cli.root)))
+            with_runtime(|runtime| runtime.block_on(run_interactive(cli.model, cli.root, None)))
         }
         Command::Prompt(prompt) => {
             with_runtime(|runtime| runtime.block_on(run_prompt(prompt, cli.model, cli.root)))
@@ -151,7 +156,8 @@ fn print_help() {
     println!(
         "AETHER Fx {VERSION}\n\n\
          Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>\n  aether models\n  aether doctor\n\n\
-         Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  -h, --help    Show help\n  -V, --version Show version"
+         Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  -h, --help    Show help\n  -V, --version Show version\n\n\
+         Sessions are stored as bounded JSONL under <root>/.aether/sessions."
     );
 }
 
@@ -164,6 +170,7 @@ fn doctor(root: &Path) -> Result<(), AppError> {
     );
     println!("telemetry: disabled");
     println!("provider integrations: Rainy SDK only");
+    println!("sessions: {}", SessionStore::directory_for(root).display());
     Ok(())
 }
 
@@ -193,15 +200,22 @@ async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Res
     let tools = new_tool_registry(root.clone()).await?;
     let workspace = tools.workspace().clone();
     let agent = Agent::new(backend, tools);
-    let session_id = SessionId::new(format!("session-{}", std::process::id()))
-        .map_err(|error| AppError::Message(error.to_string()))?;
+    let session_id = new_session_id()?;
+    let store = open_session_store(&root, &session_id).await?;
+    persist_started(&store, &root, Some(model.clone())).await?;
+    announce_session(&session_id, &root);
     let turn_id = TurnId::new(format!("turn-{}-1", std::process::id()))
         .map_err(|error| AppError::Message(error.to_string()))?;
-    let mut request = AgentRequest::new(session_id, turn_id, prompt);
+    let mut request = AgentRequest::new(session_id, turn_id.clone(), prompt.clone());
     request.model = Some(model);
+    request.workspace_root = Some(root.display().to_string());
     let mut renderer = Renderer::new();
     let broker = NoPermissionBroker;
     let turn_result = run_agent_turn(&agent, request, &broker, None, &mut renderer).await;
+    if let Ok(Some(result)) = &turn_result {
+        persist_completed_turn(&store, &turn_id, &prompt, result).await?;
+    }
+    let _ = persist_finished(&store).await;
     let cleanup = workspace.shutdown_processes().await;
     if let Err(error) = turn_result {
         if !cleanup.is_clean() {
@@ -213,21 +227,67 @@ async fn run_prompt(prompt: String, model: Option<String>, root: PathBuf) -> Res
 }
 
 /// Keep the prompt local and visible before constructing the network backend.
-async fn run_interactive(model: Option<String>, root: PathBuf) -> Result<(), AppError> {
-    let Some(mut prompt) = read_prompt().await? else {
-        return Ok(());
+async fn run_interactive(
+    model: Option<String>,
+    root: PathBuf,
+    resume: Option<aether_agent::ResumableSession>,
+) -> Result<(), AppError> {
+    let first_prompt = if resume.is_none() {
+        let Some(prompt) = read_prompt().await? else {
+            return Ok(());
+        };
+        Some(prompt)
+    } else {
+        None
     };
-    let model = configured_model(model)?;
+    let model = match &resume {
+        Some(session) => {
+            configured_model(model.or_else(|| session.model.clone())).or_else(|_| {
+                session.model.clone().ok_or_else(|| {
+                    AppError::Message(
+                        "no model selected; pass --model <id> or set AETHER_MODEL".to_owned(),
+                    )
+                })
+            })?
+        }
+        None => configured_model(model)?,
+    };
     let backend = RainyBackend::from_env().map_err(|error| AppError::Message(error.to_string()))?;
-    let tools = new_tool_registry(root.clone()).await?;
+    let live_root = resume.as_ref().map(|session| session.workspace_root.clone()).unwrap_or(root);
+    let tools = new_tool_registry(live_root.clone()).await?;
     let workspace = tools.workspace().clone();
     let agent = Agent::new(backend, tools);
     let broker = SessionPermissionBroker::new();
-    let session_id = SessionId::new(format!("session-{}", std::process::id()))
-        .map_err(|error| AppError::Message(error.to_string()))?;
-    let mut continuation: Option<OpaqueContinuation> = None;
+    let session_id = match &resume {
+        Some(session) => session.session_id.clone(),
+        None => new_session_id()?,
+    };
+    let store = open_session_store(&live_root, &session_id).await?;
+    if resume.is_none() {
+        persist_started(&store, &live_root, Some(model.clone())).await?;
+    }
+    announce_session(&session_id, &live_root);
+    if let Some(session) = &resume {
+        for warning in &session.warnings {
+            eprintln!("AETHER Fx: {warning}");
+        }
+    }
+    let mut continuation = resume.as_ref().and_then(|session| session.continuation.clone());
+    let mut context_seed = resume.as_ref().map(|session| session.context.clone());
     let mut turn_number = 0_u64;
     let mut renderer = Renderer::new();
+    let mut prompt = if let Some(prompt) = first_prompt {
+        prompt
+    } else {
+        match read_prompt().await? {
+            Some(value) => value,
+            None => {
+                let _ = persist_finished(&store).await;
+                let cleanup = workspace.shutdown_processes().await;
+                return finish_shutdown(cleanup);
+            }
+        }
+    };
 
     let session_result = async {
         loop {
@@ -242,13 +302,18 @@ async fn run_interactive(model: Option<String>, root: PathBuf) -> Result<(), App
             turn_number = turn_number.saturating_add(1);
             let turn_id = TurnId::new(format!("turn-{}-{turn_number}", std::process::id()))
                 .map_err(|error| AppError::Message(error.to_string()))?;
-            let mut request = AgentRequest::new(session_id.clone(), turn_id, prompt);
+            let mut request =
+                AgentRequest::new(session_id.clone(), turn_id.clone(), prompt.clone());
             request.model = Some(model.clone());
             request.continuation = continuation.clone();
+            request.workspace_root = Some(live_root.display().to_string());
+            request.context_seed = context_seed.clone();
             if let Some(result) =
                 run_agent_turn(&agent, request, &broker, Some(&broker), &mut renderer).await?
             {
+                persist_completed_turn(&store, &turn_id, &prompt, &result).await?;
                 continuation = result.continuation;
+                context_seed = Some(result.context);
             }
 
             let Some(next) = read_prompt().await? else {
@@ -259,6 +324,7 @@ async fn run_interactive(model: Option<String>, root: PathBuf) -> Result<(), App
         Ok::<(), AppError>(())
     }
     .await;
+    let _ = persist_finished(&store).await;
     let cleanup = workspace.shutdown_processes().await;
     if !cleanup.is_clean() {
         report_shutdown_failure(&cleanup);
@@ -268,6 +334,33 @@ async fn run_interactive(model: Option<String>, root: PathBuf) -> Result<(), App
         Ok(()) if cleanup.is_clean() => Ok(()),
         Ok(()) => Err(AppError::Message("owned process cleanup failed".to_owned())),
     }
+}
+
+async fn run_resume(session: String, model: Option<String>, root: PathBuf) -> Result<(), AppError> {
+    let session_id =
+        SessionId::new(session).map_err(|error| AppError::Message(error.to_string()))?;
+    let path = SessionStore::path_for(&root, &session_id);
+    if !path.exists() {
+        return Err(AppError::Message(format!(
+            "session {} was not found in {}",
+            session_id,
+            SessionStore::directory_for(&root).display()
+        )));
+    }
+    let restored = tokio::task::spawn_blocking({
+        let path = path.clone();
+        let root = root.clone();
+        move || SessionStore::restore(path, root)
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("session restore worker failed: {error}")))??;
+    if !restored.workspace_root.exists() {
+        return Err(AppError::Message(format!(
+            "workspace {} no longer exists",
+            restored.workspace_root.display()
+        )));
+    }
+    run_interactive(model, root, Some(restored)).await
 }
 
 fn finish_shutdown(report: ProcessShutdownReport) -> Result<(), AppError> {
@@ -316,6 +409,98 @@ fn configured_model_from(
         ));
     };
     Ok(model)
+}
+
+fn new_session_id() -> Result<SessionId, AppError> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    SessionId::new(format!("s-{timestamp}-{}", std::process::id()))
+        .map_err(|error| AppError::Message(error.to_string()))
+}
+
+fn announce_session(session_id: &SessionId, root: &Path) {
+    println!(
+        "session {session_id}  (resume: aether resume {session_id} --root {})",
+        root.display()
+    );
+}
+
+async fn open_session_store(
+    root: &Path,
+    session_id: &SessionId,
+) -> Result<Arc<Mutex<SessionStore>>, AppError> {
+    let path = SessionStore::path_for(root, session_id);
+    let session_id = session_id.clone();
+    let store = tokio::task::spawn_blocking(move || SessionStore::open(path, session_id))
+        .await
+        .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
+    Ok(Arc::new(Mutex::new(store)))
+}
+
+async fn persist_started(
+    store: &Arc<Mutex<SessionStore>>,
+    root: &Path,
+    model: Option<String>,
+) -> Result<(), AppError> {
+    let store = Arc::clone(store);
+    let workspace_root = root.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(None, SessionRecord::Started { workspace_root, model })
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
+    Ok(())
+}
+
+async fn persist_completed_turn(
+    store: &Arc<Mutex<SessionStore>>,
+    turn_id: &TurnId,
+    prompt: &str,
+    result: &AgentRunResult,
+) -> Result<(), AppError> {
+    let store = Arc::clone(store);
+    let turn_id = turn_id.clone();
+    let prompt = prompt.to_owned();
+    let steps = result.steps;
+    let cancelled = result.cancelled;
+    let text = result.text.clone();
+    let context = result.context.clone();
+    let continuation = result.continuation.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_turn(
+            &mut store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            PersistTurn {
+                turn_id: &turn_id,
+                prompt: &prompt,
+                steps,
+                cancelled,
+                text,
+                context: &context,
+                continuation,
+            },
+        )
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
+    Ok(())
+}
+
+async fn persist_finished(store: &Arc<Mutex<SessionStore>>) -> Result<(), AppError> {
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || {
+        store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(None, SessionRecord::Finished)
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
+    Ok(())
 }
 
 async fn run_agent_turn<B, T>(

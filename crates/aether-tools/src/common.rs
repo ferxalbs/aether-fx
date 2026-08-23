@@ -24,7 +24,6 @@ use tokio::{
     task::JoinHandle,
 };
 
-#[cfg(windows)]
 use crate::platform;
 
 pub(crate) const MAX_WALK_ENTRIES: usize = 100_000;
@@ -708,26 +707,47 @@ fn install_without_replacement(
     cancellation: &CancellationFlag,
 ) -> ToolResultInternal<()> {
     cancellation.check()?;
-    match fs::hard_link(&staged.temporary, &staged.destination) {
-        Ok(()) => {
-            // The hard link is the commit point. Removing the same-directory staging name does
-            // not alter the installed destination; if cleanup is unavailable, leave the bounded
-            // temporary artifact rather than reporting a false failed commit.
-            let _ = fs::remove_file(&staged.temporary);
-            Ok(())
-        }
+    match platform::install_exclusive(&staged.destination, &staged.temporary) {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if create_only {
-                Err(ToolInternalError::DestinationExists {
-                    path: staged.destination.display().to_string(),
-                })
-            } else {
-                Err(ToolInternalError::ConcurrentModification {
-                    path: staged.destination.display().to_string(),
-                })
+            no_replace_conflict(create_only, &staged.destination)
+        }
+        Err(error) if should_fallback_to_hard_link(&error) => {
+            match fs::hard_link(&staged.temporary, &staged.destination) {
+                Ok(()) => {
+                    // The hard link is the commit point. Removing the same-directory staging
+                    // name does not alter the installed destination; if cleanup is unavailable,
+                    // leave the bounded temporary artifact rather than reporting a false failed
+                    // commit.
+                    let _ = fs::remove_file(&staged.temporary);
+                    Ok(())
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    no_replace_conflict(create_only, &staged.destination)
+                }
+                Err(error) => Err(error.into()),
             }
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn no_replace_conflict(create_only: bool, destination: &Path) -> ToolResultInternal<()> {
+    if create_only {
+        Err(ToolInternalError::DestinationExists { path: destination.display().to_string() })
+    } else {
+        Err(ToolInternalError::ConcurrentModification { path: destination.display().to_string() })
+    }
+}
+
+fn should_fallback_to_hard_link(error: &io::Error) -> bool {
+    match error.kind() {
+        io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices => true,
+        _ => error.raw_os_error().is_some_and(|code| {
+            // EXDEV, ENOSYS, ENOTSUP/EOPNOTSUPP. Exact values vary by Unix; keep this fallback
+            // narrow so a real AlreadyExists never degrades into replacement.
+            matches!(code, 18 | 38 | 45 | 78 | 95)
+        }),
     }
 }
 
@@ -777,6 +797,18 @@ mod tests {
         let second = buffer.take(64);
         assert_eq!(second.bytes, b"2345");
         assert_eq!(second.dropped_bytes, 4);
+    }
+
+    #[test]
+    fn exclusive_install_creates_missing_destination() {
+        let root = temp_root("exclusive-create");
+        let path = root.join("new.txt");
+        let cancellation = CancellationFlag::new();
+        let staged = stage_replacement(&path, b"created", &cancellation).unwrap();
+        install_replacement(&staged, &FileState::Missing, true, &cancellation).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"created");
+        assert!(!staged.temporary.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

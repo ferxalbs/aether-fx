@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::{
-    MAX_INPUT_BYTES, ToolInternalError, Workspace, bounded_limit, spawn_blocking_tool,
+    MAX_INPUT_BYTES, ToolInternalError, Workspace, bounded_limit, hash_file, spawn_blocking_tool,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -32,6 +32,7 @@ pub struct ReadFile {
     pub binary: bool,
     pub truncated: bool,
     pub bytes_read: usize,
+    pub content_hash: Option<String>,
     pub lines: Vec<ReadLine>,
 }
 
@@ -108,6 +109,7 @@ fn execute_blocking(
                 binary: false,
                 truncated: true,
                 bytes_read: 0,
+                content_hash: None,
                 lines: Vec::new(),
             });
             continue;
@@ -141,7 +143,15 @@ fn execute_blocking(
                 })
                 .collect()
         };
-        files.push(ReadFile { path: relative, binary, truncated, bytes_read: bytes.len(), lines });
+        let content_hash = hash_file(&path, &cancellation).ok();
+        files.push(ReadFile {
+            path: relative,
+            binary,
+            truncated,
+            bytes_read: bytes.len(),
+            content_hash,
+            lines,
+        });
     }
     let output = serde_json::json!({ "files": files, "truncated": remaining == 0 });
     let mut result = aether_core::ToolResult::success_json(call_id, output, limit);

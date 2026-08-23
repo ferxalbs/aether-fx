@@ -21,6 +21,7 @@ name = "aether-agent"
 version = "0.1.0"
 dependencies = [
  "aether-core",
+ "blake3",
  "serde",
  "serde_json",
  "thiserror",
@@ -74,6 +75,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "regex-automata",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",

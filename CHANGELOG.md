@@ -3,6 +3,55 @@
 All notable AETHER Fx changes are recorded here. The project remains
 unreleased, with changes grouped by implementation phase.
 
+## Unreleased - 2026-08-22 (4) - Phase 2 context engine and session continuity
+
+> Status: unreleased Phase 2 work. No artifact has been published.
+
+### Added
+
+- Added a bounded workspace context engine that tracks the current task,
+  inspected and modified files, targeted excerpts, compact tool summaries, git
+  state, and sanitized Rainy continuation without resending full files or raw
+  tool history on every model step.
+- Activated local versioned JSONL sessions under `.aether/sessions` and
+  implemented `aether resume <session-id>` with workspace, schema, path, and
+  stale-hash validation.
+- Added deterministic local tool-result compaction and continuation
+  reconstruction from bounded persisted state when Rainy `previous_response_id`
+  is unusable.
+
+### Changed
+
+- New-file `create_only` installation prefers native exclusive rename
+  (Unix `renameat_with(NOREPLACE)`, Windows `MoveFileExW` without replace) and
+  falls back to hard links only when exclusive rename is unavailable.
+
+### Security
+
+- Session persistence refuses secret-bearing records and stores only opaque
+  continuation identity keys. `create_only` still refuses to replace an
+  existing destination.
+
+### Performance
+
+- Re-ran the existing Criterion suite. Small-file read and session replay
+  are slower in this configuration because `read` now hashes content and
+  session JSONL validates schema v2; remaining statistically flagged
+  changes are recorded in `docs/performance.md`.
+
+### Documentation
+
+- Documented context/session bounds, resume behavior, and remaining
+  filesystems that lack both exclusive rename and hard links.
+
+### Known Limitations
+
+- Filesystems without exclusive no-replace rename or hard links cannot
+  atomically create-if-absent; AETHER fails closed rather than copying over an
+  existing destination.
+- Git awareness remains read-only; working-tree mutation is still out of
+  scope.
+
 ## Unreleased - 2026-08-22 (3) - Phase 1.1 correctness closure
 
 > Status: unreleased Phase 1.1 work. No artifact has been published.

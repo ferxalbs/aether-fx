@@ -4,7 +4,7 @@ AETHER Fx is an experimental, native terminal coding agent written in Rust. It i
 
 ## Status
 
-This repository is in foundational bootstrap. The workspace, runtime boundaries, terminal substrate, nine-tool registry, deterministic fake backend, and Rainy SDK adapter are being established. Incomplete capabilities return explicit errors rather than pretending to work.
+This repository is in foundational bootstrap. The workspace, runtime boundaries, terminal substrate, nine-tool registry, context engine, local JSONL sessions, deterministic fake backend, and Rainy SDK adapter are being established. Incomplete capabilities return explicit errors rather than pretending to work.
 
 ## Why native Rust
 
@@ -28,7 +28,7 @@ cargo test --workspace --all-features --locked
 cargo run -p aether -- --version
 ```
 
-`aether` does not contact Rainy at startup. Inference requires `RAINY_API_KEY`; the key is read from the environment only when an inference operation is requested and is never printed or persisted.
+`aether` does not contact Rainy at startup. Inference requires `RAINY_API_KEY`; the key is read from the environment only when an inference operation is requested and is never printed or persisted. Interactive and one-shot runs write bounded JSONL under `<workspace>/.aether/sessions/`. Resume with `aether resume <session-id>`.
 
 ## Security and licensing
 

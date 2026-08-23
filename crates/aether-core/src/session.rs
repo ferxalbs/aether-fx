@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentEvent, OpaqueContinuation, SessionId, TurnId};
+use crate::{
+    BoundedText, ContextSnapshot, OpaqueContinuation, SessionId, TurnId, persistable_continuation,
+};
 
 /// Version of the append-friendly local JSONL schema.
-pub const SESSION_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_SCHEMA_VERSION: u32 = 2;
 
 /// One versioned line in a local session JSONL file.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -24,16 +26,27 @@ pub struct SessionLine {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionRecord {
-    /// Session header.
-    Started,
-    /// User input.
+    /// Session header with workspace and model identity.
+    Started { workspace_root: String, model: Option<String> },
+    /// Bounded user input.
     UserPrompt { prompt: String },
-    /// A rendered-safe agent event.
-    AgentEvent { event: AgentEvent },
+    /// Compact completed-turn metadata. Raw tool output is not stored.
+    TurnCompleted { steps: u16, cancelled: bool, text: BoundedText },
     /// Opaque backend continuation needed by a later step.
     Continuation { continuation: Option<OpaqueContinuation> },
+    /// Bounded working-context snapshot.
+    ContextSnapshot { context: Box<ContextSnapshot> },
     /// Explicitly closed session.
     Finished,
+}
+
+impl SessionRecord {
+    /// Persist only opaque continuation identity keys.
+    pub fn continuation(continuation: Option<OpaqueContinuation>) -> Self {
+        Self::Continuation {
+            continuation: continuation.as_ref().and_then(persistable_continuation),
+        }
+    }
 }
 
 impl SessionLine {

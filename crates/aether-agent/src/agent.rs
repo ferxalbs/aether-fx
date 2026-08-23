@@ -1,15 +1,17 @@
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use aether_core::{
-    AgentEvent, BoundedText, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit, ModelEvent, ModelRequest,
-    OpaqueContinuation, PermissionDecision, SessionId, StepId, ToolCallId, ToolExecutionContext,
-    ToolExecutor, ToolInvocation, TurnId,
+    AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit,
+    ModelEvent, ModelRequest, OpaqueContinuation, PermissionDecision, SessionId, StepId,
+    ToolCallId, ToolExecutionContext, ToolExecutor, ToolInvocation, TurnId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::context::{ContextEngine, capture_git_snapshot};
 use crate::{BackendError, CancellationToken, ModelBackend, NoPermissionBroker, PermissionBroker};
 
 /// A user-requested agent turn.
@@ -27,6 +29,12 @@ pub struct AgentRequest {
     pub max_steps: u16,
     /// Opaque provider continuation from the preceding external turn.
     pub continuation: Option<OpaqueContinuation>,
+    /// Absolute workspace root used for git snapshots and resume refresh.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// Restored working context for resume or in-process continuity.
+    #[serde(default)]
+    pub context_seed: Option<ContextSnapshot>,
 }
 
 impl AgentRequest {
@@ -39,6 +47,8 @@ impl AgentRequest {
             model: None,
             max_steps: 16,
             continuation: None,
+            workspace_root: None,
+            context_seed: None,
         }
     }
 }
@@ -54,6 +64,8 @@ pub struct AgentRunResult {
     pub cancelled: bool,
     /// Opaque provider continuation for the next external turn.
     pub continuation: Option<OpaqueContinuation>,
+    /// Bounded working context after this turn.
+    pub context: ContextSnapshot,
 }
 
 /// Agent loop failures are typed and secret-free.
@@ -80,6 +92,7 @@ pub enum AgentError {
 pub struct Agent<B, T> {
     backend: Arc<B>,
     tools: Arc<T>,
+    context: Mutex<ContextEngine>,
 }
 
 impl<B, T> Agent<B, T>
@@ -89,7 +102,11 @@ where
 {
     /// Compose one backend and one tool executor.
     pub fn new(backend: B, tools: T) -> Self {
-        Self { backend: Arc::new(backend), tools: Arc::new(tools) }
+        Self {
+            backend: Arc::new(backend),
+            tools: Arc::new(tools),
+            context: Mutex::new(ContextEngine::new(String::new(), None)),
+        }
     }
 
     /// Execute one bounded turn, emitting ordered events into a bounded channel.
@@ -111,9 +128,23 @@ where
         broker: &P,
     ) -> Result<AgentRunResult, AgentError> {
         let mut accumulated = String::new();
-        let mut input = json!([{"type":"message","role":"user","content":request.prompt}]);
+        self.prepare_turn(&request);
+        if let Some(root) = request.workspace_root.clone() {
+            let git =
+                tokio::task::spawn_blocking(move || capture_git_snapshot(&PathBuf::from(root)))
+                    .await
+                    .unwrap_or_else(|_| aether_core::GitSnapshot {
+                        branch: None,
+                        status: BoundedText::new("git snapshot cancelled", 128),
+                        available: false,
+                    });
+            self.with_context(|engine| engine.set_git(git));
+        }
         let mut continuation = request.continuation.clone();
+        let mut input =
+            assemble_user_input(&request.prompt, self.context_packet(continuation.is_some()));
         let mut steps = 0_u16;
+        let mut reconstructed = false;
 
         loop {
             if cancellation.is_cancelled() {
@@ -142,7 +173,31 @@ where
             let backend_future = self.backend.stream_step(model_request);
             let mut stream = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-                result = backend_future => result?,
+                result = backend_future => match result {
+                    Err(error)
+                        if steps == 1
+                            && !reconstructed
+                            && continuation.is_some()
+                            && continuation_unusable(&error) =>
+                    {
+                        continuation = None;
+                        reconstructed = true;
+                        input = assemble_user_input(&request.prompt, Some(self.render_context(true)));
+                        send_event(
+                            &events,
+                            AgentEvent::Warning {
+                                message: BoundedText::new(
+                                    "Rainy continuation was unusable; reconstructed from bounded session state",
+                                    DEFAULT_MAX_OUTPUT_BYTES,
+                                ),
+                            },
+                        )
+                        .await?;
+                        steps = steps.saturating_sub(1);
+                        continue;
+                    }
+                    result => result?,
+                },
             };
             let mut tool_calls = Vec::new();
             loop {
@@ -198,11 +253,13 @@ where
 
             if tool_calls.is_empty() {
                 send_event(&events, AgentEvent::Done).await?;
+                self.with_context(|engine| engine.set_continuation(continuation.clone()));
                 return Ok(AgentRunResult {
                     text: BoundedText::new(accumulated, DEFAULT_MAX_OUTPUT_BYTES),
                     steps,
                     cancelled: false,
                     continuation,
+                    context: self.current_context(),
                 });
             }
 
@@ -283,6 +340,7 @@ where
                     },
                 )
                 .await?;
+                let tool_input = invocation.input.clone();
                 let result = if let Some(permit) = permit {
                     let execution = self.tools.execute(
                         invocation,
@@ -314,6 +372,9 @@ where
                     AgentEvent::ToolFinished { call_id: call_id.clone(), ok: result.ok },
                 )
                 .await?;
+                self.with_context(|engine| {
+                    engine.observe_tool(&name, &tool_input, &result);
+                });
                 outputs.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id.as_str(),
@@ -329,6 +390,56 @@ where
             input = serde_json::Value::Array(outputs);
         }
     }
+
+    fn prepare_turn(&self, request: &AgentRequest) {
+        self.with_context(|engine| {
+            if let Some(seed) = request.context_seed.clone() {
+                *engine = ContextEngine::restore(seed);
+            }
+            if let Some(root) = &request.workspace_root
+                && engine.snapshot().workspace_root.is_empty()
+            {
+                *engine = ContextEngine::new(root, request.model.clone());
+            }
+            engine.set_model(request.model.clone());
+            engine.set_task(&request.prompt);
+            if request.continuation.is_some() {
+                engine.set_continuation(request.continuation.clone());
+            }
+        });
+    }
+
+    fn with_context<R>(&self, operation: impl FnOnce(&mut ContextEngine) -> R) -> R {
+        let mut engine = self.context.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation(&mut engine)
+    }
+
+    fn current_context(&self) -> ContextSnapshot {
+        self.with_context(|engine| engine.snapshot().clone())
+    }
+
+    fn render_context(&self, include_guidance: bool) -> String {
+        self.with_context(|engine| engine.render(include_guidance))
+    }
+
+    fn context_packet(&self, has_continuation: bool) -> Option<String> {
+        self.with_context(|engine| {
+            engine.should_attach_to_prompt(has_continuation).then(|| engine.render(true))
+        })
+    }
+}
+
+fn assemble_user_input(prompt: &str, context_packet: Option<String>) -> serde_json::Value {
+    let content = match context_packet {
+        Some(packet) if !packet.trim().is_empty() => format!("{packet}\n\n{prompt}"),
+        _ => prompt.to_owned(),
+    };
+    json!([{"type":"message","role":"user","content": content}])
+}
+
+fn continuation_unusable(error: &BackendError) -> bool {
+    let message = error.to_string();
+    message.contains("previous_response_id") || message.contains("previous_response")
 }
 
 async fn send_event(
@@ -766,6 +877,89 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct UnusableContinuationBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelBackend for UnusableContinuationBackend {
+        fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if request.continuation.is_some() {
+                    return Err(BackendError::FeatureUnavailable {
+                        feature: "Rainy SDK continuation requires previous_response_id".to_owned(),
+                    });
+                }
+                let (sender, receiver) = mpsc::channel(4);
+                sender
+                    .send(Ok(ModelEvent::TextDelta { text: "reconstructed".to_owned() }))
+                    .await
+                    .map_err(|_| BackendError::Cancelled)?;
+                sender
+                    .send(Ok(ModelEvent::Done { continuation: None }))
+                    .await
+                    .map_err(|_| BackendError::Cancelled)?;
+                Ok(receiver)
+            })
+        }
+
+        fn discover_models<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<ModelCatalogItem>, BackendError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_rainy_continuation_reconstructs_from_bounded_state() {
+        let agent = Agent::new(UnusableContinuationBackend::default(), tools());
+        let mut request = AgentRequest::new(
+            SessionId::new("session-reconstruct").unwrap(),
+            TurnId::new("turn-reconstruct").unwrap(),
+            "continue",
+        );
+        request.continuation =
+            Some(OpaqueContinuation(json!({"previous_response_id": "stale-response"})));
+        request.context_seed = Some(ContextSnapshot::new("/workspace", Some("model-a".to_owned())));
+        let (sender, _receiver) = mpsc::channel(8);
+        let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
+        assert_eq!(result.text.as_str(), "reconstructed");
+        assert!(result.continuation.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_results_are_compacted_into_session_context() {
+        let agent = Agent::new(
+            crate::FakeBackend::new("done")
+                .with_tool_call("read", json!({"files": [{"path": "src/lib.rs"}]})),
+            tools(),
+        );
+        let (sender, _receiver) = mpsc::channel(8);
+        let result = agent
+            .run(
+                AgentRequest::new(
+                    SessionId::new("session-compact").unwrap(),
+                    TurnId::new("turn-compact").unwrap(),
+                    "inspect",
+                ),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.context.tool_summaries.len(), 1);
+        assert_eq!(result.context.tool_summaries[0].tool, "read");
+        assert!(result.context.tool_summaries[0].summary.as_str().contains("read"));
     }
 
     #[tokio::test]
