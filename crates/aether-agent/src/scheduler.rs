@@ -17,6 +17,7 @@ const MAX_TOOL_CALLS_PER_STEP: usize = 64;
 struct ScheduledCall {
     invocation: ToolInvocation,
     permit: Option<ExecutionPermit>,
+    preflight: Option<ToolResult>,
     footprint: ToolFootprint,
     permission: String,
 }
@@ -32,6 +33,21 @@ pub(crate) struct ScheduledToolResult {
     pub(crate) name: String,
     pub(crate) input: Value,
     pub(crate) result: ToolResult,
+}
+
+/// Deterministic pre-execution gate for workflow or composition-root policy.
+pub(crate) trait ToolCallGate {
+    /// Return a typed result when the call must not execute.
+    fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult>;
+}
+
+#[allow(dead_code)]
+struct AllowAllToolCallGate;
+
+impl ToolCallGate for AllowAllToolCallGate {
+    fn preflight(&self, _: &ToolInvocation) -> Option<ToolResult> {
+        None
+    }
 }
 
 /// Select a conservative prefix of ready calls without allocating or waiting.
@@ -56,6 +72,7 @@ pub fn schedule_ready_calls(
 }
 
 /// Resolve permissions, schedule safe calls, and return deterministic model output.
+#[allow(dead_code)]
 pub async fn execute_tool_calls<T, P>(
     tools: &T,
     tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
@@ -67,7 +84,31 @@ where
     T: ToolExecutor,
     P: PermissionBroker + ?Sized,
 {
-    let mut calls = prepare_calls(tools, tool_calls, events, cancellation, broker).await?;
+    execute_tool_calls_with_gate(
+        tools,
+        tool_calls,
+        events,
+        cancellation,
+        broker,
+        &AllowAllToolCallGate,
+    )
+    .await
+}
+
+pub(crate) async fn execute_tool_calls_with_gate<T, P, G>(
+    tools: &T,
+    tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
+    events: &mpsc::Sender<AgentEvent>,
+    cancellation: &CancellationToken,
+    broker: &P,
+    gate: &G,
+) -> Result<Vec<ScheduledToolResult>, AgentError>
+where
+    T: ToolExecutor,
+    P: PermissionBroker + ?Sized,
+    G: ToolCallGate + ?Sized,
+{
+    let mut calls = prepare_calls(tools, tool_calls, events, cancellation, broker, gate).await?;
     let mut completed = 0_usize;
     let mut outputs = Vec::with_capacity(calls.len());
     let mut selected = [0_usize; DEFAULT_MAX_PARALLEL_TOOLS];
@@ -107,13 +148,17 @@ where
             let call = calls[index].take().ok_or_else(|| {
                 AgentError::Tool("tool scheduler lost a selected call".to_owned())
             })?;
-            let ScheduledCall { invocation, permit, .. } = call;
+            let ScheduledCall { invocation, permit, preflight, .. } = call;
             let completed_call = CompletedCall {
                 call_id: invocation.call_id.clone(),
                 name: invocation.name.clone(),
                 input: invocation.input.clone(),
             };
             metadata[slot] = Some(completed_call);
+            if let Some(result) = preflight {
+                batch_results[slot] = Some(result);
+                continue;
+            }
             let Some(permit) = permit else {
                 let call_id = metadata[slot]
                     .as_ref()
@@ -236,16 +281,18 @@ fn tool_panic_result(call_id: aether_core::ToolCallId) -> ToolResult {
     )
 }
 
-async fn prepare_calls<T, P>(
+async fn prepare_calls<T, P, G>(
     tools: &T,
     tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
     events: &mpsc::Sender<AgentEvent>,
     cancellation: &CancellationToken,
     broker: &P,
+    gate: &G,
 ) -> Result<Vec<Option<ScheduledCall>>, AgentError>
 where
     T: ToolExecutor,
     P: PermissionBroker + ?Sized,
+    G: ToolCallGate + ?Sized,
 {
     if tool_calls.len() > MAX_TOOL_CALLS_PER_STEP {
         return Err(AgentError::Tool(
@@ -298,10 +345,14 @@ where
         } else {
             Some(ExecutionPermit::new(call_id.clone(), name.clone(), class))
         };
+        let preflight = permit.as_ref().and_then(|_| gate.preflight(&invocation));
         let permission = class.to_string();
-        let footprint =
-            if permit.is_some() { tools.footprint(&invocation) } else { ToolFootprint::empty() };
-        calls.push(Some(ScheduledCall { invocation, permit, footprint, permission }));
+        let footprint = if permit.is_some() && preflight.is_none() {
+            tools.footprint(&invocation)
+        } else {
+            ToolFootprint::empty()
+        };
+        calls.push(Some(ScheduledCall { invocation, permit, preflight, footprint, permission }));
     }
     Ok(calls)
 }

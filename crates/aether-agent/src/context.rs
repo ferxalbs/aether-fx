@@ -3,8 +3,9 @@ use std::path::Path;
 use aether_core::{
     BoundedText, CONTEXT_GUIDANCE, CompactToolSummary, ContextSnapshot, FileExcerpt, GitSnapshot,
     InspectedFile, LineRange, MAX_CONTEXT_ITEMS, MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES,
-    MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES, MAX_STORED_TOOL_SUMMARIES, MAX_TASK_BYTES,
-    ObservedFileState, OpaqueContinuation, ToolResult, WorkspacePath, compact_tool_result,
+    MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES, MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS,
+    MAX_TASK_BYTES, MAX_WORKFLOW_FIELD_BYTES, ObservedFileState, OpaqueContinuation, ToolResult,
+    WorkflowFailure, WorkflowPhase, WorkflowVerification, WorkspacePath, compact_tool_result,
     merge_line_ranges,
 };
 use serde_json::Value;
@@ -35,6 +36,7 @@ impl ContextEngine {
         snapshot.excerpts.truncate(MAX_FILE_EXCERPTS);
         snapshot.tool_summaries.truncate(MAX_STORED_TOOL_SUMMARIES);
         snapshot.modified.truncate(MAX_CONTEXT_ITEMS);
+        snapshot.workflow.enforce_bounds();
         let repo_map =
             (!snapshot.workspace_root.is_empty()).then(|| RepoMap::new(&snapshot.workspace_root));
         Self { snapshot, repo_map }
@@ -73,6 +75,9 @@ impl ContextEngine {
 
     /// Mark that resume or live observation found workspace drift.
     pub fn set_workspace_changed(&mut self, changed: bool) {
+        if changed && !self.snapshot.workspace_changed {
+            self.reset_workflow_for_workspace_change();
+        }
         self.snapshot.workspace_changed = changed;
     }
 
@@ -83,16 +88,54 @@ impl ContextEngine {
         }
     }
 
+    /// Apply deterministic completion criteria at normal turn termination.
+    pub fn finish_turn(&mut self) -> bool {
+        self.snapshot.workflow.complete_if_ready(&self.snapshot.modified)
+    }
+
     /// Observe a completed tool call and fold it into bounded working state.
     pub fn observe_tool(&mut self, name: &str, input: &Value, result: &ToolResult) {
+        let failure_key = workflow_failure_key(name, input);
+        let focused_verification = self.is_focused_verification(name, input);
+        let mutation = is_workspace_mutation(name);
+        self.snapshot.workflow.progress.note_tool_result();
+        if mutation {
+            self.snapshot.workflow.begin_modification();
+        }
         let summary = compact_tool_result(name, result);
         self.push_summary(summary);
+        self.observe_relevant(name, input, result);
         match name {
             "read" => self.observe_read(result),
             "write" => self.observe_write(input, result),
             "patch" => self.observe_patch(result),
             "git" => self.observe_git(result),
             _ => {}
+        }
+        if result.ok {
+            self.snapshot.workflow.clear_failure(&failure_key);
+        } else {
+            self.record_workflow_failure(&failure_key, name, result);
+        }
+        if mutation && mutation_applied(name, input, result) {
+            self.snapshot.workflow.record_mutation();
+        }
+        if focused_verification {
+            let passed = verification_passed(name, result);
+            self.snapshot.workflow.record_verification(passed);
+            if passed {
+                self.snapshot.workflow.clear_failure(&failure_key);
+            } else {
+                self.snapshot.workflow.record_failure(WorkflowFailure::new(
+                    failure_key,
+                    name,
+                    "verification_failed",
+                    verification_message(result),
+                ));
+            }
+        }
+        if name == "read" && result.ok && read_contains_files(result) {
+            self.snapshot.workflow.record_inspection();
         }
         self.enforce_bounds();
     }
@@ -101,7 +144,9 @@ impl ContextEngine {
     pub fn refresh_against_workspace(&mut self, workspace_root: &Path) -> Vec<String> {
         let mut stale_paths = Vec::new();
         let live_root = workspace_root.display().to_string();
-        if !self.snapshot.workspace_root.is_empty() && self.snapshot.workspace_root != live_root {
+        let root_changed =
+            !self.snapshot.workspace_root.is_empty() && self.snapshot.workspace_root != live_root;
+        if root_changed {
             self.snapshot.workspace_changed = true;
         }
         self.snapshot.workspace_root = live_root;
@@ -145,6 +190,9 @@ impl ContextEngine {
             let stale = stale_paths.iter().cloned().collect::<std::collections::HashSet<_>>();
             self.snapshot.excerpts.retain(|excerpt| !stale.contains(&excerpt.path));
         }
+        if root_changed || !stale_paths.is_empty() {
+            self.reset_workflow_for_workspace_change();
+        }
         self.snapshot.modified.retain(|path| path_is_workspace_relative(path));
         stale_paths
     }
@@ -167,6 +215,7 @@ impl ContextEngine {
                 "workspace_changed: true; treat persisted hashes and excerpts as stale until re-read\n",
             );
         }
+        self.render_workflow(&mut out);
         let repo_metadata = self
             .repo_map
             .as_ref()
@@ -331,6 +380,157 @@ impl ContextEngine {
             return !self.snapshot.is_empty() || !self.snapshot.workspace_root.is_empty();
         }
         self.snapshot.workspace_changed || self.snapshot.inspected.iter().any(|file| file.stale)
+    }
+
+    fn render_workflow(&self, out: &mut String) {
+        let workflow = &self.snapshot.workflow;
+        out.push_str("workflow: phase=");
+        out.push_str(workflow.phase.as_str());
+        out.push_str(" verification=");
+        out.push_str(workflow.verification.as_str());
+        out.push_str(" relevant=");
+        out.push_str(&workflow.relevant_files.len().to_string());
+        out.push_str(" modified=");
+        out.push_str(&self.snapshot.modified.len().to_string());
+        out.push_str(" failures=");
+        out.push_str(&workflow.unresolved_failures.len().to_string());
+        out.push_str(" progress=");
+        out.push_str(&workflow.progress.discoveries.to_string());
+        out.push('/');
+        out.push_str(&workflow.progress.inspections.to_string());
+        out.push('/');
+        out.push_str(&workflow.progress.mutations.to_string());
+        out.push('/');
+        out.push_str(&workflow.progress.verifications.to_string());
+        out.push('\n');
+        if let Some(failure) = workflow.unresolved_failures.last() {
+            out.push_str("workflow_failure: ");
+            out.push_str(failure.tool.as_str());
+            out.push(' ');
+            out.push_str(failure.code.as_str());
+            out.push_str(" — ");
+            out.push_str(failure.message.as_str());
+            out.push('\n');
+        }
+        render_workflow_paths(out, "workflow_relevant", &workflow.relevant_files);
+        render_workflow_paths(out, "workflow_modified", &self.snapshot.modified);
+        let action = match workflow.phase {
+            WorkflowPhase::Discover => "identify relevant files before editing",
+            WorkflowPhase::Inspect => "inspect identified files before editing",
+            WorkflowPhase::Modify => "retry or complete the pending mutation",
+            WorkflowPhase::Verify => "run focused verification for modified files",
+            WorkflowPhase::Complete => "workflow complete",
+        };
+        out.push_str("workflow_action: ");
+        out.push_str(action);
+        out.push('\n');
+    }
+
+    fn reset_workflow_for_workspace_change(&mut self) {
+        self.snapshot.workflow.reset_for_workspace_change();
+        if !self.snapshot.modified.is_empty() {
+            self.snapshot.workflow.verification = WorkflowVerification::Pending;
+        }
+    }
+
+    fn observe_relevant(&mut self, name: &str, input: &Value, result: &ToolResult) {
+        if !result.ok {
+            return;
+        }
+        let Some(data) = result.data.as_ref() else {
+            if name == "write"
+                && let Some(path) = input.get("path").and_then(Value::as_str)
+            {
+                self.record_relevant_path(path);
+            }
+            return;
+        };
+        match name {
+            "list" => {
+                if let Some(entries) = data.get("entries").and_then(Value::as_array) {
+                    for entry in entries {
+                        if entry.get("file_type").and_then(Value::as_str) == Some("file")
+                            && let Some(path) = entry.get("path").and_then(Value::as_str)
+                        {
+                            self.record_relevant_path(path);
+                        }
+                    }
+                }
+            }
+            "find" => {
+                if let Some(paths) = data.get("paths").and_then(Value::as_array) {
+                    for path in paths.iter().filter_map(Value::as_str) {
+                        self.record_relevant_path(path);
+                    }
+                }
+            }
+            "search" => {
+                if let Some(matches) = data.get("matches").and_then(Value::as_array) {
+                    for path in matches.iter().filter_map(|item| item.get("path")) {
+                        if let Some(path) = path.as_str() {
+                            self.record_relevant_path(path);
+                        }
+                    }
+                }
+            }
+            "read" => {
+                if let Some(files) = data.get("files").and_then(Value::as_array) {
+                    for path in files.iter().filter_map(|file| file.get("path")) {
+                        if let Some(path) = path.as_str() {
+                            self.record_relevant_path(path);
+                        }
+                    }
+                }
+            }
+            "write" => {
+                if let Some(path) = data.get("path").and_then(Value::as_str) {
+                    self.record_relevant_path(path);
+                }
+            }
+            "patch" => {
+                if let Some(files) = data.get("files").and_then(Value::as_array) {
+                    for path in files.iter().filter_map(|file| file.get("path")) {
+                        if let Some(path) = path.as_str() {
+                            self.record_relevant_path(path);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_relevant_path(&mut self, path: &str) {
+        if path_is_workspace_relative(path) {
+            self.snapshot.workflow.record_relevant_file(path);
+        }
+    }
+
+    fn record_workflow_failure(&mut self, key: &str, name: &str, result: &ToolResult) {
+        let code = result.error.as_ref().map_or("tool_failed", |error| error.code.as_str());
+        self.snapshot.workflow.record_failure(WorkflowFailure::new(
+            key,
+            name,
+            code,
+            result.error.as_ref().map_or(result.output.as_str(), |error| error.message.as_str()),
+        ));
+    }
+
+    fn is_focused_verification(&self, name: &str, input: &Value) -> bool {
+        if !matches!(
+            self.snapshot.workflow.verification,
+            WorkflowVerification::Pending | WorkflowVerification::Failed
+        ) {
+            return false;
+        }
+        match name {
+            "read" => read_targets_modified(input, &self.snapshot.modified),
+            "git" => {
+                matches!(input.get("operation").and_then(Value::as_str), Some("status" | "diff"))
+            }
+            "shell" => is_verification_command(input),
+            _ => false,
+        }
     }
 
     fn observe_read(&mut self, result: &ToolResult) {
@@ -510,11 +710,149 @@ impl ContextEngine {
         self.snapshot.excerpts.truncate(MAX_FILE_EXCERPTS);
         self.snapshot.tool_summaries.truncate(MAX_STORED_TOOL_SUMMARIES);
         self.snapshot.modified.truncate(MAX_CONTEXT_ITEMS);
+        self.snapshot.workflow.enforce_bounds();
     }
 }
 
 fn path_is_workspace_relative(path: &str) -> bool {
     WorkspacePath::new(path).is_ok()
+}
+
+fn is_workspace_mutation(name: &str) -> bool {
+    matches!(name, "write" | "patch")
+}
+
+fn mutation_applied(name: &str, input: &Value, result: &ToolResult) -> bool {
+    if !result.ok || !is_workspace_mutation(name) {
+        return false;
+    }
+    if name == "patch"
+        && result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("dry_run"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    name == "write"
+        || result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("files"))
+            .and_then(Value::as_array)
+            .is_some_and(|files| !files.is_empty())
+        || input.get("files").and_then(Value::as_array).is_some_and(|files| !files.is_empty())
+}
+
+fn read_contains_files(result: &ToolResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("files"))
+        .and_then(Value::as_array)
+        .is_some_and(|files| !files.is_empty())
+}
+
+fn read_targets_modified(input: &Value, modified: &[String]) -> bool {
+    input.get("files").and_then(Value::as_array).is_some_and(|files| {
+        files
+            .iter()
+            .filter_map(|file| file.get("path").and_then(Value::as_str))
+            .any(|path| modified.iter().any(|modified| modified == path))
+    })
+}
+
+fn is_verification_command(input: &Value) -> bool {
+    let Some(program) = input.get("program").and_then(Value::as_str) else {
+        return false;
+    };
+    let program =
+        std::path::Path::new(program).file_name().and_then(|name| name.to_str()).unwrap_or(program);
+    if matches!(program, "rustc" | "clippy-driver") {
+        return true;
+    }
+    if program != "cargo" {
+        return false;
+    }
+    input.get("args").and_then(Value::as_array).is_some_and(|args| {
+        args.iter().filter_map(Value::as_str).any(|command| {
+            matches!(command, "check" | "test" | "clippy" | "fmt" | "build" | "bench")
+        })
+    })
+}
+
+fn verification_passed(name: &str, result: &ToolResult) -> bool {
+    if !result.ok {
+        return false;
+    }
+    if name == "read" {
+        return read_contains_files(result);
+    }
+    if matches!(name, "shell" | "git") {
+        return result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("success"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+    true
+}
+
+fn verification_message(result: &ToolResult) -> &str {
+    result.error.as_ref().map_or(result.output.as_str(), |error| error.message.as_str())
+}
+
+fn workflow_failure_key(name: &str, input: &Value) -> String {
+    let target = input
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("program").and_then(Value::as_str))
+        .or_else(|| input.get("operation").and_then(Value::as_str))
+        .or_else(|| {
+            input
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(|file| file.get("path"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("operation");
+    let mut key = String::with_capacity(MAX_WORKFLOW_FIELD_BYTES);
+    let bounded_name = BoundedText::new(name, MAX_WORKFLOW_FIELD_BYTES.saturating_sub(1));
+    key.push_str(bounded_name.as_str());
+    if key.len() < MAX_WORKFLOW_FIELD_BYTES {
+        key.push(':');
+    }
+    let remaining = MAX_WORKFLOW_FIELD_BYTES.saturating_sub(key.len());
+    key.push_str(BoundedText::new(target, remaining).as_str());
+    key
+}
+
+fn render_workflow_paths(out: &mut String, label: &str, paths: &[String]) {
+    let start = paths.len().saturating_sub(MAX_SUMMARY_PATHS);
+    if start == paths.len() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str(": ");
+    for (index, path) in paths[start..].iter().enumerate() {
+        if index != 0 {
+            out.push_str(", ");
+        }
+        push_bounded_workflow_path(out, path);
+    }
+    out.push('\n');
+}
+
+fn push_bounded_workflow_path(out: &mut String, path: &str) {
+    let mut end = path.len().min(MAX_WORKFLOW_FIELD_BYTES);
+    while end > 0 && !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&path[..end]);
 }
 
 fn format_ranges(ranges: &[LineRange]) -> String {
@@ -594,7 +932,7 @@ pub fn capture_git_snapshot(workspace_root: &Path) -> GitSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether_core::ToolCallId;
+    use aether_core::{ToolCallId, WorkflowPhase, WorkflowVerification};
 
     fn success(data: Value) -> ToolResult {
         ToolResult::success_json(ToolCallId::new("ctx-1").unwrap(), data, 64 * 1024)
@@ -671,5 +1009,138 @@ mod tests {
         assert!(engine.snapshot().excerpts.is_empty());
         assert!(engine.snapshot().workspace_changed);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_follows_discover_inspect_modify_verify_complete() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        let discovered = success(serde_json::json!({
+            "paths": ["src/lib.rs"],
+            "truncated": false
+        }));
+        engine.observe_tool("find", &Value::Null, &discovered);
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Inspect);
+
+        let read_input = serde_json::json!({
+            "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 2}]
+        });
+        let read = success(serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "content_hash": "before",
+                "lines": [{"number": 1, "text": "fn main() {}"}]
+            }]
+        }));
+        engine.observe_tool("read", &read_input, &read);
+        assert_eq!(engine.snapshot().workflow.progress.inspections, 1);
+
+        let write = success(serde_json::json!({
+            "path": "src/lib.rs",
+            "hash": "after"
+        }));
+        engine.observe_tool("write", &serde_json::json!({"path": "src/lib.rs"}), &write);
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Verify);
+        assert_eq!(engine.snapshot().workflow.verification, WorkflowVerification::Pending);
+        assert_eq!(engine.snapshot().modified, vec!["src/lib.rs"]);
+
+        let verified = success(serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "content_hash": "after",
+                "lines": [{"number": 1, "text": "fn main() { println!(\"ok\"); }"}]
+            }]
+        }));
+        engine.observe_tool("read", &read_input, &verified);
+        assert_eq!(engine.snapshot().workflow.verification, WorkflowVerification::Passed);
+        assert!(engine.finish_turn());
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Complete);
+    }
+
+    #[test]
+    fn workflow_read_only_completion_and_failed_verification_retry() {
+        let mut read_only = ContextEngine::new("/workspace", None);
+        let read_input = serde_json::json!({
+            "files": [{"path": "README.md", "start_line": 1, "end_line": 1}]
+        });
+        let read = success(serde_json::json!({
+            "files": [{
+                "path": "README.md",
+                "content_hash": "readme",
+                "lines": [{"number": 1, "text": "AETHER"}]
+            }]
+        }));
+        read_only.observe_tool("read", &read_input, &read);
+        assert!(read_only.finish_turn());
+        assert_eq!(read_only.snapshot().workflow.phase, WorkflowPhase::Complete);
+
+        let mut coding = ContextEngine::new("/workspace", None);
+        coding.observe_tool("read", &read_input, &read);
+        let write = success(serde_json::json!({"path": "README.md", "hash": "changed"}));
+        coding.observe_tool("write", &serde_json::json!({"path": "README.md"}), &write);
+        let failed = ToolResult::failure(
+            ToolCallId::new("ctx-failed-verify").unwrap(),
+            "io",
+            "verification read failed",
+            true,
+            1024,
+        );
+        coding.observe_tool("read", &read_input, &failed);
+        assert_eq!(coding.snapshot().workflow.verification, WorkflowVerification::Failed);
+        assert!(!coding.finish_turn());
+        coding.observe_tool("read", &read_input, &read);
+        assert_eq!(coding.snapshot().workflow.verification, WorkflowVerification::Passed);
+        assert!(coding.snapshot().workflow.unresolved_failures.is_empty());
+        assert!(coding.finish_turn());
+    }
+
+    #[test]
+    fn workflow_failed_mutation_stays_blocked_until_same_target_retries() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        let input = serde_json::json!({"path": "src/lib.rs"});
+        let failed = ToolResult::failure(
+            ToolCallId::new("ctx-failed-mutation").unwrap(),
+            "precondition",
+            "expected hash did not match",
+            true,
+            1024,
+        );
+        engine.observe_tool("write", &input, &failed);
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Modify);
+        assert!(engine.snapshot().workflow.has_unresolved_failures());
+
+        let read = success(serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "content_hash": "current",
+                "lines": [{"number": 1, "text": "old"}]
+            }]
+        }));
+        engine.observe_tool("read", &serde_json::json!({"files": [{"path": "src/lib.rs"}]}), &read);
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Inspect);
+        assert!(engine.snapshot().workflow.has_unresolved_failures());
+
+        let write = success(serde_json::json!({"path": "src/lib.rs", "hash": "new"}));
+        engine.observe_tool("write", &input, &write);
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Verify);
+        assert!(engine.snapshot().workflow.unresolved_failures.is_empty());
+    }
+
+    #[test]
+    fn workflow_context_is_compact_and_workspace_drift_reopens_discovery() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        engine.observe_tool(
+            "find",
+            &Value::Null,
+            &success(serde_json::json!({"paths": ["src/lib.rs"]})),
+        );
+        let rendered = engine.render(false);
+        assert!(rendered.contains("workflow: phase=inspect"));
+        assert!(rendered.contains("workflow_relevant: src/lib.rs"));
+        assert!(rendered.contains("workflow_action: inspect identified files before editing"));
+        assert!(!rendered.contains("raw transcript"));
+
+        engine.set_workspace_changed(true);
+        assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Discover);
+        assert!(engine.snapshot().workflow.relevant_files.is_empty());
     }
 }

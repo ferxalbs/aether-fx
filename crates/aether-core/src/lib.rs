@@ -13,6 +13,7 @@ pub mod path;
 pub mod permissions;
 pub mod session;
 pub mod tools;
+pub mod workflow;
 
 pub use cancellation::CancellationFlag;
 pub use context::{
@@ -33,8 +34,15 @@ pub use path::{WorkspacePath, WorkspaceRoot};
 pub use permissions::{
     PermissionClass, PermissionDecision, PermissionEngine, PermissionPolicy, PermissionRequest,
 };
-pub use session::{SESSION_SCHEMA_VERSION, SessionLine, SessionRecord, TurnSnapshot};
+pub use session::{
+    MIN_SUPPORTED_SESSION_SCHEMA_VERSION, SESSION_SCHEMA_VERSION, SessionLine, SessionRecord,
+    TurnSnapshot,
+};
 pub use tools::{
     ExecutionPermit, MAX_TOOL_FOOTPRINT_RESOURCES, ToolDefinition, ToolEffect,
     ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
+};
+pub use workflow::{
+    MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES, MAX_WORKFLOW_RELEVANT_FILES, WorkflowFailure,
+    WorkflowPhase, WorkflowProgress, WorkflowState, WorkflowVerification,
 };

@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (5) - Repository-aware coding workflow
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Coding sessions now track bounded Discover, Inspect, Modify, Verify, and Complete phases,
+  relevant files, mutation progress, verification status, and unresolved failures.
+- Workspace mutations require current relevant inspection and successful mutations move the
+  session into focused verification before completion.
+
+### Changed
+
+- Workflow state is persisted with session context, remains recoverable across resumed sessions,
+  and is rendered to the model as compact actionable status.
+
+### Performance
+
+- Added benchmarks for bounded workflow updates and workflow context rendering overhead.
+
 ## Unreleased - 2026-08-23 (4) - Relevance-ranked model context
 
 > Status: unreleased work. No artifact has been published.

@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{ContextSnapshot, OpaqueContinuation, SessionId, TurnId, persistable_continuation};
 
 /// Version of the append-friendly local JSONL schema.
-pub const SESSION_SCHEMA_VERSION: u32 = 3;
+pub const SESSION_SCHEMA_VERSION: u32 = 4;
+/// The immediately previous session schema remains readable after adding workflow defaults.
+pub const MIN_SUPPORTED_SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// One versioned line in a local session JSONL file.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

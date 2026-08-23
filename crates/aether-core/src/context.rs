@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{BoundedText, OpaqueContinuation, ToolResult};
+use crate::{BoundedText, OpaqueContinuation, ToolResult, WorkflowState};
 
 /// Maximum persisted session JSONL size, including all records.
 pub const MAX_SESSION_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -130,6 +130,9 @@ pub struct ContextSnapshot {
     pub model: Option<String>,
     /// Whether resume detected a workspace or file-state change.
     pub workspace_changed: bool,
+    /// Deterministic repository-aware coding workflow state.
+    #[serde(default)]
+    pub workflow: WorkflowState,
 }
 
 impl ContextSnapshot {
@@ -146,6 +149,7 @@ impl ContextSnapshot {
             continuation: None,
             model,
             workspace_changed: false,
+            workflow: WorkflowState::new(),
         }
     }
 
@@ -156,6 +160,8 @@ impl ContextSnapshot {
     /// bodies, git diffs, and shell/process/git stdout. `payload_contains_secrets` is not
     /// the primary boundary; this shape is.
     pub fn persistable(&self) -> Self {
+        let mut workflow = self.workflow.clone();
+        workflow.enforce_bounds();
         Self {
             workspace_root: self.workspace_root.clone(),
             current_task: BoundedText::new("", MAX_TASK_BYTES),
@@ -176,6 +182,7 @@ impl ContextSnapshot {
             continuation: self.continuation.as_ref().and_then(persistable_continuation),
             model: self.model.clone(),
             workspace_changed: self.workspace_changed,
+            workflow,
         }
     }
 
@@ -187,6 +194,7 @@ impl ContextSnapshot {
             && self.excerpts.is_empty()
             && self.tool_summaries.is_empty()
             && self.git.is_none()
+            && self.workflow == WorkflowState::default()
     }
 }
 
@@ -654,5 +662,15 @@ mod tests {
         assert_eq!(MAX_FILE_EXCERPTS, 16);
         assert_eq!(MAX_EXCERPT_BYTES, 4 * 1024);
         assert_eq!(MAX_INSPECTED_FILES, 64);
+    }
+
+    #[test]
+    fn context_without_workflow_field_defaults_to_discovery() {
+        let snapshot = ContextSnapshot::new("/workspace", None);
+        let mut encoded = serde_json::to_value(snapshot).unwrap();
+        encoded.as_object_mut().unwrap().remove("workflow");
+        let restored: ContextSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.workflow.phase, crate::WorkflowPhase::Discover);
+        assert!(restored.workflow.relevant_files.is_empty());
     }
 }

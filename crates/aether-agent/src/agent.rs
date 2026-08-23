@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use aether_core::{
     AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelRequest,
-    OpaqueContinuation, SessionId, StepId, ToolCallId, ToolExecutor, TurnId,
+    ObservedFileState, OpaqueContinuation, SessionId, StepId, ToolCallId, ToolExecutor,
+    ToolInvocation, ToolResult, TurnId, WorkspacePath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::context::{ContextEngine, capture_git_snapshot};
-use crate::scheduler::execute_tool_calls;
+use crate::scheduler::{ToolCallGate, execute_tool_calls_with_gate};
 use crate::{BackendError, CancellationToken, ModelBackend, NoPermissionBroker, PermissionBroker};
 
 /// A user-requested agent turn.
@@ -253,7 +254,10 @@ where
 
             if tool_calls.is_empty() {
                 send_event(&events, AgentEvent::Done).await?;
-                self.with_context(|engine| engine.set_continuation(continuation.clone()));
+                self.with_context(|engine| {
+                    engine.set_continuation(continuation.clone());
+                    engine.finish_turn();
+                });
                 return Ok(AgentRunResult {
                     text: BoundedText::new(accumulated, DEFAULT_MAX_OUTPUT_BYTES),
                     steps,
@@ -263,9 +267,16 @@ where
                 });
             }
 
-            let completed =
-                execute_tool_calls(self.tools.as_ref(), tool_calls, &events, &cancellation, broker)
-                    .await?;
+            let gate = WorkflowMutationGate { snapshot: self.current_context() };
+            let completed = execute_tool_calls_with_gate(
+                self.tools.as_ref(),
+                tool_calls,
+                &events,
+                &cancellation,
+                broker,
+                &gate,
+            )
+            .await?;
             let mut outputs = Vec::with_capacity(completed.len());
             for completed in completed {
                 let name = completed.name;
@@ -326,6 +337,68 @@ where
     }
 }
 
+struct WorkflowMutationGate {
+    snapshot: ContextSnapshot,
+}
+
+impl ToolCallGate for WorkflowMutationGate {
+    fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult> {
+        if !matches!(invocation.name.as_str(), "write" | "patch")
+            || mutation_targets_inspected(&self.snapshot, &invocation.name, &invocation.input)
+        {
+            return None;
+        }
+        Some(ToolResult::failure(
+            invocation.call_id.clone(),
+            "inspection_required",
+            "inspect the relevant workspace code before modifying it",
+            true,
+            DEFAULT_MAX_OUTPUT_BYTES,
+        ))
+    }
+}
+
+fn mutation_targets_inspected(
+    snapshot: &ContextSnapshot,
+    name: &str,
+    input: &serde_json::Value,
+) -> bool {
+    match name {
+        "write" => input.get("path").and_then(serde_json::Value::as_str).is_some_and(|path| {
+            target_is_currently_inspected(snapshot, path)
+                || (input.get("create_only").and_then(serde_json::Value::as_bool) == Some(true)
+                    && new_target_has_discovered_parent(snapshot, path))
+        }),
+        "patch" => input.get("files").and_then(serde_json::Value::as_array).is_some_and(|files| {
+            !files.is_empty()
+                && files.iter().all(|file| {
+                    file.get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|path| target_is_currently_inspected(snapshot, path))
+                })
+        }),
+        _ => true,
+    }
+}
+
+fn target_is_currently_inspected(snapshot: &ContextSnapshot, path: &str) -> bool {
+    WorkspacePath::new(path).is_ok()
+        && snapshot.workflow.relevant_files.iter().any(|relevant| relevant == path)
+        && snapshot.inspected.iter().any(|file| {
+            file.path == path
+                && file.last_state == ObservedFileState::Present
+                && !file.stale
+                && file.content_hash.is_some()
+        })
+}
+
+fn new_target_has_discovered_parent(snapshot: &ContextSnapshot, path: &str) -> bool {
+    let parent = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+    snapshot.workflow.relevant_files.iter().any(|relevant| {
+        std::path::Path::new(relevant).parent().is_some_and(|candidate| candidate == parent)
+    })
+}
+
 fn assemble_user_input(prompt: &str, context_packet: Option<String>) -> serde_json::Value {
     let content = match context_packet {
         Some(packet) if !packet.trim().is_empty() => format!("{packet}\n\n{prompt}"),
@@ -366,8 +439,9 @@ mod tests {
     use crate::{BackendFuture, ModelCatalogItem, SessionPermissionBroker};
     use aether_core::tools::ToolFuture;
     use aether_core::{
-        ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass, PermissionDecision,
-        ToolDefinition, ToolExecutionContext, ToolInvocation, ToolResult,
+        InspectedFile, ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass,
+        PermissionDecision, ToolDefinition, ToolExecutionContext, ToolInvocation, ToolResult,
+        WorkflowVerification,
     };
     use serde_json::json;
 
@@ -406,6 +480,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mutation_gate_requires_current_inspection_before_execution() {
+        let call_id = ToolCallId::new("workflow-gate").unwrap();
+        let invocation = ToolInvocation {
+            call_id: call_id.clone(),
+            name: "write".to_owned(),
+            input: json!({"path": "src/lib.rs"}),
+        };
+        let gate = WorkflowMutationGate { snapshot: ContextSnapshot::new("/workspace", None) };
+        let blocked = gate.preflight(&invocation).expect("uninspected mutation must be blocked");
+        assert_eq!(blocked.error.as_ref().unwrap().code, "inspection_required");
+
+        let mut inspected = ContextSnapshot::new("/workspace", None);
+        inspected.inspected.push(InspectedFile {
+            path: "src/lib.rs".to_owned(),
+            content_hash: Some("current".to_owned()),
+            ranges: Vec::new(),
+            last_state: ObservedFileState::Present,
+            stale: false,
+        });
+        inspected.workflow.record_relevant_file("src/lib.rs");
+        let gate = WorkflowMutationGate { snapshot: inspected };
+        assert!(gate.preflight(&invocation).is_none());
+    }
+
     #[tokio::test]
     async fn fake_backend_proves_tool_continuation_and_event_order() {
         let backend =
@@ -426,6 +525,148 @@ mod tests {
             kinds,
             vec!["tool_started", "tool_output", "tool_finished", "text_delta", "done"]
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct WorkflowBackend {
+        steps: Arc<AtomicUsize>,
+    }
+
+    impl ModelBackend for WorkflowBackend {
+        fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
+            let step = self.steps.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let (sender, receiver) = mpsc::channel(4);
+                match step {
+                    0 => sender
+                        .send(Ok(ModelEvent::ToolCall {
+                            call_id: ToolCallId::new("workflow-read-1").unwrap(),
+                            name: "read".to_owned(),
+                            arguments: json!({
+                                "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
+                            }),
+                        }))
+                        .await
+                        .unwrap(),
+                    1 => sender
+                        .send(Ok(ModelEvent::ToolCall {
+                            call_id: ToolCallId::new("workflow-write-1").unwrap(),
+                            name: "write".to_owned(),
+                            arguments: json!({"path": "src/lib.rs", "content": "new"}),
+                        }))
+                        .await
+                        .unwrap(),
+                    2 => sender
+                        .send(Ok(ModelEvent::ToolCall {
+                            call_id: ToolCallId::new("workflow-read-2").unwrap(),
+                            name: "read".to_owned(),
+                            arguments: json!({
+                                "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
+                            }),
+                        }))
+                        .await
+                        .unwrap(),
+                    _ => sender
+                        .send(Ok(ModelEvent::TextDelta { text: "complete".to_owned() }))
+                        .await
+                        .unwrap(),
+                }
+                sender.send(Ok(ModelEvent::Done { continuation: None })).await.unwrap();
+                let _ = request;
+                Ok(receiver)
+            })
+        }
+
+        fn discover_models<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<ModelCatalogItem>, BackendError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct WorkflowTools;
+
+    impl ToolExecutor for WorkflowTools {
+        fn definitions(&self) -> &[ToolDefinition] {
+            static DEFINITIONS: std::sync::OnceLock<Vec<ToolDefinition>> =
+                std::sync::OnceLock::new();
+            DEFINITIONS.get_or_init(|| {
+                vec![
+                    ToolDefinition {
+                        name: "read".to_owned(),
+                        description: "workflow read".to_owned(),
+                        input_schema: json!({"type": "object"}),
+                        permission: PermissionClass::ReadOnly,
+                    },
+                    ToolDefinition {
+                        name: "write".to_owned(),
+                        description: "workflow write".to_owned(),
+                        input_schema: json!({"type": "object"}),
+                        permission: PermissionClass::WorkspaceWrite,
+                    },
+                ]
+            })
+        }
+
+        fn permission_request(&self, _: &ToolInvocation) -> Option<aether_core::PermissionRequest> {
+            None
+        }
+
+        fn execute<'a>(
+            &'a self,
+            invocation: ToolInvocation,
+            _: ToolExecutionContext,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                match invocation.name.as_str() {
+                    "read" => ToolResult::success_json(
+                        invocation.call_id,
+                        json!({
+                            "files": [{
+                                "path": "src/lib.rs",
+                                "content_hash": "current",
+                                "lines": [{"number": 1, "text": "fn main() {}"}]
+                            }]
+                        }),
+                        4096,
+                    ),
+                    "write" => ToolResult::success_json(
+                        invocation.call_id,
+                        json!({"path": "src/lib.rs", "hash": "current"}),
+                        4096,
+                    ),
+                    _ => ToolResult::failure(
+                        invocation.call_id,
+                        "unknown",
+                        "unknown workflow tool",
+                        false,
+                        4096,
+                    ),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_coding_flow_completes_after_focused_verification() {
+        let agent = Agent::new(WorkflowBackend::default(), WorkflowTools);
+        let request = AgentRequest::new(
+            SessionId::new("workflow-normal").unwrap(),
+            TurnId::new("workflow-turn").unwrap(),
+            "update lib",
+        );
+        let (sender, _receiver) = mpsc::channel(32);
+        let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
+        assert_eq!(result.context.workflow.phase, aether_core::WorkflowPhase::Complete);
+        assert_eq!(result.context.workflow.verification, WorkflowVerification::Passed);
+        assert_eq!(result.context.workflow.progress.mutations, 1);
+        assert!(result.context.workflow.unresolved_failures.is_empty());
     }
 
     #[tokio::test]
@@ -601,17 +842,33 @@ mod tests {
         let task_agent = Arc::clone(&agent);
         let task_broker = broker.clone();
         let task = tokio::spawn(async move {
+            let mut request = AgentRequest::new(
+                SessionId::new("session-permission-event").unwrap(),
+                TurnId::new("turn-permission-event").unwrap(),
+                "write",
+            );
+            request.context_seed = Some(ContextSnapshot {
+                workspace_root: String::new(),
+                current_task: BoundedText::default(),
+                inspected: vec![InspectedFile {
+                    path: "test.txt".to_owned(),
+                    content_hash: Some("current".to_owned()),
+                    ranges: Vec::new(),
+                    last_state: ObservedFileState::Present,
+                    stale: false,
+                }],
+                modified: Vec::new(),
+                excerpts: Vec::new(),
+                tool_summaries: Vec::new(),
+                git: None,
+                continuation: None,
+                model: None,
+                workspace_changed: false,
+                workflow: aether_core::WorkflowState::new(),
+            });
+            request.context_seed.as_mut().unwrap().workflow.record_relevant_file("test.txt");
             task_agent
-                .run_with_broker(
-                    AgentRequest::new(
-                        SessionId::new("session-permission-event").unwrap(),
-                        TurnId::new("turn-permission-event").unwrap(),
-                        "write",
-                    ),
-                    sender,
-                    CancellationToken::new(),
-                    &task_broker,
-                )
+                .run_with_broker(request, sender, CancellationToken::new(), &task_broker)
                 .await
         });
         while let Some(event) = receiver.recv().await {

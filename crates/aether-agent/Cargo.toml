@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "context_selection"
 harness = false
+
+[[bench]]
+name = "workflow"
+harness = false

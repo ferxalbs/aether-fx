@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use aether_core::{
     ContextSnapshot, MAX_SESSION_FILE_BYTES, MAX_SESSION_LINE_BYTES, MAX_SESSION_LINES,
-    MAX_STORED_TURNS, OpaqueContinuation, SESSION_SCHEMA_VERSION, SessionId, SessionLine,
-    SessionRecord, TurnId, TurnSnapshot, payload_contains_secrets, persistable_continuation,
+    MAX_STORED_TURNS, MIN_SUPPORTED_SESSION_SCHEMA_VERSION, OpaqueContinuation,
+    SESSION_SCHEMA_VERSION, SessionId, SessionLine, SessionRecord, TurnId, TurnSnapshot,
+    payload_contains_secrets, persistable_continuation,
 };
 use thiserror::Error;
 
@@ -194,7 +195,7 @@ impl SessionStore {
         }
         let line: SessionLine = serde_json::from_str(text)
             .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
-        if line.schema_version != SESSION_SCHEMA_VERSION {
+        if !supported_schema(line.schema_version) {
             return Err(SessionStoreError::Invalid(format!(
                 "unsupported session schema {}",
                 line.schema_version
@@ -343,7 +344,7 @@ impl SessionStore {
             }
             match serde_json::from_str::<SessionLine>(trimmed) {
                 Ok(line) => {
-                    if line.schema_version != SESSION_SCHEMA_VERSION {
+                    if !supported_schema(line.schema_version) {
                         return Err(SessionStoreError::Invalid(format!(
                             "unsupported session schema {}",
                             line.schema_version
@@ -505,6 +506,10 @@ impl SessionStore {
     }
 }
 
+fn supported_schema(version: u32) -> bool {
+    (MIN_SUPPORTED_SESSION_SCHEMA_VERSION..=SESSION_SCHEMA_VERSION).contains(&version)
+}
+
 fn sanitize_record(record: SessionRecord) -> Result<SessionRecord, SessionStoreError> {
     let record = match record {
         SessionRecord::TurnSnapshot { snapshot } => SessionRecord::turn_snapshot(*snapshot),
@@ -550,7 +555,7 @@ mod tests {
     use super::*;
     use aether_core::{
         CompactToolSummary, ContextSnapshot, InspectedFile, LineRange, ObservedFileState,
-        SESSION_SCHEMA_VERSION, TurnId,
+        SESSION_SCHEMA_VERSION, TurnId, WorkflowPhase,
     };
 
     fn temp_session(label: &str) -> (PathBuf, PathBuf, SessionId) {
@@ -698,6 +703,28 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn resumed_session_restores_bounded_workflow_state() {
+        let (root, _path, session) = temp_session("workflow-resume");
+        let source = root.join("src.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let hash = blake3::hash(&std::fs::read(&source).unwrap()).to_hex().to_string();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let mut context =
+            ContextSnapshot::new(canonical_root.display().to_string(), Some("model".to_owned()));
+        context.inspected.push(inspected("src.rs", &hash));
+        context.workflow.record_relevant_file("src.rs");
+        context.workflow.record_inspection();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
+        write_started_and_turn(&mut store, &root, context, None);
+
+        let restored = SessionStore::restore(&root, session).unwrap();
+        assert_eq!(restored.context.workflow.phase, WorkflowPhase::Inspect);
+        assert_eq!(restored.context.workflow.relevant_files, vec!["src.rs"]);
+        assert_eq!(restored.context.workflow.progress.inspections, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn padded_started_line(
