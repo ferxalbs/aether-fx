@@ -49,3 +49,7 @@ harness = false
 [[bench]]
 name = "policy"
 harness = false
+
+[[bench]]
+name = "planner"
+harness = false

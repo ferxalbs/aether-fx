@@ -127,6 +127,8 @@ impl ContextEngine {
         let focused_verification = self.is_focused_verification(name, input);
         let command_effects = command_effects_for_tool(name, input);
         let mutation = is_workspace_mutation(name, input, command_effects.as_ref());
+        let repository_observation =
+            result.data.as_ref().is_some_and(|data| data.get("repository_observation").is_some());
         self.snapshot.workflow.progress.note_tool_result();
         if mutation {
             self.snapshot.workflow.begin_modification();
@@ -140,6 +142,12 @@ impl ContextEngine {
             "patch" => self.observe_patch(result),
             "git" => self.observe_git(result),
             _ => {}
+        }
+        if repository_observation {
+            self.observe_read(result);
+            if read_contains_files(result) {
+                self.snapshot.workflow.record_inspection();
+            }
         }
         if result.ok {
             self.snapshot.workflow.clear_failure(&failure_key);

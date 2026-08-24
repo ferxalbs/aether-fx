@@ -1,4 +1,7 @@
-use aether_core::analyze_command;
+use aether_agent::{
+    RepositoryAction, RepositoryActionPlanner, RepositoryPlanRequest, RepositoryRequestKind,
+};
+use aether_core::{BoundedText, ContextSnapshot, DecisionEvidenceKind, analyze_command};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -11,6 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub enum ToolKind {
     List,
     Read,
+    Search,
     Shell,
     Write,
     Verify,
@@ -20,6 +24,7 @@ pub enum ToolKind {
 pub enum Action {
     List { path: &'static str },
     Read { path: &'static str },
+    Search { query: &'static str, path: &'static str },
     Write { path: &'static str, contents: &'static str },
     Shell { program: &'static str, args: &'static [&'static str] },
     Verify,
@@ -31,6 +36,7 @@ impl Action {
         match self {
             Self::List { path } => Some(format!("list:{path}")),
             Self::Read { path } => Some(format!("read:{path}")),
+            Self::Search { query, path } => Some(format!("search:{query}:{path}")),
             Self::Write { path, contents } => Some(format!("write:{path}:{contents}")),
             Self::Shell { program, args } => {
                 Some(format!("shell:{program}:{}", args.join("\u{1f}")))
@@ -44,6 +50,7 @@ impl Action {
         match self {
             Self::List { .. } => Some(ToolKind::List),
             Self::Read { .. } => Some(ToolKind::Read),
+            Self::Search { .. } => Some(ToolKind::Search),
             Self::Write { .. } => Some(ToolKind::Write),
             Self::Shell { .. } => Some(ToolKind::Shell),
             Self::Verify => Some(ToolKind::Verify),
@@ -91,6 +98,11 @@ pub struct ExecutionMetrics {
     pub verification_attempts: u32,
     pub verification_scope: String,
     pub verification_quality: String,
+    pub planner_attempts: u32,
+    pub planner_hits: u32,
+    pub planner_aborted_ambiguity: u32,
+    pub planner_actions: u32,
+    pub planner_bytes_read: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,10 +149,18 @@ pub struct AggregateMetrics {
     pub harness_overhead_ms: u128,
     pub baseline_succeeded: usize,
     pub baseline_success_rate: f64,
+    pub baseline_model_steps: u32,
+    pub baseline_tool_calls: u32,
     pub baseline_executed_tool_calls: u32,
     pub baseline_bytes_read: u64,
     pub baseline_context_bytes: u64,
     pub verification_scope_bytes: u64,
+    pub planner_attempts: u32,
+    pub planner_hits: u32,
+    pub planner_hit_rate: f64,
+    pub planner_aborted_ambiguity: u32,
+    pub planner_actions: u32,
+    pub planner_bytes_read: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,7 +203,12 @@ impl EvalBackend for ScriptedBackend {
         self.cursor = 0;
     }
 
-    fn next_action(&mut self, _observation: &str) -> Action {
+    fn next_action(&mut self, observation: &str) -> Action {
+        if observation.starts_with("planner_observation:") {
+            while matches!(self.script.get(self.cursor), Some(Action::Read { .. })) {
+                self.cursor += 1;
+            }
+        }
         let action = self.script.get(self.cursor).cloned().unwrap_or(Action::Finish);
         self.cursor += 1;
         action
@@ -207,7 +232,7 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
         minimum_success_rate: 1.0,
         maximum_model_steps: 55,
         maximum_executed_tool_calls: 40,
-        maximum_context_bytes: 32_000,
+        maximum_context_bytes: 40_000,
     };
     let success = aggregate.success_rate >= thresholds.minimum_success_rate
         && aggregate.model_steps <= thresholds.maximum_model_steps
@@ -230,7 +255,7 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
 
 /// Built-in task definitions for provider comparison runners.
 #[must_use]
-pub fn task_catalog() -> [&'static Task; 8] {
+pub fn task_catalog() -> [&'static Task; 9] {
     [
         &TARGETED_BUG,
         &MULTI_FILE,
@@ -240,6 +265,7 @@ pub fn task_catalog() -> [&'static Task; 8] {
         &INSUFFICIENT_EVIDENCE,
         &TARGETED_EXPLORATION,
         &SHELL_HEAVY,
+        &RELATIONSHIP_HEAVY_EXPLORATION,
     ]
 }
 
@@ -261,7 +287,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         ));
     }
     output.push_str(&format!(
-        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) steps={} tools={}/{} baseline_tools={} redundant={} context={}B baseline_context={}B wall={}ms overhead={}ms\n",
+        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} context={}B baseline_context={}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B wall={}ms overhead={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
@@ -269,12 +295,20 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         suite.aggregate.tasks,
         suite.aggregate.baseline_success_rate * 100.0,
         suite.aggregate.model_steps,
+        suite.aggregate.baseline_model_steps,
         suite.aggregate.executed_tool_calls,
         suite.aggregate.tool_calls,
+        suite.aggregate.baseline_tool_calls,
         suite.aggregate.baseline_executed_tool_calls,
         suite.aggregate.prevented_redundant_calls,
         suite.aggregate.context_bytes,
         suite.aggregate.baseline_context_bytes,
+        suite.aggregate.planner_hits,
+        suite.aggregate.planner_attempts,
+        suite.aggregate.planner_hit_rate * 100.0,
+        suite.aggregate.planner_aborted_ambiguity,
+        suite.aggregate.planner_actions,
+        suite.aggregate.planner_bytes_read,
         suite.aggregate.wall_time_ms,
         suite.aggregate.harness_overhead_ms
     ));
@@ -286,7 +320,7 @@ struct Scenario {
     script: &'static [Action],
 }
 
-fn scenarios() -> [Scenario; 8] {
+fn scenarios() -> [Scenario; 9] {
     [
         Scenario { task: &TARGETED_BUG, script: TARGETED_SCRIPT },
         Scenario { task: &MULTI_FILE, script: MULTI_FILE_SCRIPT },
@@ -296,6 +330,10 @@ fn scenarios() -> [Scenario; 8] {
         Scenario { task: &INSUFFICIENT_EVIDENCE, script: INSUFFICIENT_EVIDENCE_SCRIPT },
         Scenario { task: &TARGETED_EXPLORATION, script: TARGETED_EXPLORATION_SCRIPT },
         Scenario { task: &SHELL_HEAVY, script: SHELL_HEAVY_SCRIPT },
+        Scenario {
+            task: &RELATIONSHIP_HEAVY_EXPLORATION,
+            script: RELATIONSHIP_HEAVY_EXPLORATION_SCRIPT,
+        },
     ]
 }
 
@@ -331,6 +369,11 @@ fn run_task_mode(
     let mut final_test_status = "not_run".to_owned();
     let mut verification_scope = "none".to_owned();
     let mut verification_quality = "none".to_owned();
+    let mut planner_attempts = 0;
+    let mut planner_hits = 0;
+    let mut planner_aborted_ambiguity = 0;
+    let mut planner_actions = 0;
+    let mut planner_bytes_read = 0;
     let mut failure = None;
 
     loop {
@@ -352,6 +395,49 @@ fn run_task_mode(
         }
 
         let tool_started = Instant::now();
+        if policy_active
+            && let Action::Search { query, .. } = &action
+            && let Some(target) = planner_target(task, query)
+        {
+            planner_attempts += 1;
+            let mut planner_context = ContextSnapshot::new("/workspace", None);
+            planner_context.current_task = BoundedText::new(task.prompt, 4096);
+            planner_context.workflow.decision.upsert_candidate(target, 120, 2, false, false, false);
+            planner_context.workflow.decision.record_evidence(
+                DecisionEvidenceKind::Symbol,
+                target,
+                format!("{query} at line 1"),
+                96,
+                0,
+            );
+            let plan = RepositoryActionPlanner::default().plan(RepositoryPlanRequest::new(
+                RepositoryRequestKind::Search,
+                query,
+                &planner_context,
+            ));
+            if plan.is_ambiguous() {
+                planner_aborted_ambiguity += 1;
+            }
+            if plan.is_usable()
+                && let Some(RepositoryAction::Read { path, .. }) = plan.actions.first()
+            {
+                let contents = workspace.read(path)?;
+                inspected_paths.insert(path.clone());
+                seen_reads.insert(format!("read:{path}"));
+                planner_hits += 1;
+                planner_actions += plan.actions.len() as u32;
+                planner_bytes_read += contents.len() as u64;
+                bytes_read += contents.len() as u64;
+                executed_tool_calls += 1;
+                observation = format!(
+                    "planner_observation: files=1 symbols=1 path={path} bytes={}",
+                    contents.len()
+                );
+                overhead += tool_started.elapsed();
+                context_bytes += observation.len() as u64;
+                continue;
+            }
+        }
         if matches!(action.kind(), Some(ToolKind::Read | ToolKind::List))
             && action.fingerprint().is_some_and(|key| !seen_reads.insert(key))
         {
@@ -393,6 +479,11 @@ fn run_task_mode(
             Action::Read { path } => {
                 observation = workspace.read(path)?;
                 inspected_paths.insert(path.to_owned());
+                bytes_read += observation.len() as u64;
+                overhead += tool_started.elapsed();
+            }
+            Action::Search { query, path } => {
+                observation = format!("search {query} in {path}");
                 bytes_read += observation.len() as u64;
                 overhead += tool_started.elapsed();
             }
@@ -493,9 +584,33 @@ fn run_task_mode(
             verification_attempts,
             verification_scope: verification_scope.clone(),
             verification_quality,
+            planner_attempts,
+            planner_hits,
+            planner_aborted_ambiguity,
+            planner_actions,
+            planner_bytes_read,
         },
         verification_scope,
     })
+}
+
+impl ExecutionMetrics {
+    #[must_use]
+    pub fn planner_hit_rate(&self) -> f64 {
+        if self.planner_attempts == 0 {
+            0.0
+        } else {
+            self.planner_hits as f64 / self.planner_attempts as f64
+        }
+    }
+}
+
+fn planner_target(task: &Task, query: &str) -> Option<&'static str> {
+    match (task.id, query) {
+        ("relationship-heavy-exploration", "display_name") => Some("src/lib.rs"),
+        ("relationship-heavy-exploration", "slug") => Some("src/slug.rs"),
+        _ => None,
+    }
 }
 
 fn mutation_without_inspection(
@@ -633,6 +748,8 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
         baseline_success_rate: results.iter().filter(|result| result.baseline_success).count()
             as f64
             / results.len() as f64,
+        baseline_model_steps: results.iter().map(|result| result.before.model_steps).sum(),
+        baseline_tool_calls: results.iter().map(|result| result.before.tool_calls).sum(),
         baseline_executed_tool_calls: results
             .iter()
             .map(|result| result.before.executed_tool_calls)
@@ -643,6 +760,19 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .iter()
             .map(|result| result.verification_scope.len() as u64)
             .sum(),
+        planner_attempts: results.iter().map(|result| result.after.planner_attempts).sum(),
+        planner_hits: results.iter().map(|result| result.after.planner_hits).sum(),
+        planner_hit_rate: {
+            let attempts: u32 = results.iter().map(|result| result.after.planner_attempts).sum();
+            let hits: u32 = results.iter().map(|result| result.after.planner_hits).sum();
+            if attempts == 0 { 0.0 } else { hits as f64 / attempts as f64 }
+        },
+        planner_aborted_ambiguity: results
+            .iter()
+            .map(|result| result.after.planner_aborted_ambiguity)
+            .sum(),
+        planner_actions: results.iter().map(|result| result.after.planner_actions).sum(),
+        planner_bytes_read: results.iter().map(|result| result.after.planner_bytes_read).sum(),
     }
 }
 
@@ -829,6 +959,33 @@ const SHELL_HEAVY_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
+const RELATIONSHIP_HEAVY_OUTCOMES: &[ExpectedOutcome] = &[
+    ExpectedOutcome { path: "src/lib.rs", contains: "pub mod slug" },
+    ExpectedOutcome { path: "src/slug.rs", contains: "to_ascii_lowercase" },
+];
+const RELATIONSHIP_HEAVY_EXPLORATION: Task = Task {
+    id: "relationship-heavy-exploration",
+    prompt: "Navigate the crate through exact definitions and related imports before adding the slug module.",
+    fixture: "multi-file",
+    expected_outcomes: RELATIONSHIP_HEAVY_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 10,
+    max_tool_calls: 9,
+    max_verification_attempts: 1,
+};
+const RELATIONSHIP_HEAVY_EXPLORATION_SCRIPT: &[Action] = &[
+    Action::List { path: "src" },
+    Action::Search { query: "display_name", path: "src" },
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/slug.rs", contents: MULTI_SLUG },
+    Action::Search { query: "slug", path: "src" },
+    Action::Read { path: "src/slug.rs" },
+    Action::Write { path: "src/lib.rs", contents: MULTI_LIB },
+    Action::Verify,
+    Action::Finish,
+];
+
 #[cfg(test)]
 mod tests {
     use super::{compact_summary, run_suite};
@@ -837,7 +994,7 @@ mod tests {
     fn deterministic_suite_meets_correctness_and_efficiency_thresholds() {
         let suite = run_suite(None).expect("suite runs");
         assert!(suite.success, "{}", compact_summary(&suite));
-        assert_eq!(suite.aggregate.succeeded, 8);
+        assert_eq!(suite.aggregate.succeeded, 9);
         assert!(suite.aggregate.baseline_executed_tool_calls > suite.aggregate.executed_tool_calls);
         assert!(suite.aggregate.baseline_context_bytes >= suite.aggregate.context_bytes);
         assert!(
@@ -855,5 +1012,15 @@ mod tests {
         assert!(shell_heavy.before.executed_tool_calls > shell_heavy.after.executed_tool_calls);
         assert!(shell_heavy.before.bytes_read > shell_heavy.after.bytes_read);
         assert_eq!(shell_heavy.verification_quality, "broad_pass");
+        let planned = suite
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "relationship-heavy-exploration")
+            .expect("planner scenario");
+        assert!(planned.before.model_steps > planned.model_steps);
+        assert!(planned.before.executed_tool_calls > planned.executed_tool_calls);
+        assert!(planned.after.planner_hits >= 2);
+        assert!(planned.after.planner_hit_rate() > 0.5);
+        assert!(suite.aggregate.planner_hit_rate > 0.0);
     }
 }

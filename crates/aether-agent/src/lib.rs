@@ -10,6 +10,7 @@ mod context_selection;
 mod fake;
 mod guardrails;
 mod permission;
+mod planner;
 mod policy;
 mod repo_map;
 mod scheduler;
@@ -33,6 +34,14 @@ pub use guardrails::LoopGuardrails;
 pub use permission::{
     AllowAllPermissionBroker, NoPermissionBroker, PermissionBroker, PermissionFuture,
     SessionPermissionBroker,
+};
+pub use planner::{
+    DEFAULT_MAX_PLANNER_ACTIONS, DEFAULT_MAX_PLANNER_BYTES, DEFAULT_MAX_PLANNER_CANDIDATES,
+    DEFAULT_MAX_PLANNER_DEPTH, DEFAULT_MAX_PLANNER_EXECUTION_MICROS, DEFAULT_MAX_PLANNER_FILES,
+    MAX_PLANNER_OBSERVATION_BYTES, MIN_PLANNER_CONFIDENCE, PlannerExecutionError, PlannerLimits,
+    RepositoryAction, RepositoryActionPlan, RepositoryActionPlanner, RepositoryExcerpt,
+    RepositoryFileObservation, RepositoryObservation, RepositoryPlanRequest, RepositoryRequestKind,
+    RepositorySymbolObservation,
 };
 pub use policy::{
     AutonomousCodingPolicy, MAX_POLICY_CANDIDATES, MAX_POLICY_OBSERVED_PATHS,

@@ -35,6 +35,8 @@ pub(crate) struct ScheduledToolResult {
     pub(crate) input: Value,
     pub(crate) result: ToolResult,
     pub(crate) executed: bool,
+    pub(crate) planned: bool,
+    pub(crate) planner_actions: usize,
 }
 
 /// Deterministic pre-execution gate for workflow or composition-root policy.
@@ -228,6 +230,8 @@ where
             input: metadata.input,
             result,
             executed: metadata.executed,
+            planned: false,
+            planner_actions: 0,
         })
         .collect())
 }

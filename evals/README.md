@@ -21,7 +21,9 @@ offline and reproducible.
 
 JSON output includes per-task correctness, wall time, harness overhead, model steps, requested and
 executed tool calls, prevented redundant calls, bytes read, context bytes, verification attempts,
-verification scope and quality, and final test status. Regression gates cover correctness, steps,
-executed calls, and context size; shell-heavy scenarios report before/after metrics in the same
-result for direct comparison.
+verification scope and quality, planner attempts/hits, ambiguity aborts, planned actions, planner
+bytes, and final test status. The `relationship-heavy-exploration` scenario requires repeated
+search-to-read navigation in baseline mode and exercises the bounded planner in policy mode.
+Regression gates cover correctness, steps, executed calls, and context size; shell-heavy and
+planner scenarios report before/after metrics in the same result for direct comparison.
 Wall time is diagnostic only because shared CI timing is unstable.

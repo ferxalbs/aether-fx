@@ -14,6 +14,9 @@ use serde_json::Value;
 
 use crate::context::ContextEngine;
 use crate::guardrails::LoopGuardrails;
+use crate::planner::{
+    RepositoryActionPlan, RepositoryActionPlanner, RepositoryPlanRequest, RepositoryRequestKind,
+};
 use crate::{RepoMap, RepoSelection, RepoSelectionKind};
 
 /// Maximum repository candidates considered by one policy refresh.
@@ -37,12 +40,42 @@ pub struct RankedAction {
 pub struct AutonomousCodingPolicy {
     guardrails: LoopGuardrails,
     candidate_key: Option<[u8; 16]>,
+    planner: RepositoryActionPlanner,
 }
 
 impl AutonomousCodingPolicy {
     /// Construct a fresh per-turn policy. Persisted decision state lives in the context snapshot.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return a pure read-only plan for one model search request, when it is eligible for local
+    /// repository observation.  Ambiguous plans are returned to the caller so it can record the
+    /// abort and fall back to the normal permissioned scheduler path.
+    pub(crate) fn repository_plan_for_call(
+        &self,
+        snapshot: &ContextSnapshot,
+        name: &str,
+        input: &Value,
+    ) -> Option<RepositoryActionPlan> {
+        if name != "search" {
+            return None;
+        }
+        if self.guardrails.has_cached_observation(name, input, snapshot.workflow.workspace_revision)
+        {
+            return None;
+        }
+        let patterns = input.get("patterns")?.as_array()?;
+        if patterns.is_empty() || patterns.len() > 32 {
+            return None;
+        }
+        let query = patterns.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?.join(" ");
+        let request = RepositoryPlanRequest::new(RepositoryRequestKind::Search, &query, snapshot);
+        Some(self.planner.plan(request))
+    }
+
+    pub(crate) fn planner(&self) -> &RepositoryActionPlanner {
+        &self.planner
     }
 
     /// Run cached-observation and insufficient-evidence checks before tool execution.

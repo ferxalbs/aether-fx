@@ -72,6 +72,20 @@ impl LoopGuardrails {
         cached
     }
 
+    /// Return whether a call is already represented by the current revision without changing
+    /// the prevented counter.  The agent uses this read-only probe before considering a local
+    /// planner shortcut; the normal scheduler remains responsible for producing the cached
+    /// result and accounting for the prevented call.
+    pub fn has_cached_observation(&self, name: &str, input: &Value, revision: u32) -> bool {
+        let Some(kind) = classify(name, input) else {
+            return false;
+        };
+        let fingerprint = call_fingerprint(kind, name, input);
+        self.observations
+            .iter()
+            .any(|item| item.revision == revision && item.fingerprint == fingerprint)
+    }
+
     /// Fold one result into bounded cache/progress state and return actionable loop feedback.
     pub fn observe(
         &mut self,

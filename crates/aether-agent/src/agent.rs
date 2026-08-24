@@ -13,7 +13,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::context::{ContextEngine, capture_git_snapshot};
-use crate::scheduler::{ToolCallGate, execute_tool_calls_with_gate};
+use crate::planner::RepositoryActionPlan;
+use crate::scheduler::{ScheduledToolResult, ToolCallGate, execute_tool_calls_with_gate};
 use crate::{
     AutonomousCodingPolicy, BackendError, CancellationToken, ModelBackend, NoPermissionBroker,
     PermissionBroker,
@@ -97,6 +98,11 @@ pub struct AgentMetrics {
     pub verification_scope: Option<String>,
     pub provider_wait_ms: u64,
     pub local_execution_ms: u64,
+    pub planner_attempts: u64,
+    pub planner_hits: u64,
+    pub planner_aborted_ambiguity: u64,
+    pub planner_actions: u64,
+    pub planner_bytes_read: u64,
 }
 
 struct MetricsState {
@@ -361,19 +367,68 @@ where
             }
 
             let snapshot = self.current_context();
+            let planner_plan = if tool_calls.len() == 1 {
+                let (call_id, name, input) = &tool_calls[0];
+                let invocation = ToolInvocation {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                };
+                let plan = if self.tools.permission_request(&invocation).is_some() {
+                    None
+                } else {
+                    self.with_context(|engine| {
+                        policy.repository_plan_for_call(engine.snapshot(), name, input)
+                    })
+                };
+                if let Some(plan) = &plan
+                    && let Some(metrics) = &mut metrics
+                {
+                    metrics.value.planner_attempts =
+                        metrics.value.planner_attempts.saturating_add(1);
+                    if plan.is_ambiguous() {
+                        metrics.value.planner_aborted_ambiguity =
+                            metrics.value.planner_aborted_ambiguity.saturating_add(1);
+                    }
+                }
+                plan
+            } else {
+                None
+            };
             let gate = AgentToolGate {
                 workflow: WorkflowMutationGate { snapshot: snapshot.clone() },
                 policy: &policy,
             };
-            let completed = execute_tool_calls_with_gate(
-                self.tools.as_ref(),
-                tool_calls,
-                &events,
-                &cancellation,
-                broker,
-                &gate,
-            )
-            .await?;
+            let completed = if planner_plan.as_ref().is_some_and(RepositoryActionPlan::is_usable) {
+                let plan = planner_plan.expect("usable planner plan is present");
+                match self
+                    .execute_repository_plan(&policy, plan, &tool_calls[0], &events, &cancellation)
+                    .await?
+                {
+                    Some(planned) => vec![planned],
+                    None => {
+                        execute_tool_calls_with_gate(
+                            self.tools.as_ref(),
+                            tool_calls,
+                            &events,
+                            &cancellation,
+                            broker,
+                            &gate,
+                        )
+                        .await?
+                    }
+                }
+            } else {
+                execute_tool_calls_with_gate(
+                    self.tools.as_ref(),
+                    tool_calls,
+                    &events,
+                    &cancellation,
+                    broker,
+                    &gate,
+                )
+                .await?
+            };
             let mut outputs = Vec::with_capacity(completed.len());
             for completed in completed {
                 let name = completed.name;
@@ -388,9 +443,20 @@ where
                     if completed.executed {
                         metrics.value.executed_tool_calls =
                             metrics.value.executed_tool_calls.saturating_add(1);
-                    } else {
+                    } else if !completed.planned {
                         metrics.value.prevented_calls =
                             metrics.value.prevented_calls.saturating_add(1);
+                    }
+                    if completed.planned {
+                        metrics.value.planner_hits = metrics.value.planner_hits.saturating_add(1);
+                        metrics.value.planner_actions = metrics
+                            .value
+                            .planner_actions
+                            .saturating_add(completed.planner_actions as u64);
+                        metrics.value.planner_bytes_read = metrics
+                            .value
+                            .planner_bytes_read
+                            .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
                     }
                     metrics.value.bytes_read = metrics
                         .value
@@ -457,6 +523,63 @@ where
         self.with_context(|engine| {
             engine.should_attach_to_prompt(has_continuation).then(|| engine.render(true))
         })
+    }
+
+    async fn execute_repository_plan(
+        &self,
+        policy: &AutonomousCodingPolicy,
+        plan: RepositoryActionPlan,
+        call: &(ToolCallId, String, serde_json::Value),
+        events: &mpsc::Sender<AgentEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ScheduledToolResult>, AgentError> {
+        let (snapshot, repo) = self
+            .with_context(|engine| (engine.snapshot().clone(), engine.repository_map().cloned()));
+        let Some(repo) = repo else {
+            return Ok(None);
+        };
+        let planner_actions = plan.actions.len();
+        let planner = *policy.planner();
+        let cancellation_for_worker = cancellation.clone();
+        let execution = tokio::task::spawn_blocking(move || {
+            planner.execute(&plan, &repo, &snapshot, &cancellation_for_worker)
+        });
+        let observation = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+            result = execution => result,
+        };
+        let observation = match observation {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(crate::PlannerExecutionError::Cancelled)) => return Err(AgentError::Cancelled),
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+        let result = observation.into_tool_result(call.0.clone());
+        send_event(
+            events,
+            AgentEvent::ToolStarted {
+                call_id: call.0.clone(),
+                name: call.1.clone(),
+                permission: "read_only".to_owned(),
+                operation: call.1.clone(),
+                step_id: None,
+            },
+        )
+        .await?;
+        send_event(
+            events,
+            AgentEvent::ToolOutput { call_id: call.0.clone(), output: result.output.clone() },
+        )
+        .await?;
+        send_event(events, AgentEvent::ToolFinished { call_id: call.0.clone(), ok: result.ok })
+            .await?;
+        Ok(Some(ScheduledToolResult {
+            name: call.1.clone(),
+            input: call.2.clone(),
+            result,
+            executed: true,
+            planned: true,
+            planner_actions,
+        }))
     }
 }
 

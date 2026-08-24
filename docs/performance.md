@@ -57,3 +57,11 @@ diagnostics for the new layout; no cross-machine or speculative regression perce
 published.
 
 The release profile is `opt-level=3`, fat LTO, one codegen unit, aborting panic, stripped symbols, no debug info, and no incremental compilation. Public builds do not use `target-cpu=native`.
+
+Repository planner verification on 2026-08-24 used the release Criterion benchmark with 10
+samples. Pure high-confidence planning measured a 1.627 µs median estimate, below the <20 µs
+planning target; bounded execution measured 57.636 µs and includes canonical containment plus the
+bounded local read. The
+planner retains at most 8 candidates, 4 files/actions, 12 KiB of read bytes, 16 KiB of structured
+observation bytes, and 10 ms of execution time. Planning uses only indexed/context evidence, so
+the indexed-context path performs zero filesystem I/O.

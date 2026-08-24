@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-24 (1) - Bounded repository action planning
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added a deterministic, read-only repository action planner that collapses high-confidence
+  search, symbol/relationship lookup, and targeted reads into one bounded structured observation.
+- Added strict ambiguity aborts, current-excerpt/range deduplication, containment and cancellation
+  bounds, planner execution metrics, a planner benchmark, and a difficult multi-round-trip eval.
+
+### Performance
+
+- Planner planning is pure and bounded; when current indexed context answers the request it emits
+  no filesystem reads. Evaluation output now reports planner hit-rate, ambiguity aborts, planned
+  actions, bytes, context, correctness, and before/after model/tool efficiency.
+
 ## Unreleased - 2026-08-23 (13) - Direct command intelligence
 
 > Status: unreleased work. No artifact has been published.
