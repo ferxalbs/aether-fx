@@ -25,7 +25,7 @@ Verified on 2026-08-21 using Rust/Cargo `1.98.0`, `cargo info`, crates.io metada
 | rainy-sdk | 0.6.14 | Apache-2.0 | Official Rainy API boundary; verified Responses, stream, catalog, and error APIs | Network path |
 | criterion | 0.8.2 | Apache-2.0 OR MIT | Reproducible local benchmarks | Benchmark only |
 
-The verified Rainy SDK is `rainy-sdk 0.6.14`. No `6.5.x` release was available, so AETHER does not fabricate that version or its APIs. The adapter is isolated so a later verified SDK generation can replace it.
+The verified Rainy SDK is `rainy-sdk 0.6.16`. No `6.5.x` release was available, so AETHER does not fabricate that version or its APIs. The adapter is isolated so a later verified SDK generation can replace it.
 
 No new crate is added. `aether-agent` uses the existing `blake3` crate for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, or unpublished Rainy SDK version is used.
 

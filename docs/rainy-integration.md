@@ -12,7 +12,7 @@ Rainy's transport/retry behavior remains Rainy's/SDK's responsibility. AETHER em
 
 ## Continuation invalidation and typed recovery
 
-`rainy-sdk 0.6.14` has no continuation-specific error type. AETHER maps to `BackendError::InvalidContinuation` only with structured protocol evidence:
+`rainy-sdk 0.6.16` has no continuation-specific error type. AETHER maps to `BackendError::InvalidContinuation` only with structured protocol evidence:
 
 - locally, a continuation object is present but has no non-empty `previous_response_id` string;
 - a Rainy `InvalidRequest` whose machine-readable `code` is `previous_response_id`, `invalid_previous_response_id`, or `INVALID_PREVIOUS_RESPONSE_ID`, and only when that request attached a previous response id.

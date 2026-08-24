@@ -12,7 +12,7 @@ The direct dependency baseline is:
 | grep-searcher | 0.1.17 | MIT OR Unlicense |
 | ignore | 0.4.33 | MIT OR Unlicense |
 | lexopt | 0.3.2 | MIT |
-| rainy-sdk | 0.6.14 | Apache-2.0 |
+| rainy-sdk | 0.6.16 | Apache-2.0 |
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 OR MIT OR Apache-2.0 WITH LLVM-exception |
 | serde / serde_json | 1.0.229 / 1.0.151 | MIT OR Apache-2.0 |

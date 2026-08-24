@@ -356,7 +356,7 @@ unreleased, with changes grouped by public capability.
 - Documented context/session bounds, resume behavior, and remaining
   filesystems that lack both exclusive rename and hard links.
 
-### Known Limitations
+### Known limitations and constraints
 
 - Filesystems without exclusive no-replace rename or hard links cannot
   atomically create-if-absent; AETHER fails closed rather than copying over an
@@ -398,7 +398,7 @@ unreleased, with changes grouped by public capability.
 - Re-ran the existing benchmark suite and recorded current local measurements
   and observed regression signals in `docs/performance.md`.
 
-### Documentation
+### Documentation updates
 
 - Documented atomic replacement versus atomic create-if-absent, optimistic
   content preconditions, process cleanup aggregation, permission cancellation,
@@ -497,7 +497,7 @@ unreleased, with changes grouped by public capability.
   configuration error.
 - Removed catalog-order fallback and unnecessary catalog fetches from normal
   model-selected inference.
-- Kept `rainy-sdk 0.6.14`; no unpublished Git dependency or speculative SDK
+- Kept `rainy-sdk 0.6.16`; no unpublished Git dependency or speculative SDK
   upgrade was introduced.
 
 ### Tests
