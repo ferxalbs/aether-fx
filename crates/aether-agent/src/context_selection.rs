@@ -2,6 +2,8 @@
 
 use std::cmp::Reverse;
 
+use crate::symbol_index::SymbolRelationshipKind;
+
 /// The origin of a context candidate.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ContextKind {
@@ -31,6 +33,15 @@ pub struct ContextCandidate<'a> {
 pub struct SymbolHint<'a> {
     pub path: &'a str,
     pub name: &'a str,
+}
+
+/// A bounded relationship hit supplied by repository symbol navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelationshipHint<'a> {
+    pub path: &'a str,
+    pub kind: SymbolRelationshipKind,
+    pub score: usize,
+    pub ambiguous: bool,
 }
 
 impl<'a> ContextCandidate<'a> {
@@ -89,6 +100,19 @@ pub fn select_context_with_symbols(
     item_limit: usize,
     symbols: &[SymbolHint<'_>],
 ) -> SelectedContext {
+    select_context_with_relationships(task, candidates, byte_budget, item_limit, symbols, &[])
+}
+
+/// Rank context with direct symbol hits and bounded lexical relationship hits.
+#[must_use]
+pub fn select_context_with_relationships(
+    task: &str,
+    candidates: &[ContextCandidate<'_>],
+    byte_budget: usize,
+    item_limit: usize,
+    symbols: &[SymbolHint<'_>],
+    relationships: &[RelationshipHint<'_>],
+) -> SelectedContext {
     if byte_budget == 0 || item_limit == 0 {
         return SelectedContext { items: Vec::new(), used_bytes: 0 };
     }
@@ -106,6 +130,7 @@ pub fn select_context_with_symbols(
                 Reverse(
                     score_candidate(*candidate, &terms, newest)
                         + symbol_bonus(*candidate, &terms, symbols)
+                        + relationship_hint_bonus(*candidate, relationships)
                         + relationship_bonus(*candidate, candidates),
                 ),
                 index,
@@ -139,6 +164,32 @@ pub fn select_context_with_symbols(
         used_bytes += bytes;
     }
     SelectedContext { items, used_bytes }
+}
+
+fn relationship_hint_bonus(
+    candidate: ContextCandidate<'_>,
+    relationships: &[RelationshipHint<'_>],
+) -> i32 {
+    let Some(path) = candidate.path else { return 0 };
+    relationships
+        .iter()
+        .take(128)
+        .filter(|relationship| relationship.path == path)
+        .map(|relationship| {
+            let role_bonus = match relationship.kind {
+                SymbolRelationshipKind::Definition => 56,
+                SymbolRelationshipKind::Implementation => 50,
+                SymbolRelationshipKind::Caller => 44,
+                SymbolRelationshipKind::Test => 48,
+                SymbolRelationshipKind::Dependency => 32,
+                SymbolRelationshipKind::Import => 24,
+                SymbolRelationshipKind::Module => 20,
+            };
+            let evidence_bonus = (relationship.score.min(128) / 8) as i32;
+            let ambiguity_penalty = if relationship.ambiguous { 10 } else { 0 };
+            role_bonus + evidence_bonus - ambiguity_penalty
+        })
+        .sum()
 }
 
 fn symbol_bonus(
@@ -291,6 +342,33 @@ mod tests {
         let symbols = [SymbolHint { path: "src/target.rs", name: "open_session" }];
         let selected = select_context_with_symbols("open_session", &candidates, 4096, 1, &symbols);
         assert_eq!(selected.items[0].index, 1);
+    }
+
+    #[test]
+    fn relationship_hits_promote_tests_and_callers_without_resolving_ambiguity() {
+        let candidates = [
+            candidate(ContextKind::InspectedFile, "src/unrelated.rs", "unrelated"),
+            candidate(ContextKind::InspectedFile, "src/caller.rs", "caller"),
+            candidate(ContextKind::InspectedFile, "tests/target_test.rs", "test"),
+        ];
+        let relationships = [
+            RelationshipHint {
+                path: "src/caller.rs",
+                kind: SymbolRelationshipKind::Caller,
+                score: 92,
+                ambiguous: true,
+            },
+            RelationshipHint {
+                path: "tests/target_test.rs",
+                kind: SymbolRelationshipKind::Test,
+                score: 84,
+                ambiguous: false,
+            },
+        ];
+        let selected =
+            select_context_with_relationships("target", &candidates, 4096, 2, &[], &relationships);
+        assert_eq!(selected.items[0].index, 2);
+        assert_eq!(selected.items[1].index, 1);
     }
 
     #[test]

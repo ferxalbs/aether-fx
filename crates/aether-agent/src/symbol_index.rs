@@ -15,6 +15,7 @@ pub const MAX_SYMBOL_FILES: usize = 128;
 pub const MAX_SYMBOLS_PER_FILE: usize = 512;
 pub const MAX_SYMBOL_RELATIONSHIPS_PER_FILE: usize = 256;
 pub const MAX_SYMBOL_LOOKUP_RESULTS: usize = 128;
+pub const MAX_SYMBOL_RELATIONSHIP_FANOUT: usize = 32;
 const MAX_SYMBOL_TOKENS: usize = 32 * 1024;
 const MAX_SYMBOL_NAME_BYTES: usize = 128;
 
@@ -93,6 +94,8 @@ pub struct SymbolRelation {
 pub enum SymbolRelationKind {
     Contains,
     Imports,
+    References,
+    Implements,
 }
 
 /// All bounded symbol data retained for one source file.
@@ -122,11 +125,318 @@ pub struct SymbolMatch {
     pub score: usize,
 }
 
+/// The bounded, lexical roles used by cross-file relationship lookup.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SymbolRelationshipKind {
+    Definition,
+    Caller,
+    Implementation,
+    Test,
+    Dependency,
+    Import,
+    Module,
+}
+
+/// A ranked cross-file relationship candidate.
+///
+/// `ambiguous` is true when more than one lexical definition can explain the query. The
+/// relationship is intentionally still returned, but callers must not treat it as semantic
+/// resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolRelationshipMatch {
+    pub path: PathBuf,
+    pub symbol: Option<Symbol>,
+    pub kind: SymbolRelationshipKind,
+    pub score: usize,
+    pub ambiguous: bool,
+}
+
+/// Backwards-friendly name for a ranked relationship result.
+pub type SymbolRelationship = SymbolRelationshipMatch;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RelationshipEvidence {
+    path: PathBuf,
+    symbol_index: Option<usize>,
+    kind: SymbolRelationshipKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RelationshipContribution {
+    key: String,
+    evidence: RelationshipEvidence,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RelationshipIndex {
+    by_key: BTreeMap<String, Vec<RelationshipEvidence>>,
+    contributions: BTreeMap<PathBuf, Vec<RelationshipContribution>>,
+    source_by_stem: BTreeMap<String, Vec<PathBuf>>,
+    test_by_stem: BTreeMap<String, Vec<PathBuf>>,
+    stems_by_path: BTreeMap<PathBuf, (bool, String)>,
+}
+
+impl RelationshipIndex {
+    fn insert_file(&mut self, file: &SymbolFile) {
+        self.remove_file(&file.path);
+        let mut contributions = Vec::new();
+        let test_file =
+            is_test_path(&file.path) || file.symbols.iter().any(|symbol| symbol.is_test);
+        if let Some(stem) = path_stem(&file.path) {
+            let stems = if test_file { &mut self.test_by_stem } else { &mut self.source_by_stem };
+            insert_path(stems, stem, file.path.clone());
+            self.stems_by_path.insert(file.path.clone(), (test_file, stem.to_owned()));
+        }
+
+        for (symbol_index, symbol) in file.symbols.iter().enumerate() {
+            if symbol.kind == SymbolKind::Import {
+                continue;
+            }
+            let kind = if symbol.kind == SymbolKind::Module {
+                SymbolRelationshipKind::Module
+            } else if symbol.is_test {
+                SymbolRelationshipKind::Test
+            } else {
+                SymbolRelationshipKind::Definition
+            };
+            add_contribution(
+                &mut self.by_key,
+                &mut contributions,
+                symbol_key(&symbol.name),
+                RelationshipEvidence {
+                    path: file.path.clone(),
+                    symbol_index: Some(symbol_index),
+                    kind,
+                },
+            );
+            if symbol.kind == SymbolKind::Method
+                && let Some(container) = symbol.container.as_deref()
+            {
+                add_contribution(
+                    &mut self.by_key,
+                    &mut contributions,
+                    symbol_key(container),
+                    RelationshipEvidence {
+                        path: file.path.clone(),
+                        symbol_index: Some(symbol_index),
+                        kind: SymbolRelationshipKind::Implementation,
+                    },
+                );
+            }
+        }
+
+        for relation in &file.relationships {
+            match relation.kind {
+                SymbolRelationKind::References => {
+                    let owner = file.symbols.iter().position(|symbol| symbol.name == relation.from);
+                    let kind =
+                        if test_file || owner.is_some_and(|index| file.symbols[index].is_test) {
+                            SymbolRelationshipKind::Test
+                        } else {
+                            SymbolRelationshipKind::Caller
+                        };
+                    add_contribution(
+                        &mut self.by_key,
+                        &mut contributions,
+                        symbol_key(&relation.to),
+                        RelationshipEvidence { path: file.path.clone(), symbol_index: owner, kind },
+                    );
+                }
+                SymbolRelationKind::Implements => {
+                    let method =
+                        file.symbols.iter().position(|symbol| symbol.name == relation.from);
+                    add_contribution(
+                        &mut self.by_key,
+                        &mut contributions,
+                        symbol_key(&relation.to),
+                        RelationshipEvidence {
+                            path: file.path.clone(),
+                            symbol_index: method,
+                            kind: SymbolRelationshipKind::Implementation,
+                        },
+                    );
+                }
+                SymbolRelationKind::Imports => {
+                    let import =
+                        file.symbols.iter().position(|symbol| symbol.name == relation.from);
+                    let target_key = symbol_key(&relation.to);
+                    add_contribution(
+                        &mut self.by_key,
+                        &mut contributions,
+                        target_key.clone(),
+                        RelationshipEvidence {
+                            path: file.path.clone(),
+                            symbol_index: import,
+                            kind: SymbolRelationshipKind::Dependency,
+                        },
+                    );
+                    if let Some(last) = relation.to.rsplit("::").find(|part| !part.is_empty()) {
+                        let last_key = symbol_key(last);
+                        if last_key != target_key {
+                            add_contribution(
+                                &mut self.by_key,
+                                &mut contributions,
+                                last_key,
+                                RelationshipEvidence {
+                                    path: file.path.clone(),
+                                    symbol_index: import,
+                                    kind: SymbolRelationshipKind::Dependency,
+                                },
+                            );
+                        }
+                    }
+                    if let Some(import) = import {
+                        add_contribution(
+                            &mut self.by_key,
+                            &mut contributions,
+                            symbol_key(&file.symbols[import].name),
+                            RelationshipEvidence {
+                                path: file.path.clone(),
+                                symbol_index: Some(import),
+                                kind: SymbolRelationshipKind::Import,
+                            },
+                        );
+                    }
+                }
+                SymbolRelationKind::Contains => {}
+            }
+        }
+        self.contributions.insert(file.path.clone(), contributions);
+    }
+
+    fn remove_file(&mut self, path: &Path) {
+        if let Some(contributions) = self.contributions.remove(path) {
+            for contribution in contributions {
+                remove_evidence(&mut self.by_key, &contribution.key, &contribution.evidence);
+            }
+        }
+        if let Some((test_file, stem)) = self.stems_by_path.remove(path) {
+            let stems = if test_file { &mut self.test_by_stem } else { &mut self.source_by_stem };
+            remove_path_from_stem(stems, &stem, path);
+        }
+    }
+
+    fn lookup(
+        &self,
+        files: &BTreeMap<PathBuf, SymbolFile>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<SymbolRelationshipMatch> {
+        let limit = limit.min(MAX_SYMBOL_LOOKUP_RESULTS);
+        if limit == 0 || query.trim().is_empty() {
+            return Vec::new();
+        }
+        let keys = query
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .filter(|term| term.len() > 1)
+            .take(16)
+            .map(symbol_key)
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let definition_count = keys
+            .iter()
+            .flat_map(|key| self.by_key.get(key).into_iter().flatten())
+            .filter(|evidence| {
+                matches!(
+                    evidence.kind,
+                    SymbolRelationshipKind::Definition | SymbolRelationshipKind::Module
+                )
+            })
+            .map(|evidence| (&evidence.path, evidence.symbol_index))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let mut ranked = Vec::new();
+        for (key_index, key) in keys.iter().enumerate() {
+            for evidence in self.by_key.get(key).into_iter().flatten() {
+                let Some(file) = files.get(&evidence.path) else { continue };
+                let symbol =
+                    evidence.symbol_index.and_then(|index| file.symbols.get(index)).cloned();
+                let mut score = relationship_score(evidence.kind);
+                score = score.saturating_sub(key_index.saturating_mul(4));
+                if definition_count > 1 {
+                    score = score.saturating_sub(8);
+                }
+                ranked.push(SymbolRelationshipMatch {
+                    path: evidence.path.clone(),
+                    symbol,
+                    kind: evidence.kind,
+                    score,
+                    ambiguous: definition_count > 1,
+                });
+            }
+        }
+        for key in keys {
+            let Some(definitions) = self.by_key.get(&key) else { continue };
+            for evidence in definitions.iter().filter(|evidence| {
+                matches!(
+                    evidence.kind,
+                    SymbolRelationshipKind::Definition | SymbolRelationshipKind::Module
+                )
+            }) {
+                let Some(stem) = path_stem(&evidence.path) else { continue };
+                let Some(tests) = self.test_by_stem.get(stem) else { continue };
+                for path in tests.iter().take(MAX_SYMBOL_RELATIONSHIP_FANOUT) {
+                    ranked.push(SymbolRelationshipMatch {
+                        path: path.clone(),
+                        symbol: None,
+                        kind: SymbolRelationshipKind::Test,
+                        score: relationship_score(SymbolRelationshipKind::Test).saturating_sub(4),
+                        ambiguous: definition_count > 1,
+                    });
+                }
+            }
+        }
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| {
+                    left.symbol
+                        .as_ref()
+                        .map(|symbol| symbol.name.as_str())
+                        .cmp(&right.symbol.as_ref().map(|symbol| symbol.name.as_str()))
+                })
+        });
+        ranked.dedup_by(|left, right| {
+            left.path == right.path && left.kind == right.kind && left.symbol == right.symbol
+        });
+        ranked.truncate(limit);
+        ranked
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.by_key
+            .iter()
+            .map(|(key, values)| {
+                key.len()
+                    + values.iter().map(|value| value.path.as_os_str().len() + 24).sum::<usize>()
+            })
+            .sum::<usize>()
+            + self
+                .contributions
+                .values()
+                .flatten()
+                .map(|contribution| {
+                    contribution.key.len() + contribution.evidence.path.as_os_str().len() + 24
+                })
+                .sum::<usize>()
+    }
+
+    fn entry_count(&self) -> usize {
+        self.by_key.values().map(Vec::len).sum()
+    }
+}
+
 /// An in-memory, bounded collection of lazily supplied symbol files.
 #[derive(Clone, Debug)]
 pub struct SymbolIndex {
     files: BTreeMap<PathBuf, SymbolFile>,
     max_files: usize,
+    relationship_index: RelationshipIndex,
 }
 
 impl Default for SymbolIndex {
@@ -138,7 +448,11 @@ impl Default for SymbolIndex {
 impl SymbolIndex {
     #[must_use]
     pub fn new() -> Self {
-        Self { files: BTreeMap::new(), max_files: MAX_SYMBOL_FILES }
+        Self {
+            files: BTreeMap::new(),
+            max_files: MAX_SYMBOL_FILES,
+            relationship_index: RelationshipIndex::default(),
+        }
     }
 
     #[must_use]
@@ -198,6 +512,7 @@ impl SymbolIndex {
     }
 
     pub fn remove_file(&mut self, path: &Path) -> Option<SymbolFile> {
+        self.relationship_index.remove_file(path);
         self.files.remove(path)
     }
 
@@ -216,27 +531,49 @@ impl SymbolIndex {
         lookup_files(paths.iter().filter_map(|path| self.files.get(path)), query, limit)
     }
 
+    /// Rank likely definitions, callers, implementations, tests, and dependencies using only
+    /// bounded lexical evidence from files already present in this index.
+    #[must_use]
+    pub fn lookup_relationships(&self, query: &str, limit: usize) -> Vec<SymbolRelationshipMatch> {
+        self.relationship_index.lookup(&self.files, query, limit)
+    }
+
+    #[must_use]
+    pub fn relationship_count(&self) -> usize {
+        self.relationship_index.entry_count()
+    }
+
+    #[must_use]
+    pub fn estimated_relationship_bytes(&self) -> usize {
+        self.relationship_index.estimated_bytes()
+    }
+
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        self.files
-            .values()
-            .map(|file| {
-                file.path.as_os_str().len()
-                    + file.symbols.iter().map(symbol_bytes).sum::<usize>()
-                    + file
-                        .relationships
-                        .iter()
-                        .map(|relation| relation.from.len() + relation.to.len())
-                        .sum::<usize>()
-            })
-            .sum()
+        self.relationship_index.estimated_bytes()
+            + self
+                .files
+                .values()
+                .map(|file| {
+                    file.path.as_os_str().len()
+                        + file.symbols.iter().map(symbol_bytes).sum::<usize>()
+                        + file
+                            .relationships
+                            .iter()
+                            .map(|relation| relation.from.len() + relation.to.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     fn insert(&mut self, file: SymbolFile) {
+        self.relationship_index.remove_file(&file.path);
         if !self.files.contains_key(&file.path) && self.files.len() >= self.max_files {
             let Some(oldest) = self.files.keys().next().cloned() else { return };
+            self.relationship_index.remove_file(&oldest);
             self.files.remove(&oldest);
         }
+        self.relationship_index.insert_file(&file);
         self.files.insert(file.path.clone(), file);
     }
 }
@@ -359,6 +696,89 @@ fn symbol_bytes(symbol: &Symbol) -> usize {
     symbol.name.len() + symbol.container.as_ref().map_or(0, String::len) + 32
 }
 
+fn symbol_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn relationship_score(kind: SymbolRelationshipKind) -> usize {
+    match kind {
+        SymbolRelationshipKind::Definition => 120,
+        SymbolRelationshipKind::Implementation => 104,
+        SymbolRelationshipKind::Caller => 92,
+        SymbolRelationshipKind::Test => 84,
+        SymbolRelationshipKind::Dependency => 68,
+        SymbolRelationshipKind::Import => 56,
+        SymbolRelationshipKind::Module => 48,
+    }
+}
+
+fn add_contribution(
+    by_key: &mut BTreeMap<String, Vec<RelationshipEvidence>>,
+    contributions: &mut Vec<RelationshipContribution>,
+    key: String,
+    evidence: RelationshipEvidence,
+) {
+    if key.is_empty() {
+        return;
+    }
+    let values = by_key.entry(key.clone()).or_default();
+    if !values.contains(&evidence) {
+        values.push(evidence.clone());
+        values.sort_unstable_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.symbol_index.cmp(&right.symbol_index))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        values.truncate(MAX_SYMBOL_RELATIONSHIP_FANOUT);
+    }
+    if values.contains(&evidence) {
+        contributions.push(RelationshipContribution { key, evidence });
+    }
+}
+
+fn remove_evidence(
+    by_key: &mut BTreeMap<String, Vec<RelationshipEvidence>>,
+    key: &str,
+    evidence: &RelationshipEvidence,
+) {
+    let Some(values) = by_key.get_mut(key) else { return };
+    values.retain(|value| value != evidence);
+    if values.is_empty() {
+        by_key.remove(key);
+    }
+}
+
+fn insert_path(paths: &mut BTreeMap<String, Vec<PathBuf>>, stem: &str, path: PathBuf) {
+    let values = paths.entry(stem.to_owned()).or_default();
+    if !values.contains(&path) {
+        values.push(path);
+        values.sort_unstable();
+        values.truncate(MAX_SYMBOL_RELATIONSHIP_FANOUT);
+    }
+}
+
+fn remove_path_from_stem(paths: &mut BTreeMap<String, Vec<PathBuf>>, stem: &str, path: &Path) {
+    let Some(values) = paths.get_mut(stem) else { return };
+    values.retain(|value| value != path);
+    if values.is_empty() {
+        paths.remove(stem);
+    }
+}
+
+fn path_stem(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|stem| stem.to_str()).map(|stem| stem.trim_end_matches("_test"))
+}
+
+fn is_test_path(path: &Path) -> bool {
+    if path.components().any(|component| component.as_os_str() == "tests") {
+        return true;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.starts_with("test_") || stem.ends_with("_test"))
+}
+
 fn hash_source(source: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(source);
@@ -422,35 +842,41 @@ fn parse_rust_symbols(source: &str) -> (Vec<Symbol>, Vec<SymbolRelation>) {
         {
             if symbols.len() < MAX_SYMBOLS_PER_FILE {
                 let raw = source[token.end..tokens[close].start].trim();
-                let name = bounded_name(raw);
                 let container = container_name(&scopes);
-                let symbol_index = symbols.len();
-                symbols.push(Symbol {
-                    name: if name.is_empty() { "use".to_owned() } else { name.clone() },
-                    kind: SymbolKind::Import,
-                    start_line: token.line,
-                    end_line: tokens[close].line,
-                    container: container.clone(),
-                    is_test: false,
-                });
-                if let Some(container) = container {
+                for (name, target) in
+                    import_entries(raw).into_iter().take(MAX_SYMBOL_RELATIONSHIPS_PER_FILE)
+                {
+                    if symbols.len() >= MAX_SYMBOLS_PER_FILE {
+                        break;
+                    }
+                    let symbol_index = symbols.len();
+                    symbols.push(Symbol {
+                        name: if name.is_empty() { "use".to_owned() } else { name },
+                        kind: SymbolKind::Import,
+                        start_line: token.line,
+                        end_line: tokens[close].line,
+                        container: container.clone(),
+                        is_test: false,
+                    });
+                    if let Some(container) = container.clone() {
+                        push_relationship(
+                            &mut relationships,
+                            SymbolRelation {
+                                from: container.clone(),
+                                to: symbols[symbol_index].name.clone(),
+                                kind: SymbolRelationKind::Contains,
+                            },
+                        );
+                    }
                     push_relationship(
                         &mut relationships,
                         SymbolRelation {
-                            from: container,
-                            to: symbols[symbol_index].name.clone(),
-                            kind: SymbolRelationKind::Contains,
+                            from: symbols[symbol_index].name.clone(),
+                            to: target,
+                            kind: SymbolRelationKind::Imports,
                         },
                     );
                 }
-                push_relationship(
-                    &mut relationships,
-                    SymbolRelation {
-                        from: symbols[symbol_index].name.clone(),
-                        to: name,
-                        kind: SymbolRelationKind::Imports,
-                    },
-                );
             }
             pending = None;
             pending_test = false;
@@ -486,11 +912,21 @@ fn parse_rust_symbols(source: &str) -> (Vec<Symbol>, Vec<SymbolRelation>) {
                         push_relationship(
                             &mut relationships,
                             SymbolRelation {
-                                from: container,
+                                from: container.clone(),
                                 to: name.clone(),
                                 kind: SymbolRelationKind::Contains,
                             },
                         );
+                        if kind == SymbolKind::Method {
+                            push_relationship(
+                                &mut relationships,
+                                SymbolRelation {
+                                    from: name.clone(),
+                                    to: container.clone(),
+                                    kind: SymbolRelationKind::Implements,
+                                },
+                            );
+                        }
                     }
                     Some(symbol_index)
                 } else {
@@ -560,6 +996,17 @@ fn parse_rust_symbols(source: &str) -> (Vec<Symbol>, Vec<SymbolRelation>) {
         } else if word == ";" {
             pending = None;
             pending_test = false;
+        } else if is_reference_identifier(word)
+            && let Some(owner) = reference_owner(&scopes)
+        {
+            push_relationship(
+                &mut relationships,
+                SymbolRelation {
+                    from: owner,
+                    to: bounded_name(word),
+                    kind: SymbolRelationKind::References,
+                },
+            );
         }
         index += 1;
     }
@@ -617,6 +1064,40 @@ fn find_attribute_end(tokens: &[Token], source: &str, open: usize) -> Option<usi
         }
     }
     None
+}
+
+fn import_entries(raw: &str) -> Vec<(String, String)> {
+    let raw = raw.trim();
+    let Some(open) = raw.find('{') else {
+        return vec![import_entry(raw)];
+    };
+    let Some(close) = raw.rfind('}') else {
+        return vec![import_entry(raw)];
+    };
+    let prefix = raw[..open].trim_end_matches(":").trim();
+    let body = &raw[open + 1..close];
+    let mut entries = Vec::new();
+    for part in body.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        let item = if part == "self" {
+            prefix.to_owned()
+        } else if prefix.is_empty() {
+            part.to_owned()
+        } else {
+            format!("{prefix}::{part}")
+        };
+        entries.push(import_entry(&item));
+    }
+    if entries.is_empty() { vec![import_entry(raw)] } else { entries }
+}
+
+fn import_entry(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    let (target, alias) = raw
+        .split_once(" as ")
+        .map_or((raw, None), |(target, alias)| (target.trim(), Some(alias.trim())));
+    let target = bounded_name(target);
+    let name = alias.map(bounded_name).unwrap_or_else(|| target.clone());
+    (name, target)
 }
 
 fn attribute_is_test(source: &str, start: usize, end: usize) -> bool {
@@ -683,6 +1164,56 @@ fn container_name(scopes: &[Scope]) -> Option<String> {
         }
     }
     (!names.is_empty()).then(|| names.join("::"))
+}
+
+fn reference_owner(scopes: &[Scope]) -> Option<String> {
+    scopes.iter().rev().find_map(|scope| {
+        matches!(scope.kind, ScopeKind::Function).then(|| scope.name.clone()).flatten()
+    })
+}
+
+fn is_reference_identifier(word: &str) -> bool {
+    is_identifier(word)
+        && !matches!(
+            word,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        )
 }
 
 fn in_impl(scopes: &[Scope]) -> bool {
@@ -938,5 +1469,96 @@ mod tests {
         let matches = index.lookup("target_two", 4);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, Path::new("src/two.rs"));
+    }
+
+    #[test]
+    fn cross_file_relationships_rank_definitions_callers_implementations_tests_and_dependencies() {
+        let mut index = SymbolIndex::new();
+        index.index_file(
+            "src/widget.rs",
+            "pub struct Widget;\nimpl Widget { pub fn open(&self) {} }\n",
+        );
+        index.index_file("src/lib.rs", "mod widget;\n");
+        index.index_file(
+            "src/use.rs",
+            "use crate::widget::Widget as ImportedWidget;\nfn caller() { open(); ImportedWidget; }\n",
+        );
+        index.index_file(
+            "tests/widget_test.rs",
+            "use crate::widget::Widget;\n#[test]\nfn widget_behavior() { Widget; }\n",
+        );
+
+        let widget = index.lookup_relationships("Widget", 32);
+        assert_eq!(widget[0].kind, SymbolRelationshipKind::Definition);
+        assert_eq!(widget[0].path, Path::new("src/widget.rs"));
+        assert!(widget.iter().any(|hit| {
+            hit.kind == SymbolRelationshipKind::Dependency && hit.path == Path::new("src/use.rs")
+        }));
+        assert!(widget.iter().any(|hit| {
+            hit.kind == SymbolRelationshipKind::Implementation
+                && hit.path == Path::new("src/widget.rs")
+        }));
+        assert!(widget.iter().any(|hit| {
+            hit.kind == SymbolRelationshipKind::Test
+                && hit.path == Path::new("tests/widget_test.rs")
+        }));
+        assert!(index.lookup_relationships("widget", 8).iter().any(|hit| {
+            hit.kind == SymbolRelationshipKind::Module && hit.path == Path::new("src/lib.rs")
+        }));
+
+        let callers = index.lookup_relationships("open", 8);
+        assert!(callers.iter().any(|hit| {
+            hit.kind == SymbolRelationshipKind::Caller && hit.path == Path::new("src/use.rs")
+        }));
+        let aliases = index.lookup_relationships("ImportedWidget", 8);
+        assert!(aliases.iter().any(|hit| {
+            hit.kind == SymbolRelationshipKind::Import && hit.path == Path::new("src/use.rs")
+        }));
+    }
+
+    #[test]
+    fn ambiguous_names_are_returned_without_claiming_resolution() {
+        let mut index = SymbolIndex::new();
+        index.index_file("src/one.rs", "pub fn duplicate() {}");
+        index.index_file("src/two.rs", "pub fn duplicate() {}");
+        let matches = index.lookup_relationships("duplicate", 8);
+        assert_eq!(
+            matches.iter().filter(|hit| hit.kind == SymbolRelationshipKind::Definition).count(),
+            2
+        );
+        assert!(matches.iter().all(|hit| hit.ambiguous));
+    }
+
+    #[test]
+    fn changing_one_participant_invalidates_only_its_relationships() {
+        let mut index = SymbolIndex::new();
+        index.index_file("src/target.rs", "pub fn target() {}");
+        index.index_file("src/caller.rs", "fn caller() { target(); }");
+        index.index_file("src/other.rs", "fn other() { target(); }");
+        let before = index.relationship_count();
+        assert_eq!(
+            index
+                .lookup_relationships("target", 8)
+                .iter()
+                .filter(|hit| hit.kind == SymbolRelationshipKind::Caller)
+                .count(),
+            2
+        );
+        index.index_file("src/caller.rs", "fn caller() {}");
+        let matches = index.lookup_relationships("target", 8);
+        assert!(matches.iter().all(|hit| hit.path != Path::new("src/caller.rs")));
+        assert!(matches.iter().any(|hit| hit.path == Path::new("src/other.rs")));
+        assert!(index.relationship_count() < before);
+    }
+
+    #[test]
+    fn relationship_fanout_and_memory_are_bounded() {
+        let mut index = SymbolIndex::new();
+        for file_index in 0..MAX_SYMBOL_RELATIONSHIP_FANOUT * 2 {
+            index.index_file(format!("src/duplicate_{file_index}.rs"), "pub fn duplicate() {}");
+        }
+        let matches = index.lookup_relationships("duplicate", MAX_SYMBOL_LOOKUP_RESULTS);
+        assert!(matches.len() <= MAX_SYMBOL_RELATIONSHIP_FANOUT);
+        assert!(index.estimated_relationship_bytes() < 64 * 1024);
     }
 }

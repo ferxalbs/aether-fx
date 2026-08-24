@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::symbol_index::{
     MAX_SYMBOL_FILES, MAX_SYMBOL_LOOKUP_RESULTS, SymbolFile, SymbolIndex, SymbolKind,
-    SymbolLanguage, SymbolMatch,
+    SymbolLanguage, SymbolMatch, SymbolRelationshipKind, SymbolRelationshipMatch,
 };
 
 pub const DEFAULT_MAX_REPO_FILES: usize = 4_096;
@@ -571,6 +571,37 @@ impl RepoMap {
                 });
             }
         }
+        for relationship in self.lookup_relationships(query, &paths, limit)? {
+            let selection =
+                selections.iter_mut().find(|selection| selection.path == relationship.path);
+            let score = relationship.score.saturating_sub(relationship.ambiguous as usize * 8);
+            if let Some(selection) = selection {
+                selection.score = selection.score.saturating_add(score);
+                if selection.symbol.is_none()
+                    && let Some(symbol) = relationship.symbol.as_ref()
+                {
+                    selection.symbol = Some(RepoSymbolSelection {
+                        name: symbol.name.clone(),
+                        kind: symbol.kind,
+                        line: symbol.start_line,
+                        container: symbol.container.clone(),
+                    });
+                }
+            } else {
+                let kind = relationship_selection_kind(&relationship);
+                selections.push(RepoSelection {
+                    path: relationship.path,
+                    kind,
+                    score,
+                    symbol: relationship.symbol.map(|symbol| RepoSymbolSelection {
+                        name: symbol.name,
+                        kind: symbol.kind,
+                        line: symbol.start_line,
+                        container: symbol.container,
+                    }),
+                });
+            }
+        }
         selections.sort_by(|left, right| {
             right.score.cmp(&left.score).then_with(|| left.path.cmp(&right.path))
         });
@@ -636,6 +667,21 @@ impl RepoMap {
         }
         let index = self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(index.lookup_in_paths(&targeted, query, limit.min(MAX_SYMBOL_LOOKUP_RESULTS)))
+    }
+
+    /// Look up bounded lexical relationships among the caller-selected and already indexed files.
+    /// This never walks the workspace beyond `paths`.
+    pub fn lookup_relationships(
+        &self,
+        query: &str,
+        paths: &[PathBuf],
+        limit: usize,
+    ) -> Result<Vec<SymbolRelationshipMatch>, RepoMapError> {
+        for path in paths.iter().take(MAX_SYMBOL_FILES) {
+            self.symbols_for_file(path)?;
+        }
+        let index = self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(index.lookup_relationships(query, limit.min(MAX_SYMBOL_LOOKUP_RESULTS)))
     }
 
     /// Retained symbol heap estimate for diagnostics.
@@ -1316,6 +1362,14 @@ fn selection_kind(kind: RepoFileKind) -> RepoSelectionKind {
     }
 }
 
+fn relationship_selection_kind(relationship: &SymbolRelationshipMatch) -> RepoSelectionKind {
+    if is_test_path(&relationship.path) || relationship.kind == SymbolRelationshipKind::Test {
+        RepoSelectionKind::Test
+    } else {
+        RepoSelectionKind::File
+    }
+}
+
 fn manifest_kind(path: &Path) -> ManifestKind {
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return ManifestKind::Other;
@@ -1803,6 +1857,35 @@ mod tests {
         let missing = map.symbols_for_file("src/target.rs").expect("missing symbols");
         assert!(!missing.readable);
         assert_eq!(map.indexed_symbol_files(), 0);
+    }
+
+    #[test]
+    fn targeted_relationship_lookup_indexes_only_participants_and_ranks_source_test_edges() {
+        let repo = TempRepo::new();
+        repo.write("src/widget.rs", "pub struct Widget;\n");
+        repo.write("src/use.rs", "use crate::widget::Widget as ImportedWidget;\n");
+        repo.write("tests/widget_test.rs", "#[test]\nfn widget() { Widget; }\n");
+        repo.write("src/unrelated.rs", "pub fn unrelated() {}\n");
+        repo.track(&["src/widget.rs", "src/use.rs", "tests/widget_test.rs", "src/unrelated.rs"]);
+        let map = RepoMap::new(&repo.path);
+        let paths = vec![
+            PathBuf::from("src/widget.rs"),
+            PathBuf::from("src/use.rs"),
+            PathBuf::from("tests/widget_test.rs"),
+        ];
+        let matches = map.lookup_relationships("Widget", &paths, 16).expect("relationships");
+        assert_eq!(map.indexed_symbol_files(), 3);
+        assert_eq!(matches[0].kind, crate::symbol_index::SymbolRelationshipKind::Definition);
+        assert_eq!(matches[0].path, Path::new("src/widget.rs"));
+        assert!(matches.iter().any(|hit| {
+            hit.kind == crate::symbol_index::SymbolRelationshipKind::Dependency
+                && hit.path == Path::new("src/use.rs")
+        }));
+        assert!(matches.iter().any(|hit| {
+            hit.kind == crate::symbol_index::SymbolRelationshipKind::Test
+                && hit.path == Path::new("tests/widget_test.rs")
+        }));
+        assert!(!matches.iter().any(|hit| hit.path == Path::new("src/unrelated.rs")));
     }
 
     #[test]

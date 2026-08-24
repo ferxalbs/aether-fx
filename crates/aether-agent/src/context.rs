@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use crate::repo_map::RepoMap;
 use crate::{
-    CommandIntent, ContextCandidate, ContextKind, SymbolHint, classify_command, plan_verification,
-    select_context_with_symbols,
+    CommandIntent, ContextCandidate, ContextKind, RelationshipHint, SymbolHint, classify_command,
+    plan_verification, select_context_with_relationships,
 };
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
@@ -258,6 +258,14 @@ impl ContextEngine {
                 map.lookup_symbols(self.snapshot.current_task.as_str(), &symbol_paths, 64).ok()
             })
             .unwrap_or_default();
+        let relationship_matches = self
+            .repo_map
+            .as_ref()
+            .and_then(|map| {
+                map.lookup_relationships(self.snapshot.current_task.as_str(), &symbol_paths, 64)
+                    .ok()
+            })
+            .unwrap_or_default();
         let symbol_hint_storage = symbol_matches
             .iter()
             .map(|symbol| (symbol.path.to_string_lossy().into_owned(), symbol.symbol.name.clone()))
@@ -265,6 +273,26 @@ impl ContextEngine {
         let symbol_hints = symbol_hint_storage
             .iter()
             .map(|(path, name)| SymbolHint { path, name })
+            .collect::<Vec<_>>();
+        let relationship_hint_storage = relationship_matches
+            .iter()
+            .map(|relationship| {
+                (
+                    relationship.path.to_string_lossy().into_owned(),
+                    relationship.kind,
+                    relationship.score,
+                    relationship.ambiguous,
+                )
+            })
+            .collect::<Vec<_>>();
+        let relationship_hints = relationship_hint_storage
+            .iter()
+            .map(|(path, kind, score, ambiguous)| RelationshipHint {
+                path,
+                kind: *kind,
+                score: *score,
+                ambiguous: *ambiguous,
+            })
             .collect::<Vec<_>>();
         let mut candidates = Vec::with_capacity(
             self.snapshot.inspected.len()
@@ -358,12 +386,13 @@ impl ContextEngine {
             });
         }
         let fixed_bytes = out.len() + CONTEXT_GUIDANCE.len() + 32;
-        let selection = select_context_with_symbols(
+        let selection = select_context_with_relationships(
             self.snapshot.current_task.as_str(),
             &candidates,
             MAX_CONTEXT_RENDER_BYTES.saturating_sub(fixed_bytes),
             MAX_CONTEXT_ITEMS,
             &symbol_hints,
+            &relationship_hints,
         );
         if !selection.items.is_empty() {
             out.push_str("selected context (relevance-ranked):\n");

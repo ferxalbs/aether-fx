@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (11) - Cross-file symbol relationship ranking
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added bounded, lazy lexical relationships for Rust definitions, callers, implementations,
+  imports, dependencies, modules, and source/test files with ambiguity flags and hash invalidation.
+- Added relationship-aware RepoMap and context selection ranking plus 10,000-symbol benchmarks.
+
+### Performance
+
+- Relationship lookup and one-file update remain targeted to indexed participants; measured medians
+  were 2.095 µs and 8.108 µs respectively on the local benchmark host.
+
 ## Unreleased - 2026-08-23 (10) - Lightweight symbol-aware repository navigation
 
 > Status: unreleased work. No artifact has been published.
