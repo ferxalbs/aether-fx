@@ -16,8 +16,8 @@
 
 ### Performance
 
-- Policy observations reuse cached context and retain fixed-size state; the local benchmark
-  median was 10.062 µs per completed observation and 236.01 ns per next-action ranking, below
+- Policy observations reuse cached context and retain fixed-size state; the final local benchmark
+  median was 10.273 µs per completed observation and 241.28 ns per next-action ranking, below
   the 20 µs overhead target.
 
 ## Unreleased - 2026-08-23 (11) - Cross-file symbol relationship ranking
