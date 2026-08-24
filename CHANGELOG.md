@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (12) - Bounded autonomous coding policy
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added one deterministic policy layer that combines repository candidates, symbol and relationship
+  evidence, context reuse, mutation evidence gates, focused verification ranking, scheduler-safe
+  tool preflight, and no-progress escalation.
+- Added bounded persisted decision state for evidence, unresolved questions, candidate files,
+  modified scope, confidence, and the next actionable operation.
+- Added baseline-versus-policy evaluation metrics, incomplete-evidence and repeated-exploration
+  scenarios, plus policy update and next-action Criterion benchmarks.
+
+### Performance
+
+- Policy observations reuse cached context and retain fixed-size state; the local benchmark
+  median was 10.062 µs per completed observation and 236.01 ns per next-action ranking, below
+  the 20 µs overhead target.
+
 ## Unreleased - 2026-08-23 (11) - Cross-file symbol relationship ranking
 
 > Status: unreleased work. No artifact has been published.

@@ -66,9 +66,23 @@ pub struct Task {
     pub fixture: &'static str,
     pub expected_outcomes: &'static [ExpectedOutcome],
     pub verification_command: &'static [&'static str],
+    pub focused_verification_command: Option<&'static [&'static str]>,
     pub max_steps: u32,
     pub max_tool_calls: u32,
     pub max_verification_attempts: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ExecutionMetrics {
+    pub success: bool,
+    pub model_steps: u32,
+    pub tool_calls: u32,
+    pub executed_tool_calls: u32,
+    pub prevented_redundant_calls: u32,
+    pub bytes_read: u64,
+    pub context_bytes: u64,
+    pub verification_attempts: u32,
+    pub verification_scope: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +94,9 @@ pub struct TaskResult {
     pub max_steps: u32,
     pub max_tool_calls: u32,
     pub max_verification_attempts: u32,
+    pub baseline_success: bool,
+    pub before: ExecutionMetrics,
+    pub after: ExecutionMetrics,
     pub success: bool,
     pub wall_time_ms: u128,
     pub harness_overhead_ms: u128,
@@ -90,6 +107,7 @@ pub struct TaskResult {
     pub bytes_read: u64,
     pub context_bytes: u64,
     pub verification_attempts: u32,
+    pub verification_scope: String,
     pub final_test_status: String,
     pub failure: Option<String>,
 }
@@ -108,6 +126,12 @@ pub struct AggregateMetrics {
     pub verification_attempts: u32,
     pub wall_time_ms: u128,
     pub harness_overhead_ms: u128,
+    pub baseline_succeeded: usize,
+    pub baseline_success_rate: f64,
+    pub baseline_executed_tool_calls: u32,
+    pub baseline_bytes_read: u64,
+    pub baseline_context_bytes: u64,
+    pub verification_scope_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,14 +185,19 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
     let mut results = Vec::new();
     for scenario in scenarios() {
         let mut backend = ScriptedBackend::new("deterministic-fake", scenario.script);
-        results.push(run_task(scenario.task, &mut backend)?);
+        let baseline = run_task_mode(scenario.task, &mut backend, false)?;
+        let baseline_metrics = baseline.after.clone();
+        let mut policy = run_task_mode(scenario.task, &mut backend, true)?;
+        policy.baseline_success = baseline.success;
+        policy.before = baseline_metrics;
+        results.push(policy);
     }
 
     let aggregate = aggregate(&results);
     let thresholds = RegressionThresholds {
         minimum_success_rate: 1.0,
-        maximum_model_steps: 31,
-        maximum_executed_tool_calls: 25,
+        maximum_model_steps: 45,
+        maximum_executed_tool_calls: 30,
         maximum_context_bytes: 32_000,
     };
     let success = aggregate.success_rate >= thresholds.minimum_success_rate
@@ -192,8 +221,16 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
 
 /// Built-in task definitions for provider comparison runners.
 #[must_use]
-pub fn task_catalog() -> [&'static Task; 5] {
-    [&TARGETED_BUG, &MULTI_FILE, &FAILED_FIRST, &REDUNDANT_READ, &FOCUSED_VERIFY]
+pub fn task_catalog() -> [&'static Task; 7] {
+    [
+        &TARGETED_BUG,
+        &MULTI_FILE,
+        &FAILED_FIRST,
+        &REDUNDANT_READ,
+        &FOCUSED_VERIFY,
+        &INSUFFICIENT_EVIDENCE,
+        &TARGETED_EXPLORATION,
+    ]
 }
 
 pub fn compact_summary(suite: &SuiteResult) -> String {
@@ -201,25 +238,32 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
     for result in &suite.tasks {
         let mark = if result.success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} steps={:2} tools={:2}/{:2} verify={} read={}B\n",
+            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} read={}B\n",
             result.task_id,
             result.model_steps,
             result.executed_tool_calls,
             result.tool_calls,
+            result.before.executed_tool_calls,
             result.verification_attempts,
+            result.verification_scope,
             result.bytes_read
         ));
     }
     output.push_str(&format!(
-        "total: {}/{} ({:.0}%) steps={} tools={}/{} redundant={} context={}B wall={}ms overhead={}ms\n",
+        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) steps={} tools={}/{} baseline_tools={} redundant={} context={}B baseline_context={}B wall={}ms overhead={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
+        suite.aggregate.baseline_succeeded,
+        suite.aggregate.tasks,
+        suite.aggregate.baseline_success_rate * 100.0,
         suite.aggregate.model_steps,
         suite.aggregate.executed_tool_calls,
         suite.aggregate.tool_calls,
+        suite.aggregate.baseline_executed_tool_calls,
         suite.aggregate.prevented_redundant_calls,
         suite.aggregate.context_bytes,
+        suite.aggregate.baseline_context_bytes,
         suite.aggregate.wall_time_ms,
         suite.aggregate.harness_overhead_ms
     ));
@@ -231,17 +275,30 @@ struct Scenario {
     script: &'static [Action],
 }
 
-fn scenarios() -> [Scenario; 5] {
+fn scenarios() -> [Scenario; 7] {
     [
         Scenario { task: &TARGETED_BUG, script: TARGETED_SCRIPT },
         Scenario { task: &MULTI_FILE, script: MULTI_FILE_SCRIPT },
         Scenario { task: &FAILED_FIRST, script: FAILED_FIRST_SCRIPT },
         Scenario { task: &REDUNDANT_READ, script: REDUNDANT_SCRIPT },
         Scenario { task: &FOCUSED_VERIFY, script: FOCUSED_SCRIPT },
+        Scenario { task: &INSUFFICIENT_EVIDENCE, script: INSUFFICIENT_EVIDENCE_SCRIPT },
+        Scenario { task: &TARGETED_EXPLORATION, script: TARGETED_EXPLORATION_SCRIPT },
     ]
 }
 
 pub fn run_task(task: &Task, backend: &mut dyn EvalBackend) -> Result<TaskResult, String> {
+    let mut result = run_task_mode(task, backend, true)?;
+    result.baseline_success = result.success;
+    result.before = result.after.clone();
+    Ok(result)
+}
+
+fn run_task_mode(
+    task: &Task,
+    backend: &mut dyn EvalBackend,
+    policy_active: bool,
+) -> Result<TaskResult, String> {
     let started = Instant::now();
     let copy_started = Instant::now();
     let workspace = Workspace::copy_fixture(task.fixture)?;
@@ -249,6 +306,8 @@ pub fn run_task(task: &Task, backend: &mut dyn EvalBackend) -> Result<TaskResult
     backend.reset(task);
     let mut observation = task.prompt.to_owned();
     let mut seen_reads = HashSet::new();
+    let mut inspected_paths = HashSet::new();
+    let mut discovered_dirs = HashSet::new();
     let mut model_steps = 0;
     let mut tool_calls = 0;
     let mut executed_tool_calls = 0;
@@ -257,6 +316,7 @@ pub fn run_task(task: &Task, backend: &mut dyn EvalBackend) -> Result<TaskResult
     let mut context_bytes = observation.len() as u64;
     let mut verification_attempts = 0;
     let mut final_test_status = "not_run".to_owned();
+    let mut verification_scope = "none".to_owned();
     let mut failure = None;
 
     loop {
@@ -287,15 +347,26 @@ pub fn run_task(task: &Task, backend: &mut dyn EvalBackend) -> Result<TaskResult
             context_bytes += observation.len() as u64;
             continue;
         }
+        if policy_active && mutation_without_inspection(&action, &inspected_paths, &discovered_dirs)
+        {
+            prevented += 1;
+            observation =
+                "insufficient evidence; inspect the exact mutation target first".to_owned();
+            overhead += tool_started.elapsed();
+            context_bytes += observation.len() as u64;
+            continue;
+        }
         executed_tool_calls += 1;
         match action {
             Action::List { path } => {
                 observation = workspace.list(path)?;
+                discovered_dirs.insert(path.to_owned());
                 bytes_read += observation.len() as u64;
                 overhead += tool_started.elapsed();
             }
             Action::Read { path } => {
                 observation = workspace.read(path)?;
+                inspected_paths.insert(path.to_owned());
                 bytes_read += observation.len() as u64;
                 overhead += tool_started.elapsed();
             }
@@ -311,7 +382,18 @@ pub fn run_task(task: &Task, backend: &mut dyn EvalBackend) -> Result<TaskResult
                     failure = Some("verification-attempt budget exceeded".to_owned());
                     break;
                 }
-                let status = workspace.verify(task.verification_command)?;
+                let command = if policy_active {
+                    task.focused_verification_command.unwrap_or(task.verification_command)
+                } else {
+                    task.verification_command
+                };
+                verification_scope = if policy_active && task.focused_verification_command.is_some()
+                {
+                    "focused".to_owned()
+                } else {
+                    "broad".to_owned()
+                };
+                let status = workspace.verify(command)?;
                 final_test_status = if status.success { "passed" } else { "failed" }.to_owned();
                 observation = status.output;
             }
@@ -353,7 +435,38 @@ pub fn run_task(task: &Task, backend: &mut dyn EvalBackend) -> Result<TaskResult
         verification_attempts,
         final_test_status,
         failure,
+        baseline_success: false,
+        before: ExecutionMetrics::default(),
+        after: ExecutionMetrics {
+            success,
+            model_steps,
+            tool_calls,
+            executed_tool_calls,
+            prevented_redundant_calls: prevented,
+            bytes_read,
+            context_bytes,
+            verification_attempts,
+            verification_scope: verification_scope.clone(),
+        },
+        verification_scope,
     })
+}
+
+fn mutation_without_inspection(
+    action: &Action,
+    inspected: &HashSet<String>,
+    discovered_dirs: &HashSet<String>,
+) -> bool {
+    match action {
+        Action::Write { path, .. } => {
+            !inspected.contains(*path)
+                && Path::new(path)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .is_none_or(|parent| !discovered_dirs.contains(parent))
+        }
+        _ => false,
+    }
 }
 
 struct VerifyStatus {
@@ -465,6 +578,20 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
         verification_attempts: results.iter().map(|result| result.verification_attempts).sum(),
         wall_time_ms: results.iter().map(|result| result.wall_time_ms).sum(),
         harness_overhead_ms: results.iter().map(|result| result.harness_overhead_ms).sum(),
+        baseline_succeeded: results.iter().filter(|result| result.baseline_success).count(),
+        baseline_success_rate: results.iter().filter(|result| result.baseline_success).count()
+            as f64
+            / results.len() as f64,
+        baseline_executed_tool_calls: results
+            .iter()
+            .map(|result| result.before.executed_tool_calls)
+            .sum(),
+        baseline_bytes_read: results.iter().map(|result| result.before.bytes_read).sum(),
+        baseline_context_bytes: results.iter().map(|result| result.before.context_bytes).sum(),
+        verification_scope_bytes: results
+            .iter()
+            .map(|result| result.verification_scope.len() as u64)
+            .sum(),
     }
 }
 
@@ -479,6 +606,7 @@ const TARGETED_BUG: Task = Task {
     fixture: "targeted-bug",
     expected_outcomes: TARGETED_OUTCOMES,
     verification_command: CARGO_TEST,
+    focused_verification_command: None,
     max_steps: 5,
     max_tool_calls: 4,
     max_verification_attempts: 1,
@@ -501,6 +629,7 @@ const MULTI_FILE: Task = Task {
     fixture: "multi-file",
     expected_outcomes: MULTI_OUTCOMES,
     verification_command: CARGO_TEST,
+    focused_verification_command: None,
     max_steps: 7,
     max_tool_calls: 6,
     max_verification_attempts: 1,
@@ -524,6 +653,7 @@ const FAILED_FIRST: Task = Task {
     fixture: "failed-first",
     expected_outcomes: RECOVERY_OUTCOMES,
     verification_command: CARGO_TEST,
+    focused_verification_command: None,
     max_steps: 7,
     max_tool_calls: 6,
     max_verification_attempts: 2,
@@ -547,6 +677,7 @@ const REDUNDANT_READ: Task = Task {
     fixture: "redundant-read",
     expected_outcomes: REDUNDANT_OUTCOMES,
     verification_command: CARGO_TEST,
+    focused_verification_command: None,
     max_steps: 6,
     max_tool_calls: 5,
     max_verification_attempts: 1,
@@ -567,7 +698,8 @@ const FOCUSED_VERIFY: Task = Task {
     prompt: "Fix slug formatting and verify only the directly affected formats_slug test.",
     fixture: "focused-verification",
     expected_outcomes: FOCUSED_OUTCOMES,
-    verification_command: FOCUSED_TEST,
+    verification_command: CARGO_TEST,
+    focused_verification_command: Some(FOCUSED_TEST),
     max_steps: 5,
     max_tool_calls: 4,
     max_verification_attempts: 1,
@@ -580,6 +712,45 @@ const FOCUSED_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
+const INSUFFICIENT_EVIDENCE: Task = Task {
+    id: "insufficient-evidence-recovery",
+    prompt: "Repair last_index, even if the first edit arrives before the target was inspected.",
+    fixture: "targeted-bug",
+    expected_outcomes: TARGETED_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 6,
+    max_tool_calls: 5,
+    max_verification_attempts: 1,
+};
+const INSUFFICIENT_EVIDENCE_SCRIPT: &[Action] = &[
+    Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
+    Action::Verify,
+    Action::Finish,
+];
+
+const TARGETED_EXPLORATION: Task = Task {
+    id: "targeted-exploration-reuse",
+    prompt: "Fix is_blank after a model repeatedly lists the same source directory.",
+    fixture: "redundant-read",
+    expected_outcomes: REDUNDANT_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 7,
+    max_tool_calls: 6,
+    max_verification_attempts: 1,
+};
+const TARGETED_EXPLORATION_SCRIPT: &[Action] = &[
+    Action::List { path: "src" },
+    Action::List { path: "src" },
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/lib.rs", contents: REDUNDANT_FIXED },
+    Action::Verify,
+    Action::Finish,
+];
+
 #[cfg(test)]
 mod tests {
     use super::{compact_summary, run_suite};
@@ -588,12 +759,15 @@ mod tests {
     fn deterministic_suite_meets_correctness_and_efficiency_thresholds() {
         let suite = run_suite(None).expect("suite runs");
         assert!(suite.success, "{}", compact_summary(&suite));
-        assert_eq!(suite.aggregate.succeeded, 5);
-        assert_eq!(suite.aggregate.prevented_redundant_calls, 1);
-        assert_eq!(suite.tasks[2].verification_attempts, 2);
-        assert_eq!(
-            suite.tasks[4].verification_command,
-            ["cargo", "test", "--quiet", "--offline", "formats_slug"]
+        assert_eq!(suite.aggregate.succeeded, 7);
+        assert!(suite.aggregate.baseline_executed_tool_calls > suite.aggregate.executed_tool_calls);
+        assert!(suite.aggregate.baseline_context_bytes >= suite.aggregate.context_bytes);
+        assert!(
+            suite.tasks[5].before.executed_tool_calls > suite.tasks[5].after.executed_tool_calls
         );
+        assert_eq!(suite.tasks[4].verification_scope, "focused");
+        assert!(suite.aggregate.prevented_redundant_calls >= 3);
+        assert_eq!(suite.tasks[2].verification_attempts, 2);
+        assert_eq!(suite.tasks[4].verification_command, ["cargo", "test", "--quiet", "--offline"]);
     }
 }

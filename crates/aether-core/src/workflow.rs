@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::BoundedText;
+use crate::{BoundedText, DecisionState};
 
 /// Maximum number of workspace-relative paths retained as relevant workflow context.
 pub const MAX_WORKFLOW_RELEVANT_FILES: usize = 32;
@@ -202,6 +202,9 @@ pub struct WorkflowState {
     /// Ordered, deduplicated verification plan and its observed outcomes.
     #[serde(default)]
     pub verification_steps: Vec<VerificationStep>,
+    /// Unified bounded evidence, candidate, scope, and next-action state.
+    #[serde(default)]
+    pub decision: DecisionState,
 }
 
 impl WorkflowState {
@@ -219,11 +222,18 @@ impl WorkflowState {
         if self.relevant_files.iter().any(|existing| existing == path.as_str()) {
             return;
         }
-        self.relevant_files.push(path.into_string());
+        self.relevant_files.push(path.clone().into_string());
         if self.relevant_files.len() > MAX_WORKFLOW_RELEVANT_FILES {
             self.relevant_files.remove(0);
         }
         self.progress.note_discovery();
+        self.decision.record_evidence(
+            crate::DecisionEvidenceKind::Discovery,
+            path,
+            "relevant path observed",
+            24,
+            self.workspace_revision,
+        );
         if matches!(self.phase, WorkflowPhase::Discover | WorkflowPhase::Complete) {
             self.phase = WorkflowPhase::Inspect;
         }
@@ -232,6 +242,13 @@ impl WorkflowState {
     /// Record a successful targeted inspection.
     pub fn record_inspection(&mut self) {
         self.progress.note_inspection();
+        self.decision.record_evidence(
+            crate::DecisionEvidenceKind::Inspection,
+            "",
+            "targeted inspection completed",
+            36,
+            self.workspace_revision,
+        );
         if !matches!(self.phase, WorkflowPhase::Verify) {
             self.phase = WorkflowPhase::Inspect;
         }
@@ -253,6 +270,7 @@ impl WorkflowState {
         }
         self.phase = WorkflowPhase::Verify;
         self.verification = WorkflowVerification::Pending;
+        self.decision.progress_confidence = self.decision.progress_confidence.min(80);
     }
 
     /// Add deterministic planning output, deduplicated within the current revision.
@@ -338,6 +356,7 @@ impl WorkflowState {
         for step in &mut self.verification_steps {
             step.status = VerificationStatus::Stale;
         }
+        self.decision.reset_for_workspace_change();
     }
 
     /// Mark the workflow complete only when all bounded completion criteria hold.
@@ -398,6 +417,7 @@ impl WorkflowState {
             failure.code = BoundedText::new(failure.code.as_str(), MAX_WORKFLOW_FIELD_BYTES);
             failure.message = BoundedText::new(failure.message.as_str(), MAX_WORKFLOW_FIELD_BYTES);
         }
+        self.decision.enforce_bounds();
     }
 }
 

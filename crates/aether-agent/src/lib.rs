@@ -10,6 +10,7 @@ mod context_selection;
 mod fake;
 mod guardrails;
 mod permission;
+mod policy;
 mod repo_map;
 mod scheduler;
 mod session;
@@ -31,6 +32,10 @@ pub use guardrails::LoopGuardrails;
 pub use permission::{
     AllowAllPermissionBroker, NoPermissionBroker, PermissionBroker, PermissionFuture,
     SessionPermissionBroker,
+};
+pub use policy::{
+    AutonomousCodingPolicy, MAX_POLICY_CANDIDATES, MAX_POLICY_OBSERVED_PATHS,
+    MIN_MUTATION_CONFIDENCE, RankedAction,
 };
 pub use repo_map::{
     DEFAULT_MAX_REPO_FILES, DEFAULT_MAX_REPO_INSTRUCTION_BYTES, DEFAULT_MAX_REPO_MANIFEST_BYTES,

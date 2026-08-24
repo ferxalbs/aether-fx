@@ -4,6 +4,7 @@
 
 pub mod cancellation;
 pub mod context;
+pub mod decision;
 pub mod error;
 pub mod events;
 pub mod ids;
@@ -24,6 +25,11 @@ pub use context::{
     MAX_STORED_TOOL_SUMMARIES, MAX_STORED_TURNS, MAX_SUMMARY_PATHS, MAX_TASK_BYTES,
     ObservedFileState, compact_tool_result, merge_line_ranges, payload_contains_secrets,
     persistable_continuation,
+};
+pub use decision::{
+    DecisionAction, DecisionCandidate, DecisionEvidence, DecisionEvidenceKind, DecisionQuestion,
+    DecisionState, MAX_DECISION_CANDIDATES, MAX_DECISION_EVIDENCE, MAX_DECISION_FIELD_BYTES,
+    MAX_DECISION_QUESTIONS, MAX_DECISION_SCOPE,
 };
 pub use error::{CoreError, CoreResult};
 pub use events::{AgentEvent, EventSequence, UsageMetadata};

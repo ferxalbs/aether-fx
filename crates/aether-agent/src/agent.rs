@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::context::{ContextEngine, capture_git_snapshot};
 use crate::scheduler::{ToolCallGate, execute_tool_calls_with_gate};
 use crate::{
-    BackendError, CancellationToken, LoopGuardrails, ModelBackend, NoPermissionBroker,
+    AutonomousCodingPolicy, BackendError, CancellationToken, ModelBackend, NoPermissionBroker,
     PermissionBroker,
 };
 
@@ -93,6 +93,8 @@ pub struct AgentMetrics {
     pub context_bytes: u64,
     pub bytes_read: u64,
     pub verification_attempts: u64,
+    /// Smallest verification scope selected by the deterministic policy, when known.
+    pub verification_scope: Option<String>,
     pub provider_wait_ms: u64,
     pub local_execution_ms: u64,
 }
@@ -194,11 +196,12 @@ where
             self.with_context(|engine| engine.set_git(git));
         }
         let mut continuation = request.continuation.clone();
+        let mut policy = AutonomousCodingPolicy::new();
+        self.with_context(|engine| policy.refresh_candidates(engine));
         let mut input =
             assemble_user_input(&request.prompt, self.context_packet(continuation.is_some()));
         let mut steps = 0_u16;
         let mut reconstructed = false;
-        let mut guardrails = LoopGuardrails::new();
 
         loop {
             if cancellation.is_cancelled() {
@@ -336,7 +339,16 @@ where
                 send_event(&events, AgentEvent::Done).await?;
                 self.with_context(|engine| {
                     engine.set_continuation(continuation.clone());
-                    engine.finish_turn();
+                    policy.finish_turn(engine);
+                });
+                let context = self.current_context();
+                let final_metrics = metrics.map(|metrics| {
+                    let mut value = metrics.finish();
+                    let scope = context.workflow.decision.verification_scope.as_str();
+                    if !scope.is_empty() {
+                        value.verification_scope = Some(scope.to_owned());
+                    }
+                    value
                 });
                 return Ok(AgentRunResult {
                     text: BoundedText::new(accumulated, DEFAULT_MAX_OUTPUT_BYTES),
@@ -344,14 +356,14 @@ where
                     cancelled: false,
                     continuation,
                     context: self.current_context(),
-                    metrics: metrics.map(MetricsState::finish),
+                    metrics: final_metrics,
                 });
             }
 
             let snapshot = self.current_context();
             let gate = AgentToolGate {
                 workflow: WorkflowMutationGate { snapshot: snapshot.clone() },
-                guardrails: &guardrails,
+                policy: &policy,
             };
             let completed = execute_tool_calls_with_gate(
                 self.tools.as_ref(),
@@ -368,7 +380,9 @@ where
                 let tool_input = completed.input;
                 let result = completed.result;
                 let before = self.current_context().workflow;
-                self.with_context(|engine| engine.observe_tool(&name, &tool_input, &result));
+                let feedback = self.with_context(|engine| {
+                    policy.observe(engine, &name, &tool_input, &result, completed.executed)
+                });
                 let after = self.current_context().workflow;
                 if let Some(metrics) = &mut metrics {
                     if completed.executed {
@@ -389,7 +403,6 @@ where
                             ));
                     }
                 }
-                let feedback = guardrails.observe(&name, &tool_input, &result, &before, &after);
                 outputs.push(json!({
                     "type": "function_call_output",
                     "call_id": result.call_id.as_str(),
@@ -488,17 +501,17 @@ struct WorkflowMutationGate {
 
 struct AgentToolGate<'a> {
     workflow: WorkflowMutationGate,
-    guardrails: &'a LoopGuardrails,
+    policy: &'a AutonomousCodingPolicy,
 }
 
 impl ToolCallGate for AgentToolGate<'_> {
     fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult> {
-        self.guardrails
+        self.policy
             .preflight(
+                &self.workflow.snapshot,
                 invocation.call_id.clone(),
                 &invocation.name,
                 &invocation.input,
-                self.workflow.snapshot.workflow.workspace_revision,
             )
             .or_else(|| self.workflow.preflight(invocation))
     }

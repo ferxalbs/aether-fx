@@ -70,6 +70,11 @@ impl ContextEngine {
         &self.snapshot
     }
 
+    /// Borrow the bounded snapshot for local policy state updates.
+    pub(crate) fn snapshot_mut(&mut self) -> &mut ContextSnapshot {
+        &mut self.snapshot
+    }
+
     /// Consume the engine and return the snapshot.
     pub fn into_snapshot(self) -> ContextSnapshot {
         self.snapshot
@@ -478,6 +483,40 @@ impl ContextEngine {
         out.push('/');
         out.push_str(&workflow.progress.verifications.to_string());
         out.push('\n');
+        let decision = &workflow.decision;
+        out.push_str("decision: action=");
+        out.push_str(decision.next_action.as_str());
+        out.push_str(" confidence=");
+        out.push_str(&decision.progress_confidence.to_string());
+        out.push_str(" candidates=");
+        out.push_str(&decision.candidate_files.len().to_string());
+        out.push_str(" questions=");
+        out.push_str(&decision.unresolved_questions.len().to_string());
+        if let Some(target) = &decision.next_target {
+            out.push_str(" target=");
+            out.push_str(target.as_str());
+        }
+        out.push('\n');
+        if let Some(candidate) = decision.candidate_files.first() {
+            out.push_str("decision_candidate: ");
+            out.push_str(candidate.path.as_str());
+            out.push_str(" score=");
+            out.push_str(&candidate.score.to_string());
+            if !candidate.inspected || candidate.stale {
+                out.push_str(" inspect_required");
+            }
+            out.push('\n');
+        }
+        if let Some(question) = decision.unresolved_questions.first() {
+            out.push_str("decision_question: ");
+            out.push_str(question.question.as_str());
+            out.push('\n');
+        }
+        if !decision.next_reason.as_str().is_empty() {
+            out.push_str("decision_reason: ");
+            out.push_str(decision.next_reason.as_str());
+            out.push('\n');
+        }
         if let Some(failure) = workflow.unresolved_failures.last() {
             out.push_str("workflow_failure: ");
             out.push_str(failure.tool.as_str());
