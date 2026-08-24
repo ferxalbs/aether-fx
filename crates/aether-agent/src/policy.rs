@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use aether_core::{
-    ContextSnapshot, DecisionAction, DecisionEvidenceKind, ObservedFileState, ToolCallId,
-    ToolResult, WorkflowPhase, WorkflowVerification,
+    CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind, ObservedFileState,
+    ToolCallId, ToolResult, WorkflowPhase, WorkflowVerification, analyze_command,
 };
 use serde_json::Value;
 
@@ -302,7 +302,19 @@ impl AutonomousCodingPolicy {
         name: &str,
         input: &Value,
     ) -> Option<ToolResult> {
-        if !matches!(name, "write" | "patch") || mutation_has_evidence(snapshot, name, input) {
+        if matches!(name, "write" | "patch") {
+            if mutation_has_evidence(snapshot, name, input) {
+                return None;
+            }
+        } else if matches!(name, "shell" | "process") {
+            let effects = command_effects(input)?;
+            if !effects.uncertain
+                && effects.class.is_mutation()
+                && command_mutation_has_evidence(snapshot, &effects)
+            {
+                return None;
+            }
+        } else {
             return None;
         }
         Some(ToolResult::failure(
@@ -343,6 +355,13 @@ impl AutonomousCodingPolicy {
         };
         let modified_paths = engine.snapshot().modified.clone();
         let decision = &mut engine.snapshot_mut().workflow.decision;
+        if is_verification(name, input)
+            && let Some(scope) =
+                command_effects(input).and_then(|effects| effects.verification_scope)
+        {
+            decision.verification_scope =
+                aether_core::BoundedText::new(scope, aether_core::MAX_DECISION_SCOPE);
+        }
         if paths.is_empty() {
             decision.record_evidence(kind, "", detail, 20, revision);
         } else {
@@ -544,21 +563,46 @@ fn is_verification(name: &str, input: &Value) -> bool {
     if !matches!(name, "shell" | "process") {
         return false;
     }
-    let command = input.get("command").or_else(|| input.get("cmd")).and_then(Value::as_str);
-    command.is_some_and(|command| {
-        let command = command.trim().to_ascii_lowercase();
-        [
-            "cargo test",
-            "cargo check",
-            "cargo clippy",
-            "cargo fmt",
-            "cargo build",
-            "npm test",
-            "python -m pytest",
-        ]
+    matches!(name, "shell" | "process")
+        && command_effects(input).is_some_and(|effects| effects.class.is_verification())
+}
+
+fn command_effects(input: &Value) -> Option<CommandEffects> {
+    let program = input.get("program")?.as_str()?;
+    let args = match input.get("args") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    };
+    Some(analyze_command(program, &args, input.get("cwd").and_then(Value::as_str).unwrap_or("")))
+}
+
+fn command_mutation_has_evidence(snapshot: &ContextSnapshot, effects: &CommandEffects) -> bool {
+    let include_manifests = matches!(
+        effects.class,
+        aether_core::CommandClass::DependencyManagement | aether_core::CommandClass::GitMutation
+    );
+    let paths = effects
+        .paths
         .iter()
-        .any(|prefix| command.starts_with(prefix))
-    })
+        .chain(include_manifests.then_some(effects.manifests.iter()).into_iter().flatten());
+    let paths = paths.collect::<Vec<_>>();
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            snapshot.workflow.relevant_files.iter().any(|relevant| relevant == *path)
+                && snapshot.inspected.iter().any(|file| {
+                    file.path == **path
+                        && file.last_state == ObservedFileState::Present
+                        && !file.stale
+                        && file.content_hash.is_some()
+                })
+        })
 }
 
 fn mutation_has_evidence(snapshot: &ContextSnapshot, name: &str, input: &Value) -> bool {
@@ -648,6 +692,31 @@ mod tests {
                 ToolCallId::new("write").unwrap(),
                 "write",
                 &json!({"path":"src/lib.rs"}),
+            )
+            .unwrap();
+        assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");
+    }
+
+    #[test]
+    fn direct_command_mutation_preflight_uses_extracted_paths() {
+        let policy = AutonomousCodingPolicy::new();
+        let snapshot = inspected_snapshot();
+        let allowed = policy.preflight(
+            &snapshot,
+            ToolCallId::new("shell-allowed").unwrap(),
+            "shell",
+            &json!({
+                "program": "cargo",
+                "args": ["fmt", "--", "src/lib.rs"]
+            }),
+        );
+        assert!(allowed.is_none());
+        let blocked = policy
+            .preflight(
+                &snapshot,
+                ToolCallId::new("shell-blocked").unwrap(),
+                "shell",
+                &json!({"program": "cargo", "args": ["fmt"]}),
             )
             .unwrap();
         assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");

@@ -3,7 +3,10 @@ use std::{
     sync::atomic::{AtomicU16, Ordering},
 };
 
-use aether_core::{DEFAULT_MAX_OUTPUT_BYTES, ToolCallId, ToolResult, WorkflowPhase, WorkflowState};
+use aether_core::{
+    CommandClass, CommandEffects, DEFAULT_MAX_OUTPUT_BYTES, ToolCallId, ToolResult, WorkflowPhase,
+    WorkflowState, analyze_command,
+};
 use serde_json::Value;
 
 const MAX_OBSERVATIONS: usize = 64;
@@ -148,13 +151,24 @@ fn classify(name: &str, input: &Value) -> Option<CallKind> {
 }
 
 fn verification_command(input: &Value) -> bool {
-    let command = input.get("command").or_else(|| input.get("cmd")).and_then(Value::as_str);
-    command.is_some_and(|command| {
-        let command = command.trim().to_ascii_lowercase();
-        ["cargo test", "cargo nextest", "cargo check", "cargo clippy", "cargo fmt", "cargo build"]
+    command_effects(input)
+        .is_some_and(|effects| matches!(effects.class, CommandClass::Verification))
+}
+
+fn command_effects(input: &Value) -> Option<CommandEffects> {
+    let program = input.get("program")?.as_str()?;
+    let args = match input.get("args") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()?
             .iter()
-            .any(|prefix| command.starts_with(prefix))
-    })
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    };
+    Some(analyze_command(program, &args, input.get("cwd").and_then(Value::as_str).unwrap_or("")))
 }
 
 fn call_fingerprint(kind: CallKind, name: &str, input: &Value) -> [u8; 16] {
@@ -255,6 +269,17 @@ mod tests {
         let mut clean = LoopGuardrails::new();
         clean.observe("read", &input, &failed, &state, &state);
         assert!(clean.preflight(ToolCallId::new("retry").unwrap(), "read", &input, 0).is_none());
+    }
+
+    #[test]
+    fn direct_verification_commands_are_cached_by_argv() {
+        let mut guard = LoopGuardrails::new();
+        let state = WorkflowState::new();
+        let input = json!({"program":"cargo", "args":["test", "-p", "api"]});
+        guard.observe("shell", &input, &success("one", "pass"), &state, &state);
+        let cached = guard.preflight(ToolCallId::new("two").unwrap(), "shell", &input, 0);
+        assert_eq!(cached.unwrap().call_id.as_str(), "two");
+        assert_eq!(guard.prevented_count(), 1);
     }
 
     #[test]

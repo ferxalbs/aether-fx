@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use aether_core::tools::ToolFuture;
 use aether_core::{
-    BoundedText, PermissionClass, PermissionEngine, PermissionRequest, ToolDefinition,
+    BoundedText, PermissionClass, PermissionEngine, PermissionRequest, ToolDefinition, ToolEffect,
     ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
-    WorkspacePath,
+    WorkspacePath, analyze_command,
 };
 use serde_json::json;
 
@@ -228,7 +228,19 @@ impl ToolExecutor for ToolRegistry {
                 })
                 .unwrap_or_else(|_| ToolFootprint::unknown()),
             "write" | "patch" => ToolFootprint::exclusive_workspace(),
-            "shell" | "process" => ToolFootprint::exclusive_global(),
+            "shell" => serde_json::from_value::<crate::ShellInput>(invocation.input.clone())
+                .map(|input| {
+                    analyze_command(
+                        &input.program,
+                        &input.args.unwrap_or_default(),
+                        input.cwd.as_deref().unwrap_or(""),
+                    )
+                    .footprint()
+                })
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
+            "process" => serde_json::from_value::<crate::ProcessInput>(invocation.input.clone())
+                .map(|input| process_footprint(&input))
+                .unwrap_or_else(|_| ToolFootprint::unknown()),
             _ => ToolFootprint::unknown(),
         }
     }
@@ -251,6 +263,41 @@ fn workspace_read_footprint(paths: impl IntoIterator<Item = String>) -> ToolFoot
         resources.push(ToolResource::WorkspacePath(path.display()));
     }
     ToolFootprint::from_effects(resources.into_iter().map(aether_core::ToolEffect::Read).collect())
+}
+
+fn process_footprint(input: &crate::ProcessInput) -> ToolFootprint {
+    use crate::ProcessOperation;
+
+    match input.operation {
+        ProcessOperation::Start => input
+            .program
+            .as_deref()
+            .map(|program| {
+                analyze_command(
+                    program,
+                    input.args.as_deref().unwrap_or(&[]),
+                    input.cwd.as_deref().unwrap_or(""),
+                )
+                .footprint()
+            })
+            .unwrap_or_else(ToolFootprint::unknown),
+        ProcessOperation::Read | ProcessOperation::Status => input
+            .process_id
+            .map(|process_id| {
+                ToolFootprint::from_effects(vec![ToolEffect::Read(ToolResource::Process(
+                    process_id,
+                ))])
+            })
+            .unwrap_or_else(ToolFootprint::unknown),
+        ProcessOperation::Write | ProcessOperation::Signal | ProcessOperation::Kill => input
+            .process_id
+            .map(|process_id| {
+                ToolFootprint::from_effects(vec![ToolEffect::Exclusive(ToolResource::Process(
+                    process_id,
+                ))])
+            })
+            .unwrap_or_else(ToolFootprint::unknown),
+    }
 }
 
 fn definitions() -> Vec<ToolDefinition> {
@@ -432,6 +479,70 @@ fn definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod command_footprint_tests {
+    use super::*;
+    use crate::ProcessInput;
+
+    #[test]
+    fn direct_read_only_processes_get_narrow_parallel_footprints() {
+        let first = ProcessInput {
+            operation: crate::ProcessOperation::Start,
+            program: Some("rg".to_owned()),
+            args: Some(vec!["needle".to_owned(), "src".to_owned()]),
+            cwd: None,
+            process_id: None,
+            stream: None,
+            data: None,
+            signal: None,
+            max_bytes: None,
+            timeout_ms: None,
+        };
+        let second = ProcessInput {
+            operation: crate::ProcessOperation::Start,
+            program: Some("find".to_owned()),
+            args: Some(vec!["tests".to_owned(), "-name".to_owned(), "*.rs".to_owned()]),
+            cwd: None,
+            process_id: None,
+            stream: None,
+            data: None,
+            signal: None,
+            max_bytes: None,
+            timeout_ms: None,
+        };
+        assert!(!process_footprint(&first).conflicts(&process_footprint(&second)));
+    }
+
+    #[test]
+    fn process_lifecycle_effects_are_serialized_per_process() {
+        let status = ProcessInput {
+            operation: crate::ProcessOperation::Status,
+            program: None,
+            args: None,
+            cwd: None,
+            process_id: Some(7),
+            stream: None,
+            data: None,
+            signal: None,
+            max_bytes: None,
+            timeout_ms: None,
+        };
+        let write = ProcessInput {
+            operation: crate::ProcessOperation::Write,
+            program: None,
+            args: None,
+            cwd: None,
+            process_id: Some(7),
+            stream: None,
+            data: Some("input".to_owned()),
+            signal: None,
+            max_bytes: None,
+            timeout_ms: None,
+        };
+        assert!(process_footprint(&status).conflicts(&process_footprint(&write)));
+    }
 }
 
 #[cfg(test)]

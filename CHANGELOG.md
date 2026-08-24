@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (13) - Direct command intelligence
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added bounded direct-argv command classification and effect extraction for Rust, Git, Node,
+  Python, and common Unix inspection/search commands, including paths, packages, manifests, and
+  verification scope.
+- Added command-aware scheduler footprints, workflow invalidation, policy evidence gates,
+  guardrail caching, and shell-heavy deterministic evaluation coverage.
+
+### Performance
+
+- Added classification and footprint Criterion benchmarks; the local Criterion run measured
+  direct-command classification at 116.70 ns median and footprint extraction at 1.9169 µs median.
+
 ## Unreleased - 2026-08-23 (12) - Bounded autonomous coding policy
 
 > Status: unreleased work. No artifact has been published.

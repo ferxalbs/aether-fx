@@ -19,6 +19,7 @@ mod state;
 mod symbol_index;
 mod verification;
 
+pub use aether_core::{CommandClass, CommandEffects};
 pub use agent::{Agent, AgentError, AgentMetrics, AgentRequest, AgentRunResult};
 pub use backend::{BackendError, BackendFuture, BackendStream, ModelBackend, ModelCatalogItem};
 pub use cancellation::CancellationToken;
@@ -57,5 +58,6 @@ pub use symbol_index::{
     parse_rust, parse_source,
 };
 pub use verification::{
-    CommandIntent, PlannedCommand, VerificationPlan, classify_command, plan_verification,
+    CommandIntent, PlannedCommand, VerificationPlan, classify_command, command_effects,
+    plan_verification,
 };

@@ -3,6 +3,7 @@
 //! Domain primitives shared by the AETHER Fx workspace.
 
 pub mod cancellation;
+pub mod command;
 pub mod context;
 pub mod decision;
 pub mod error;
@@ -17,6 +18,10 @@ pub mod tools;
 pub mod workflow;
 
 pub use cancellation::CancellationFlag;
+pub use command::{
+    CommandClass, CommandEffects, MAX_COMMAND_ARGS, MAX_COMMAND_BYTES, MAX_COMMAND_FIELD_BYTES,
+    MAX_COMMAND_PACKAGES, MAX_COMMAND_PATHS, analyze_command, classify_command,
+};
 pub use context::{
     CONTEXT_GUIDANCE, CompactToolSummary, ContextSnapshot, FileExcerpt, GitSnapshot, InspectedFile,
     LineRange, MAX_COMPACT_SUMMARY_BYTES, MAX_CONTEXT_ITEMS, MAX_CONTEXT_RENDER_BYTES,

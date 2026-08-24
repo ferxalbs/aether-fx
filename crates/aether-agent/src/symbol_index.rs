@@ -465,6 +465,12 @@ impl SymbolIndex {
         self.files.is_empty()
     }
 
+    /// Drop all lazily indexed symbols and relationships.
+    pub fn clear(&mut self) {
+        self.files.clear();
+        self.relationship_index = RelationshipIndex::default();
+    }
+
     #[must_use]
     pub fn symbol_count(&self) -> usize {
         self.files.values().map(|file| file.symbols.len()).sum()

@@ -694,6 +694,12 @@ impl RepoMap {
         self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
     }
 
+    /// Drop repository and symbol caches after a command may have changed workspace state.
+    pub fn invalidate(&self) {
+        *self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+    }
+
     pub fn estimated_bytes(&self) -> Result<usize, RepoMapError> {
         Ok(self.snapshot()?.estimated_bytes())
     }

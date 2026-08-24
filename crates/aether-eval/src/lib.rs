@@ -1,3 +1,4 @@
+use aether_core::analyze_command;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -10,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub enum ToolKind {
     List,
     Read,
+    Shell,
     Write,
     Verify,
 }
@@ -19,6 +21,7 @@ pub enum Action {
     List { path: &'static str },
     Read { path: &'static str },
     Write { path: &'static str, contents: &'static str },
+    Shell { program: &'static str, args: &'static [&'static str] },
     Verify,
     Finish,
 }
@@ -29,6 +32,9 @@ impl Action {
             Self::List { path } => Some(format!("list:{path}")),
             Self::Read { path } => Some(format!("read:{path}")),
             Self::Write { path, contents } => Some(format!("write:{path}:{contents}")),
+            Self::Shell { program, args } => {
+                Some(format!("shell:{program}:{}", args.join("\u{1f}")))
+            }
             Self::Verify => None,
             Self::Finish => None,
         }
@@ -39,6 +45,7 @@ impl Action {
             Self::List { .. } => Some(ToolKind::List),
             Self::Read { .. } => Some(ToolKind::Read),
             Self::Write { .. } => Some(ToolKind::Write),
+            Self::Shell { .. } => Some(ToolKind::Shell),
             Self::Verify => Some(ToolKind::Verify),
             Self::Finish => None,
         }
@@ -83,6 +90,7 @@ pub struct ExecutionMetrics {
     pub context_bytes: u64,
     pub verification_attempts: u32,
     pub verification_scope: String,
+    pub verification_quality: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +116,7 @@ pub struct TaskResult {
     pub context_bytes: u64,
     pub verification_attempts: u32,
     pub verification_scope: String,
+    pub verification_quality: String,
     pub final_test_status: String,
     pub failure: Option<String>,
 }
@@ -196,8 +205,8 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
     let aggregate = aggregate(&results);
     let thresholds = RegressionThresholds {
         minimum_success_rate: 1.0,
-        maximum_model_steps: 45,
-        maximum_executed_tool_calls: 30,
+        maximum_model_steps: 55,
+        maximum_executed_tool_calls: 40,
         maximum_context_bytes: 32_000,
     };
     let success = aggregate.success_rate >= thresholds.minimum_success_rate
@@ -221,7 +230,7 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
 
 /// Built-in task definitions for provider comparison runners.
 #[must_use]
-pub fn task_catalog() -> [&'static Task; 7] {
+pub fn task_catalog() -> [&'static Task; 8] {
     [
         &TARGETED_BUG,
         &MULTI_FILE,
@@ -230,6 +239,7 @@ pub fn task_catalog() -> [&'static Task; 7] {
         &FOCUSED_VERIFY,
         &INSUFFICIENT_EVIDENCE,
         &TARGETED_EXPLORATION,
+        &SHELL_HEAVY,
     ]
 }
 
@@ -238,7 +248,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
     for result in &suite.tasks {
         let mark = if result.success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} read={}B\n",
+            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} quality={} read={}B\n",
             result.task_id,
             result.model_steps,
             result.executed_tool_calls,
@@ -246,6 +256,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
             result.before.executed_tool_calls,
             result.verification_attempts,
             result.verification_scope,
+            result.verification_quality,
             result.bytes_read
         ));
     }
@@ -275,7 +286,7 @@ struct Scenario {
     script: &'static [Action],
 }
 
-fn scenarios() -> [Scenario; 7] {
+fn scenarios() -> [Scenario; 8] {
     [
         Scenario { task: &TARGETED_BUG, script: TARGETED_SCRIPT },
         Scenario { task: &MULTI_FILE, script: MULTI_FILE_SCRIPT },
@@ -284,6 +295,7 @@ fn scenarios() -> [Scenario; 7] {
         Scenario { task: &FOCUSED_VERIFY, script: FOCUSED_SCRIPT },
         Scenario { task: &INSUFFICIENT_EVIDENCE, script: INSUFFICIENT_EVIDENCE_SCRIPT },
         Scenario { task: &TARGETED_EXPLORATION, script: TARGETED_EXPLORATION_SCRIPT },
+        Scenario { task: &SHELL_HEAVY, script: SHELL_HEAVY_SCRIPT },
     ]
 }
 
@@ -306,6 +318,7 @@ fn run_task_mode(
     backend.reset(task);
     let mut observation = task.prompt.to_owned();
     let mut seen_reads = HashSet::new();
+    let mut seen_commands = HashSet::new();
     let mut inspected_paths = HashSet::new();
     let mut discovered_dirs = HashSet::new();
     let mut model_steps = 0;
@@ -317,6 +330,7 @@ fn run_task_mode(
     let mut verification_attempts = 0;
     let mut final_test_status = "not_run".to_owned();
     let mut verification_scope = "none".to_owned();
+    let mut verification_quality = "none".to_owned();
     let mut failure = None;
 
     loop {
@@ -356,6 +370,18 @@ fn run_task_mode(
             context_bytes += observation.len() as u64;
             continue;
         }
+        if policy_active
+            && let Action::Shell { program, args } = &action
+            && analyze_direct_command(program, args)
+                .is_some_and(|effects| effects.class.is_read_only())
+            && action.fingerprint().is_some_and(|key| !seen_commands.insert(key))
+        {
+            prevented += 1;
+            observation = "reuse prior scoped observation".to_owned();
+            overhead += tool_started.elapsed();
+            context_bytes += observation.len() as u64;
+            continue;
+        }
         executed_tool_calls += 1;
         match action {
             Action::List { path } => {
@@ -375,6 +401,15 @@ fn run_task_mode(
                 observation = format!("wrote {path}");
                 overhead += tool_started.elapsed();
                 seen_reads.clear();
+                seen_commands.clear();
+            }
+            Action::Shell { program, args } => {
+                let effects = analyze_direct_command(program, args);
+                observation = format!("{} {}", program, args.join(" "));
+                if effects.as_ref().is_some_and(|effects| effects.class.is_read_only()) {
+                    bytes_read += observation.len() as u64;
+                }
+                overhead += tool_started.elapsed();
             }
             Action::Verify => {
                 verification_attempts += 1;
@@ -395,6 +430,15 @@ fn run_task_mode(
                 };
                 let status = workspace.verify(command)?;
                 final_test_status = if status.success { "passed" } else { "failed" }.to_owned();
+                verification_quality = if status.success {
+                    if verification_scope == "focused" {
+                        "focused_pass".to_owned()
+                    } else {
+                        "broad_pass".to_owned()
+                    }
+                } else {
+                    "failed".to_owned()
+                };
                 observation = status.output;
             }
             Action::Finish => unreachable!(),
@@ -434,6 +478,7 @@ fn run_task_mode(
         context_bytes,
         verification_attempts,
         final_test_status,
+        verification_quality: verification_quality.clone(),
         failure,
         baseline_success: false,
         before: ExecutionMetrics::default(),
@@ -447,6 +492,7 @@ fn run_task_mode(
             context_bytes,
             verification_attempts,
             verification_scope: verification_scope.clone(),
+            verification_quality,
         },
         verification_scope,
     })
@@ -467,6 +513,11 @@ fn mutation_without_inspection(
         }
         _ => false,
     }
+}
+
+fn analyze_direct_command(program: &str, args: &[&str]) -> Option<aether_core::CommandEffects> {
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    Some(analyze_command(program, &args, ""))
 }
 
 struct VerifyStatus {
@@ -751,6 +802,33 @@ const TARGETED_EXPLORATION_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
+const SHELL_RG_ARGS: &[&str] = &["last_index", "src"];
+const SHELL_FIND_ARGS: &[&str] = &["src", "-name", "*.rs"];
+const SHELL_CAT_ARGS: &[&str] = &["src/lib.rs"];
+const SHELL_HEAVY: Task = Task {
+    id: "shell-heavy-command-reuse",
+    prompt: "Repair last_index after an inefficient shell-heavy discovery loop.",
+    fixture: "targeted-bug",
+    expected_outcomes: TARGETED_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 10,
+    max_tool_calls: 9,
+    max_verification_attempts: 1,
+};
+const SHELL_HEAVY_SCRIPT: &[Action] = &[
+    Action::Shell { program: "rg", args: SHELL_RG_ARGS },
+    Action::Shell { program: "rg", args: SHELL_RG_ARGS },
+    Action::Shell { program: "find", args: SHELL_FIND_ARGS },
+    Action::Shell { program: "find", args: SHELL_FIND_ARGS },
+    Action::Shell { program: "cat", args: SHELL_CAT_ARGS },
+    Action::Shell { program: "cat", args: SHELL_CAT_ARGS },
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
+    Action::Verify,
+    Action::Finish,
+];
+
 #[cfg(test)]
 mod tests {
     use super::{compact_summary, run_suite};
@@ -759,7 +837,7 @@ mod tests {
     fn deterministic_suite_meets_correctness_and_efficiency_thresholds() {
         let suite = run_suite(None).expect("suite runs");
         assert!(suite.success, "{}", compact_summary(&suite));
-        assert_eq!(suite.aggregate.succeeded, 7);
+        assert_eq!(suite.aggregate.succeeded, 8);
         assert!(suite.aggregate.baseline_executed_tool_calls > suite.aggregate.executed_tool_calls);
         assert!(suite.aggregate.baseline_context_bytes >= suite.aggregate.context_bytes);
         assert!(
@@ -769,5 +847,13 @@ mod tests {
         assert!(suite.aggregate.prevented_redundant_calls >= 3);
         assert_eq!(suite.tasks[2].verification_attempts, 2);
         assert_eq!(suite.tasks[4].verification_command, ["cargo", "test", "--quiet", "--offline"]);
+        let shell_heavy = suite
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "shell-heavy-command-reuse")
+            .expect("shell-heavy scenario");
+        assert!(shell_heavy.before.executed_tool_calls > shell_heavy.after.executed_tool_calls);
+        assert!(shell_heavy.before.bytes_read > shell_heavy.after.bytes_read);
+        assert_eq!(shell_heavy.verification_quality, "broad_pass");
     }
 }

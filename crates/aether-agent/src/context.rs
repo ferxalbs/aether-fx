@@ -1,19 +1,19 @@
 use std::path::{Path, PathBuf};
 
 use aether_core::{
-    BoundedText, CONTEXT_GUIDANCE, CompactToolSummary, ContextSnapshot, FileExcerpt, GitSnapshot,
-    InspectedFile, LineRange, MAX_CONTEXT_ITEMS, MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES,
-    MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES, MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS,
-    MAX_TASK_BYTES, MAX_WORKFLOW_FIELD_BYTES, ObservedFileState, OpaqueContinuation, ToolResult,
-    WorkflowFailure, WorkflowPhase, WorkflowVerification, WorkspacePath, compact_tool_result,
-    merge_line_ranges,
+    BoundedText, CONTEXT_GUIDANCE, CommandEffects, CompactToolSummary, ContextSnapshot,
+    FileExcerpt, GitSnapshot, InspectedFile, LineRange, MAX_CONTEXT_ITEMS,
+    MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES, MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES,
+    MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS, MAX_TASK_BYTES, MAX_WORKFLOW_FIELD_BYTES,
+    ObservedFileState, OpaqueContinuation, ToolResult, WorkflowFailure, WorkflowPhase,
+    WorkflowVerification, WorkspacePath, analyze_command, compact_tool_result, merge_line_ranges,
 };
 use serde_json::Value;
 
 use crate::repo_map::RepoMap;
 use crate::{
-    CommandIntent, ContextCandidate, ContextKind, RelationshipHint, SymbolHint, classify_command,
-    plan_verification, select_context_with_relationships,
+    ContextCandidate, ContextKind, RelationshipHint, SymbolHint, plan_verification,
+    select_context_with_relationships,
 };
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
@@ -125,7 +125,8 @@ impl ContextEngine {
     pub fn observe_tool(&mut self, name: &str, input: &Value, result: &ToolResult) {
         let failure_key = workflow_failure_key(name, input);
         let focused_verification = self.is_focused_verification(name, input);
-        let mutation = is_workspace_mutation(name, input);
+        let command_effects = command_effects_for_tool(name, input);
+        let mutation = is_workspace_mutation(name, input, command_effects.as_ref());
         self.snapshot.workflow.progress.note_tool_result();
         if mutation {
             self.snapshot.workflow.begin_modification();
@@ -145,7 +146,24 @@ impl ContextEngine {
         } else {
             self.record_workflow_failure(&failure_key, name, result);
         }
-        if mutation && mutation_applied(name, input, result) {
+        if mutation && mutation_applied(name, input, result, command_effects.as_ref()) {
+            if let Some(effects) = command_effects.as_ref() {
+                let include_manifests = matches!(
+                    effects.class,
+                    aether_core::CommandClass::DependencyManagement
+                        | aether_core::CommandClass::GitMutation
+                );
+                let paths = effects.paths.iter().chain(
+                    include_manifests.then_some(effects.manifests.iter()).into_iter().flatten(),
+                );
+                for path in paths {
+                    if path_is_workspace_relative(path) {
+                        self.record_relevant_path(path);
+                        self.record_modified(path);
+                    }
+                }
+                self.invalidate_command_effects(effects);
+            }
             self.snapshot.workflow.record_mutation();
             self.refresh_verification_plan();
         }
@@ -570,6 +588,33 @@ impl ContextEngine {
         );
     }
 
+    fn invalidate_command_effects(&mut self, effects: &CommandEffects) {
+        let affected = effects.paths.iter().chain(effects.manifests.iter()).collect::<Vec<_>>();
+        if effects.uncertain || affected.is_empty() {
+            for file in &mut self.snapshot.inspected {
+                file.stale = true;
+            }
+            self.snapshot.excerpts.clear();
+        } else {
+            for file in &mut self.snapshot.inspected {
+                if affected.iter().any(|path| {
+                    file.path == path.as_str()
+                        || file.path.starts_with(&format!("{}/", path.trim_end_matches('/')))
+                        || path.starts_with(&format!("{}/", file.path.trim_end_matches('/')))
+                }) {
+                    file.stale = true;
+                }
+            }
+            self.snapshot
+                .excerpts
+                .retain(|excerpt| !affected.iter().any(|path| excerpt.path == path.as_str()));
+        }
+        self.snapshot.workspace_changed = true;
+        if let Some(repo_map) = &self.repo_map {
+            repo_map.invalidate();
+        }
+    }
+
     fn observe_relevant(&mut self, name: &str, input: &Value, result: &ToolResult) {
         if !result.ok {
             return;
@@ -855,13 +900,19 @@ fn path_is_workspace_relative(path: &str) -> bool {
     WorkspacePath::new(path).is_ok()
 }
 
-fn is_workspace_mutation(name: &str, input: &Value) -> bool {
+fn is_workspace_mutation(name: &str, _input: &Value, effects: Option<&CommandEffects>) -> bool {
     matches!(name, "write" | "patch")
-        || (name == "shell" && shell_command_intent(input) == CommandIntent::Mutation)
+        || matches!(name, "shell" | "process")
+            && effects.is_some_and(|effects| effects.uncertain || effects.class.is_mutation())
 }
 
-fn mutation_applied(name: &str, input: &Value, result: &ToolResult) -> bool {
-    if !result.ok || !is_workspace_mutation(name, input) {
+fn mutation_applied(
+    name: &str,
+    input: &Value,
+    result: &ToolResult,
+    effects: Option<&CommandEffects>,
+) -> bool {
+    if !result.ok || !is_workspace_mutation(name, input, effects) {
         return false;
     }
     if name == "patch"
@@ -875,6 +926,7 @@ fn mutation_applied(name: &str, input: &Value, result: &ToolResult) -> bool {
         return false;
     }
     name == "shell"
+        || name == "process"
         || name == "write"
         || result
             .data
@@ -904,19 +956,38 @@ fn read_targets_modified(input: &Value, modified: &[String]) -> bool {
 }
 
 fn is_verification_command(input: &Value) -> bool {
-    shell_command_intent(input) == CommandIntent::Verification
+    command_effects_for_input(input).is_some_and(|effects| effects.class.is_verification())
 }
 
-fn shell_command_intent(input: &Value) -> CommandIntent {
-    let Some(program) = input.get("program").and_then(Value::as_str) else {
-        return CommandIntent::Unknown;
+fn command_effects_for_tool(name: &str, input: &Value) -> Option<CommandEffects> {
+    if !matches!(name, "shell" | "process") {
+        return None;
+    }
+    if name == "process"
+        && input
+            .get("operation")
+            .and_then(Value::as_str)
+            .is_some_and(|operation| operation != "start")
+    {
+        return None;
+    }
+    command_effects_for_input(input)
+}
+
+fn command_effects_for_input(input: &Value) -> Option<CommandEffects> {
+    let program = input.get("program")?.as_str()?;
+    let args = match input.get("args") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
     };
-    let args = input
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|args| args.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
-        .unwrap_or_default();
-    classify_command(program, &args)
+    Some(analyze_command(program, &args, input.get("cwd").and_then(Value::as_str).unwrap_or("")))
 }
 
 fn shell_command_display(input: &Value) -> Option<String> {
@@ -1111,6 +1182,32 @@ mod tests {
         assert_eq!(engine.snapshot().inspected.len(), 1);
         assert_eq!(engine.snapshot().inspected[0].ranges, vec![LineRange { start: 1, end: 2 }]);
         assert_eq!(engine.snapshot().excerpts.len(), 1);
+    }
+
+    #[test]
+    fn direct_command_mutation_invalidates_targeted_context_and_verification() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        let read = success(serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "content_hash": "before",
+                "lines": [{"number": 1, "text": "fn main() {}"}]
+            }]
+        }));
+        engine.observe_tool("read", &serde_json::json!({"files": [{"path": "src/lib.rs"}]}), &read);
+        let formatted = success(serde_json::json!({"success": true}));
+        engine.observe_tool(
+            "shell",
+            &serde_json::json!({
+                "program": "cargo",
+                "args": ["fmt", "--", "src/lib.rs"]
+            }),
+            &formatted,
+        );
+        assert!(engine.snapshot().inspected[0].stale);
+        assert!(engine.snapshot().excerpts.is_empty());
+        assert!(engine.snapshot().modified.iter().any(|path| path == "src/lib.rs"));
+        assert_eq!(engine.snapshot().workflow.workspace_revision, 1);
     }
 
     #[test]

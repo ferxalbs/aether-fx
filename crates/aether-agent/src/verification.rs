@@ -2,16 +2,11 @@
 
 use std::path::Path;
 
-use aether_core::VerificationStep;
+use aether_core::{CommandEffects, VerificationStep};
 
 use crate::{ManifestKind, RepoMapSnapshot};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommandIntent {
-    Verification,
-    Mutation,
-    Unknown,
-}
+pub use aether_core::CommandClass as CommandIntent;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedCommand {
@@ -76,61 +71,12 @@ pub fn plan_verification(repo: &RepoMapSnapshot, modified: &[String]) -> Verific
 
 /// Classify only direct, well-known process invocations; shell interpreters remain unknown.
 pub fn classify_command(program: &str, args: &[String]) -> CommandIntent {
-    let program = Path::new(program).file_name().and_then(|p| p.to_str()).unwrap_or(program);
-    if matches!(program, "sh" | "bash" | "zsh" | "cmd" | "powershell" | "pwsh") {
-        return CommandIntent::Unknown;
-    }
-    match program {
-        "cargo" => classify_cargo(args),
-        "rustc" | "clippy-driver" | "pytest" | "mypy" | "ruff" | "tsc" => {
-            CommandIntent::Verification
-        }
-        "python" | "python3" => classify_python(args),
-        "npm" | "pnpm" | "yarn" => classify_node(args),
-        "git" if args.first().is_some_and(|arg| matches!(arg.as_str(), "diff" | "status")) => {
-            CommandIntent::Verification
-        }
-        _ => CommandIntent::Unknown,
-    }
+    aether_core::classify_command(program, args)
 }
 
-fn classify_cargo(args: &[String]) -> CommandIntent {
-    match args.iter().find(|arg| !arg.starts_with('-')).map(String::as_str) {
-        Some("check" | "test" | "clippy" | "build" | "bench") => CommandIntent::Verification,
-        Some("fmt") if args.iter().any(|arg| arg == "--check") => CommandIntent::Verification,
-        Some("fmt" | "fix" | "install" | "update" | "add" | "remove") => CommandIntent::Mutation,
-        _ => CommandIntent::Unknown,
-    }
-}
-
-fn classify_python(args: &[String]) -> CommandIntent {
-    match args.first().map(String::as_str) {
-        Some("-m") => match args.get(1).map(String::as_str) {
-            Some("pytest" | "unittest" | "compileall" | "mypy" | "ruff") => {
-                CommandIntent::Verification
-            }
-            Some("pip") => CommandIntent::Mutation,
-            _ => CommandIntent::Unknown,
-        },
-        _ => CommandIntent::Unknown,
-    }
-}
-
-fn classify_node(args: &[String]) -> CommandIntent {
-    match args.first().map(String::as_str) {
-        Some("test" | "lint" | "typecheck") => CommandIntent::Verification,
-        Some("run")
-            if args.get(1).is_some_and(|arg| {
-                matches!(arg.as_str(), "test" | "lint" | "typecheck" | "check" | "build")
-            }) =>
-        {
-            CommandIntent::Verification
-        }
-        Some("install" | "add" | "remove" | "update" | "uninstall" | "ci") => {
-            CommandIntent::Mutation
-        }
-        _ => CommandIntent::Unknown,
-    }
+/// Analyze one direct argv invocation for paths, packages, manifests, and scheduler effects.
+pub fn command_effects(program: &str, args: &[String], cwd: &str) -> CommandEffects {
+    aether_core::analyze_command(program, args, cwd)
 }
 
 fn plan_rust(plan: &mut VerificationPlan, repo: &RepoMapSnapshot, root: &Path, path: &Path) {
@@ -342,11 +288,14 @@ mod tests {
             classify_command("cargo", &["test".into(), "-p".into(), "api".into()]),
             CommandIntent::Verification
         );
-        assert_eq!(classify_command("cargo", &["fmt".into()]), CommandIntent::Mutation);
+        assert_eq!(classify_command("cargo", &["fmt".into()]), CommandIntent::Formatting);
         assert_eq!(
             classify_command("bash", &["-c".into(), "cargo test".into()]),
             CommandIntent::Unknown
         );
-        assert_eq!(classify_command("npm", &["install".into()]), CommandIntent::Mutation);
+        assert_eq!(
+            classify_command("npm", &["install".into()]),
+            CommandIntent::DependencyManagement
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use aether_agent::{
     ContextEngine, LoopGuardrails, ManifestInfo, ManifestKind, ManifestStatus, PackageInfo,
-    RepoMapSnapshot, classify_command, plan_verification,
+    RepoMapSnapshot, classify_command, command_effects, plan_verification,
 };
 use aether_core::{ToolCallId, ToolResult, WorkflowState};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -91,6 +91,14 @@ fn benchmark_verification_planning(c: &mut Criterion) {
     let args = vec!["test".to_owned(), "-p".to_owned(), "demo".to_owned()];
     c.bench_function("verification_plan/classify_cargo_test", |bencher| {
         bencher.iter(|| std::hint::black_box(classify_command("cargo", &args)));
+    });
+    c.bench_function("command_intelligence/classify_direct_argv", |bencher| {
+        bencher.iter(|| std::hint::black_box(classify_command("cargo", &args)));
+    });
+    c.bench_function("command_intelligence/extract_footprint", |bencher| {
+        bencher.iter(|| {
+            std::hint::black_box(command_effects("cargo", &args, "crates/demo").footprint())
+        });
     });
 }
 
