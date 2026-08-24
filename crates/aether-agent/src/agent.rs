@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aether_core::{
     AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelRequest,
@@ -39,6 +40,9 @@ pub struct AgentRequest {
     /// Restored working context for resume or in-process continuity.
     #[serde(default)]
     pub context_seed: Option<ContextSnapshot>,
+    /// Collect structured execution metrics for this turn.
+    #[serde(default)]
+    pub metrics: bool,
 }
 
 impl AgentRequest {
@@ -53,6 +57,7 @@ impl AgentRequest {
             continuation: None,
             workspace_root: None,
             context_seed: None,
+            metrics: false,
         }
     }
 }
@@ -70,6 +75,49 @@ pub struct AgentRunResult {
     pub continuation: Option<OpaqueContinuation>,
     /// Bounded working context after this turn.
     pub context: ContextSnapshot,
+    /// Structured execution metrics, present only when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<AgentMetrics>,
+}
+
+/// Bounded, machine-readable accounting for one agent turn.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentMetrics {
+    pub model_steps: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub requested_tool_calls: u64,
+    pub executed_tool_calls: u64,
+    pub prevented_calls: u64,
+    pub context_bytes: u64,
+    pub bytes_read: u64,
+    pub verification_attempts: u64,
+    pub provider_wait_ms: u64,
+    pub local_execution_ms: u64,
+}
+
+struct MetricsState {
+    value: AgentMetrics,
+    started: Instant,
+    provider_wait: Duration,
+}
+
+impl MetricsState {
+    fn new() -> Self {
+        Self {
+            value: AgentMetrics::default(),
+            started: Instant::now(),
+            provider_wait: Duration::ZERO,
+        }
+    }
+
+    fn finish(mut self) -> AgentMetrics {
+        self.value.provider_wait_ms = duration_ms(self.provider_wait);
+        self.value.local_execution_ms =
+            duration_ms(self.started.elapsed().saturating_sub(self.provider_wait));
+        self.value
+    }
 }
 
 /// Agent loop failures are typed and secret-free.
@@ -132,6 +180,7 @@ where
         broker: &P,
     ) -> Result<AgentRunResult, AgentError> {
         let mut accumulated = String::new();
+        let mut metrics = request.metrics.then(MetricsState::new);
         self.prepare_turn(&request);
         if let Some(root) = request.workspace_root.clone() {
             let git =
@@ -175,41 +224,56 @@ where
                 tools: self.tools.definitions().to_vec(),
                 continuation: continuation.clone(),
             };
+            if let Some(metrics) = &mut metrics {
+                metrics.value.model_steps = metrics.value.model_steps.saturating_add(1);
+                metrics.value.context_bytes = metrics.value.context_bytes.saturating_add(
+                    serde_json::to_vec(&model_request).map_or(u64::MAX, |value| value.len() as u64),
+                );
+            }
+            let provider_started = metrics.as_ref().map(|_| Instant::now());
             let backend_future = self.backend.stream_step(model_request);
-            let mut stream = tokio::select! {
+            let backend_result = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-                result = backend_future => match result {
-                    Err(error)
-                        if steps == 1
-                            && !reconstructed
-                            && continuation.is_some()
-                            && matches!(error, BackendError::InvalidContinuation { .. }) =>
-                    {
-                        continuation = None;
-                        reconstructed = true;
-                        input = assemble_user_input(&request.prompt, Some(self.render_context(true)));
-                        send_event(
-                            &events,
-                            AgentEvent::Warning {
-                                message: BoundedText::new(
-                                    "Rainy continuation was unusable; reconstructed from bounded session state",
-                                    DEFAULT_MAX_OUTPUT_BYTES,
-                                ),
-                            },
-                        )
-                        .await?;
-                        steps = steps.saturating_sub(1);
-                        continue;
-                    }
-                    result => result?,
-                },
+                result = backend_future => result,
+            };
+            if let (Some(metrics), Some(started)) = (&mut metrics, provider_started) {
+                metrics.provider_wait = metrics.provider_wait.saturating_add(started.elapsed());
+            }
+            let mut stream = match backend_result {
+                Err(error)
+                    if steps == 1
+                        && !reconstructed
+                        && continuation.is_some()
+                        && matches!(error, BackendError::InvalidContinuation { .. }) =>
+                {
+                    continuation = None;
+                    reconstructed = true;
+                    input = assemble_user_input(&request.prompt, Some(self.render_context(true)));
+                    send_event(
+                        &events,
+                        AgentEvent::Warning {
+                            message: BoundedText::new(
+                                "Rainy continuation was unusable; reconstructed from bounded session state",
+                                DEFAULT_MAX_OUTPUT_BYTES,
+                            ),
+                        },
+                    )
+                    .await?;
+                    steps = steps.saturating_sub(1);
+                    continue;
+                }
+                result => result?,
             };
             let mut tool_calls = Vec::new();
             loop {
+                let provider_started = metrics.as_ref().map(|_| Instant::now());
                 let event = tokio::select! {
                     _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
                     event = stream.recv() => event,
                 };
+                if let (Some(metrics), Some(started)) = (&mut metrics, provider_started) {
+                    metrics.provider_wait = metrics.provider_wait.saturating_add(started.elapsed());
+                }
                 let Some(event) = event else {
                     break;
                 };
@@ -226,9 +290,21 @@ where
                         .await?;
                     }
                     ModelEvent::ToolCall { call_id, name, arguments } => {
+                        if let Some(metrics) = &mut metrics {
+                            metrics.value.requested_tool_calls =
+                                metrics.value.requested_tool_calls.saturating_add(1);
+                        }
                         tool_calls.push((call_id, name, arguments));
                     }
                     ModelEvent::Usage { input_tokens, output_tokens, total_tokens } => {
+                        if let Some(metrics) = &mut metrics {
+                            add_usage(
+                                &mut metrics.value,
+                                input_tokens,
+                                output_tokens,
+                                total_tokens,
+                            );
+                        }
                         send_event(
                             &events,
                             AgentEvent::Usage {
@@ -268,6 +344,7 @@ where
                     cancelled: false,
                     continuation,
                     context: self.current_context(),
+                    metrics: metrics.map(MetricsState::finish),
                 });
             }
 
@@ -293,6 +370,25 @@ where
                 let before = self.current_context().workflow;
                 self.with_context(|engine| engine.observe_tool(&name, &tool_input, &result));
                 let after = self.current_context().workflow;
+                if let Some(metrics) = &mut metrics {
+                    if completed.executed {
+                        metrics.value.executed_tool_calls =
+                            metrics.value.executed_tool_calls.saturating_add(1);
+                    } else {
+                        metrics.value.prevented_calls =
+                            metrics.value.prevented_calls.saturating_add(1);
+                    }
+                    metrics.value.bytes_read = metrics
+                        .value
+                        .bytes_read
+                        .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
+                    if after.progress.verifications > before.progress.verifications {
+                        metrics.value.verification_attempts =
+                            metrics.value.verification_attempts.saturating_add(u64::from(
+                                after.progress.verifications - before.progress.verifications,
+                            ));
+                    }
+                }
                 let feedback = guardrails.observe(&name, &tool_input, &result, &before, &after);
                 outputs.push(json!({
                     "type": "function_call_output",
@@ -349,6 +445,41 @@ where
             engine.should_attach_to_prompt(has_continuation).then(|| engine.render(true))
         })
     }
+}
+
+fn add_usage(
+    metrics: &mut AgentMetrics,
+    input: Option<u32>,
+    output: Option<u32>,
+    total: Option<u32>,
+) {
+    metrics.input_tokens = add_optional(metrics.input_tokens, input);
+    metrics.output_tokens = add_optional(metrics.output_tokens, output);
+    metrics.total_tokens = add_optional(metrics.total_tokens, total);
+}
+
+fn add_optional(current: Option<u64>, value: Option<u32>) -> Option<u64> {
+    value.map(|value| current.unwrap_or(0).saturating_add(u64::from(value))).or(current)
+}
+
+fn sum_named_u64(value: Option<&serde_json::Value>, key: &str) -> u64 {
+    match value {
+        Some(serde_json::Value::Object(values)) => values.iter().fold(0, |total, (name, value)| {
+            total.saturating_add(if name == key {
+                value.as_u64().unwrap_or(0)
+            } else {
+                sum_named_u64(Some(value), key)
+            })
+        }),
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .fold(0, |total, value| total.saturating_add(sum_named_u64(Some(value), key))),
+        _ => 0,
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct WorkflowMutationGate {
@@ -557,6 +688,84 @@ mod tests {
             kinds,
             vec!["tool_started", "tool_output", "tool_finished", "text_delta", "done"]
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_account_requested_executed_and_prevented_calls() {
+        let backend =
+            crate::FakeBackend::new("completed").with_tool_call("read", json!({"files": []}));
+        let agent = Agent::new(backend, tools());
+        let mut request = AgentRequest::new(
+            SessionId::new("metrics-accounting").unwrap(),
+            TurnId::new("metrics-turn").unwrap(),
+            "inspect",
+        );
+        request.metrics = true;
+        let (sender, _receiver) = mpsc::channel(32);
+        let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
+        let metrics = result.metrics.unwrap();
+        assert_eq!(metrics.model_steps, 2);
+        assert_eq!(metrics.requested_tool_calls, 1);
+        assert_eq!(metrics.executed_tool_calls, 1);
+        assert_eq!(metrics.prevented_calls, 0);
+        assert!(metrics.context_bytes > 0);
+    }
+
+    #[test]
+    fn metrics_aggregate_cached_usage_and_preserve_missing_provider_usage() {
+        let mut metrics = AgentMetrics::default();
+        add_usage(&mut metrics, Some(10), Some(3), Some(13));
+        add_usage(&mut metrics, Some(4), Some(2), Some(6));
+        add_usage(&mut metrics, None, None, None);
+        assert_eq!(metrics.input_tokens, Some(14));
+        assert_eq!(metrics.output_tokens, Some(5));
+        assert_eq!(metrics.total_tokens, Some(19));
+
+        let mut missing = AgentMetrics::default();
+        add_usage(&mut missing, None, None, None);
+        assert_eq!(missing.input_tokens, None);
+        assert_eq!(missing.output_tokens, None);
+        assert_eq!(missing.total_tokens, None);
+    }
+
+    #[test]
+    fn metrics_count_nested_read_bytes_and_verification_attempts() {
+        assert_eq!(
+            sum_named_u64(
+                Some(&json!({"files": [{"bytes_read": 7}, {"bytes_read": 11}]})),
+                "bytes_read",
+            ),
+            18
+        );
+        let before = 2_u16;
+        let after = 4_u16;
+        assert_eq!(u64::from(after.saturating_sub(before)), 2);
+    }
+
+    #[tokio::test]
+    async fn metrics_disabled_avoids_collection_and_cancellation_remains_terminal() {
+        let agent = Agent::new(crate::FakeBackend::new("done"), tools());
+        let request = AgentRequest::new(
+            SessionId::new("metrics-disabled").unwrap(),
+            TurnId::new("metrics-disabled-turn").unwrap(),
+            "finish",
+        );
+        let (sender, _receiver) = mpsc::channel(8);
+        let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
+        assert!(result.metrics.is_none());
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let request = AgentRequest::new(
+            SessionId::new("metrics-cancelled").unwrap(),
+            TurnId::new("metrics-cancelled-turn").unwrap(),
+            "cancel",
+        );
+        let (sender, _receiver) = mpsc::channel(8);
+        assert!(matches!(
+            agent.run(request, sender, cancellation).await,
+            Err(AgentError::Cancelled)
+        ));
     }
 
     #[derive(Clone, Default)]
@@ -1112,10 +1321,12 @@ mod tests {
         request.continuation =
             Some(OpaqueContinuation(json!({"previous_response_id": "stale-response"})));
         request.context_seed = Some(ContextSnapshot::new("/workspace", Some("model-a".to_owned())));
+        request.metrics = true;
         let (sender, _receiver) = mpsc::channel(8);
         let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
         assert_eq!(result.text.as_str(), "reconstructed");
         assert!(result.continuation.is_none());
+        assert_eq!(result.metrics.unwrap().model_steps, 2);
     }
 
     #[derive(Clone, Default)]

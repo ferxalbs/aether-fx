@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "workflow"
 harness = false
+
+[[bench]]
+name = "symbol_navigation"
+harness = false

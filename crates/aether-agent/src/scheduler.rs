@@ -26,6 +26,7 @@ struct CompletedCall {
     call_id: aether_core::ToolCallId,
     name: String,
     input: Value,
+    executed: bool,
 }
 
 /// A completed tool result with the original invocation needed for context observation.
@@ -33,6 +34,7 @@ pub(crate) struct ScheduledToolResult {
     pub(crate) name: String,
     pub(crate) input: Value,
     pub(crate) result: ToolResult,
+    pub(crate) executed: bool,
 }
 
 /// Deterministic pre-execution gate for workflow or composition-root policy.
@@ -153,6 +155,7 @@ where
                 call_id: invocation.call_id.clone(),
                 name: invocation.name.clone(),
                 input: invocation.input.clone(),
+                executed: permit.is_some() && preflight.is_none(),
             };
             metadata[slot] = Some(completed_call);
             if let Some(result) = preflight {
@@ -224,6 +227,7 @@ where
             name: metadata.name,
             input: metadata.input,
             result,
+            executed: metadata.executed,
         })
         .collect())
 }

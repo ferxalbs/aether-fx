@@ -111,7 +111,7 @@ impl ToolExecutor for BenchTools {
     }
 }
 
-fn benchmark_agent(c: &mut Criterion, calls: usize, name: &str) {
+fn benchmark_agent(c: &mut Criterion, calls: usize, name: &str, metrics: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -120,11 +120,12 @@ fn benchmark_agent(c: &mut Criterion, calls: usize, name: &str) {
         bencher.iter(|| {
             runtime.block_on(async {
                 let agent = Agent::new(BenchBackend { calls }, BenchTools);
-                let request = AgentRequest::new(
+                let mut request = AgentRequest::new(
                     aether_core::SessionId::new("bench-session").unwrap(),
                     aether_core::TurnId::new("bench-turn").unwrap(),
                     "benchmark",
                 );
+                request.metrics = metrics;
                 let (sender, _receiver) = mpsc::channel(128);
                 agent.run(request, sender, CancellationToken::new()).await.unwrap();
             });
@@ -154,11 +155,13 @@ fn pure_scheduler_overhead(c: &mut Criterion) {
 }
 
 fn end_to_end_scheduler(c: &mut Criterion) {
-    benchmark_agent(c, 1, "agent_turn_end_to_end_one_tool");
+    benchmark_agent(c, 1, "agent_turn_end_to_end_one_tool", false);
+    benchmark_agent(c, 0, "agent_turn_metrics_disabled", false);
+    benchmark_agent(c, 0, "agent_turn_metrics_enabled", true);
 }
 
 fn parallel_independent_tools(c: &mut Criterion) {
-    benchmark_agent(c, 8, "parallel_independent_tool_execution");
+    benchmark_agent(c, 8, "parallel_independent_tool_execution", false);
 }
 
 fn tokio_fixture_latency(c: &mut Criterion) {

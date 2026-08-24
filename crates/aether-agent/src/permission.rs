@@ -39,6 +39,22 @@ impl PermissionBroker for NoPermissionBroker {
     fn cancel(&self, _: &ToolCallId) {}
 }
 
+/// Explicit opt-in broker for trusted, isolated non-interactive runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllowAllPermissionBroker;
+
+impl PermissionBroker for AllowAllPermissionBroker {
+    fn needs_prompt(&self, _: &PermissionRequest) -> bool {
+        false
+    }
+
+    fn decide<'a>(&'a self, _: PermissionRequest) -> PermissionFuture<'a> {
+        Box::pin(ready(PermissionDecision::AllowOnce))
+    }
+
+    fn cancel(&self, _: &ToolCallId) {}
+}
+
 #[derive(Debug)]
 struct PendingPermission {
     request: PermissionRequest,
@@ -140,6 +156,14 @@ mod tests {
             target: None,
             details: serde_json::json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_allow_all_broker_is_prompt_free() {
+        let broker = AllowAllPermissionBroker;
+        let request = request("trusted-call", "write", PermissionClass::WorkspaceWrite);
+        assert!(!broker.needs_prompt(&request));
+        assert_eq!(broker.decide(request).await, PermissionDecision::AllowOnce);
     }
 
     #[tokio::test]

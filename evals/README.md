@@ -13,7 +13,7 @@ task and removes the copy afterward, so runs never mutate fixture sources or reu
 
 The default backend is scripted and deterministic. It performs no provider or network calls and
 sets Cargo offline for fixture verification. `EvalBackend` is the integration boundary for real
-providers; provider comparisons should use a separate binary or feature so default CI remains
+providers; provider-backed evaluations should use a separate binary or feature so default CI remains
 offline and reproducible.
 
 JSON output includes per-task correctness, wall time, harness overhead, model steps, requested and

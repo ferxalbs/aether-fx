@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-23 (10) - Lightweight symbol-aware repository navigation
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added bounded, lazy Rust symbol extraction for functions, methods, types, modules, tests, and
+  imports with targeted file lookup and in-memory content-hash invalidation.
+- Added symbol-aware repository selection and context ranking plus parsing and 1,000-symbol lookup
+  benchmarks.
+
+### Known Limitations
+
+- Navigation is lexical and intentionally partial: it does not resolve macros, traits, generated
+  code, cross-file references, or language semantics; TypeScript and Python are recognized for
+  future parser extensions but are not yet extracted.
+
+## Unreleased - 2026-08-23 (9) - Structured execution metrics
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added opt-in JSON turn output with model, token, tool-call, context, read, verification, provider
+  wait, and local execution metrics while preserving the default interactive renderer.
+- Added accounting coverage for retries, cached usage events, missing provider usage, prevented
+  calls, verification, cancellation, and metrics-disabled execution.
+
+### Performance
+
+- Added a Criterion case for the metrics-disabled agent path.
+
 ## Unreleased - 2026-08-23 (8) - Deterministic coding-agent evaluations
 
 > Status: unreleased work. No artifact has been published.

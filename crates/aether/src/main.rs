@@ -8,9 +8,9 @@ use std::{
 use std::sync::{Arc, Mutex};
 
 use aether_agent::{
-    Agent, AgentError, AgentRequest, AgentRunResult, CancellationToken, ModelBackend,
-    PermissionBroker, PersistTurn, SessionPermissionBroker, SessionStore, SessionStoreError,
-    persist_turn,
+    Agent, AgentError, AgentRequest, AgentRunResult, AllowAllPermissionBroker, CancellationToken,
+    ModelBackend, PermissionBroker, PersistTurn, SessionPermissionBroker, SessionStore,
+    SessionStoreError, persist_turn,
 };
 use aether_core::{
     AgentEvent, BoundedText, PermissionRequest, SessionId, SessionRecord, ToolExecutor, TurnId,
@@ -56,6 +56,8 @@ struct Cli {
     command: Command,
     model: Option<String>,
     root: PathBuf,
+    json: bool,
+    yolo: bool,
 }
 
 fn main() -> ExitCode {
@@ -82,17 +84,27 @@ fn run() -> Result<(), AppError> {
         Command::Doctor => doctor(&cli.root),
         Command::Models => with_runtime(|runtime| runtime.block_on(models())),
         Command::Sessions => sessions(&cli.root),
-        Command::Resume(session) => {
-            with_runtime(|runtime| runtime.block_on(run_resume(session, cli.model, cli.root)))
-        }
-        Command::ResumeLatest => {
-            with_runtime(|runtime| runtime.block_on(run_resume_latest(cli.model, cli.root)))
-        }
+        Command::Resume(session) => with_runtime(|runtime| {
+            runtime.block_on(run_resume(session, cli.model, cli.root, cli.json, cli.yolo))
+        }),
+        Command::ResumeLatest => with_runtime(|runtime| {
+            runtime.block_on(run_resume_latest(cli.model, cli.root, cli.json, cli.yolo))
+        }),
         Command::Shell => with_runtime(|runtime| {
-            runtime.block_on(run_interactive(cli.model, cli.root, None, None, false))
+            runtime.block_on(run_interactive(
+                cli.model, cli.root, None, None, false, cli.json, cli.yolo,
+            ))
         }),
         Command::Prompt(prompt) => with_runtime(|runtime| {
-            runtime.block_on(run_interactive(cli.model, cli.root, None, Some(prompt), true))
+            runtime.block_on(run_interactive(
+                cli.model,
+                cli.root,
+                None,
+                Some(prompt),
+                true,
+                cli.json,
+                cli.yolo,
+            ))
         }),
     }
 }
@@ -103,13 +115,15 @@ fn parse_cli() -> Result<Cli, AppError> {
     let mut model = None;
     let mut latest = false;
     let mut root = std::env::current_dir()?;
+    let mut json = false;
+    let mut yolo = false;
     while let Some(argument) = parser.next()? {
         match argument {
             lexopt::Arg::Short('h') | lexopt::Arg::Long("help") => {
-                return Ok(Cli { command: Command::Help, model, root });
+                return Ok(Cli { command: Command::Help, model, root, json, yolo });
             }
             lexopt::Arg::Short('V') | lexopt::Arg::Long("version") => {
-                return Ok(Cli { command: Command::Version, model, root });
+                return Ok(Cli { command: Command::Version, model, root, json, yolo });
             }
             lexopt::Arg::Long("model") => {
                 model =
@@ -121,6 +135,8 @@ fn parse_cli() -> Result<Cli, AppError> {
                 root = PathBuf::from(parser.value()?);
             }
             lexopt::Arg::Long("latest") => latest = true,
+            lexopt::Arg::Long("json") => json = true,
+            lexopt::Arg::Long("yolo") => yolo = true,
             lexopt::Arg::Value(value) => positionals.push(value),
             other => {
                 return Err(AppError::Message(format!("unsupported argument: {other:?}")));
@@ -128,7 +144,7 @@ fn parse_cli() -> Result<Cli, AppError> {
         }
     }
     if positionals.is_empty() {
-        return Ok(Cli { command: Command::Shell, model, root });
+        return Ok(Cli { command: Command::Shell, model, root, json, yolo });
     }
     let first = positionals[0]
         .to_str()
@@ -163,14 +179,14 @@ fn parse_cli() -> Result<Cli, AppError> {
             Command::Prompt(prompt)
         }
     };
-    Ok(Cli { command, model, root })
+    Ok(Cli { command, model, root, json, yolo })
 }
 
 fn print_help() {
     println!(
         "AETHER Fx {VERSION}\n\n\
          Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models\n  aether doctor\n\n\
-         Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  --latest      Resume the newest valid local session\n  -h, --help    Show help\n  -V, --version Show version\n\n\
+         Options:\n  --model <id>  Select a Rainy model\n  --root <dir>  Set the workspace root\n  --json        Emit one JSON object per completed turn\n  --yolo        Allow tools without permission prompts\n  --latest      Resume the newest valid local session\n  -h, --help    Show help\n  -V, --version Show version\n\n\
          Sessions are stored as bounded JSONL in private OS application-state storage."
     );
 }
@@ -235,6 +251,8 @@ async fn run_interactive(
     resume: Option<aether_agent::ResumableSession>,
     initial_prompt: Option<String>,
     single_pass: bool,
+    json_output: bool,
+    yolo: bool,
 ) -> Result<(), AppError> {
     let first_prompt = if initial_prompt.is_some() {
         initial_prompt
@@ -266,6 +284,7 @@ async fn run_interactive(
     let workspace = tools.workspace().clone();
     let agent = Agent::new(backend, tools);
     let broker = SessionPermissionBroker::new();
+    let allow_all = AllowAllPermissionBroker;
     let session_id = match &resume {
         Some(session) => session.session_id.clone(),
         None => new_session_id()?,
@@ -274,7 +293,9 @@ async fn run_interactive(
     if resume.is_none() {
         persist_started(&store, &live_root, Some(model.clone())).await?;
     }
-    announce_session(&session_id, &live_root);
+    if !json_output {
+        announce_session(&session_id, &live_root);
+    }
     if let Some(session) = &resume {
         for warning in &session.warnings {
             eprintln!("AETHER Fx: {warning}");
@@ -313,12 +334,31 @@ async fn run_interactive(
             let mut request =
                 AgentRequest::new(session_id.clone(), turn_id.clone(), prompt.clone());
             request.model = Some(model.clone());
+            request.max_steps = configured_max_steps()?;
             request.continuation = continuation.clone();
             request.workspace_root = Some(live_root.display().to_string());
             request.context_seed = context_seed.clone();
-            if let Some(result) =
-                run_agent_turn(&agent, request, &broker, Some(&broker), &mut renderer).await?
+            request.metrics = json_output;
+            if let Some(result) = run_agent_turn(
+                &agent,
+                request,
+                if yolo { &allow_all } else { &broker },
+                (!yolo).then_some(&broker),
+                &mut renderer,
+                json_output,
+            )
+            .await?
             {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "text": result.text.as_str(),
+                            "metrics": &result.metrics,
+                        }))
+                        .map_err(|error| AppError::Message(error.to_string()))?
+                    );
+                }
                 persist_completed_turn(&store, &turn_id, &result).await?;
                 continuation = result.continuation;
                 context_seed = Some(result.context);
@@ -348,7 +388,27 @@ async fn run_interactive(
     }
 }
 
-async fn run_resume(session: String, model: Option<String>, root: PathBuf) -> Result<(), AppError> {
+fn configured_max_steps() -> Result<u16, AppError> {
+    match std::env::var("AETHER_MAX_AGENT_STEPS") {
+        Ok(value) => value.parse::<u16>().ok().filter(|steps| *steps > 0).ok_or_else(|| {
+            AppError::Message(
+                "AETHER_MAX_AGENT_STEPS must be an integer from 1 to 65535".to_owned(),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(16),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(AppError::Message("AETHER_MAX_AGENT_STEPS must be valid UTF-8".to_owned()))
+        }
+    }
+}
+
+async fn run_resume(
+    session: String,
+    model: Option<String>,
+    root: PathBuf,
+    json_output: bool,
+    yolo: bool,
+) -> Result<(), AppError> {
     let session_id =
         SessionId::new(session).map_err(|error| AppError::Message(error.to_string()))?;
     let restored = tokio::task::spawn_blocking({
@@ -364,10 +424,15 @@ async fn run_resume(session: String, model: Option<String>, root: PathBuf) -> Re
             restored.workspace_root.display()
         )));
     }
-    run_interactive(model, root, Some(restored), None, false).await
+    run_interactive(model, root, Some(restored), None, false, json_output, yolo).await
 }
 
-async fn run_resume_latest(model: Option<String>, root: PathBuf) -> Result<(), AppError> {
+async fn run_resume_latest(
+    model: Option<String>,
+    root: PathBuf,
+    json_output: bool,
+    yolo: bool,
+) -> Result<(), AppError> {
     let (restored, issues) = tokio::task::spawn_blocking({
         let root = root.clone();
         move || SessionStore::restore_latest(root)
@@ -380,7 +445,7 @@ async fn run_resume_latest(model: Option<String>, root: PathBuf) -> Result<(), A
     let Some(restored) = restored else {
         return Err(AppError::Message("session not found".to_owned()));
     };
-    run_interactive(model, root, Some(restored), None, false).await
+    run_interactive(model, root, Some(restored), None, false, json_output, yolo).await
 }
 
 fn finish_shutdown(report: ProcessShutdownReport) -> Result<(), AppError> {
@@ -518,6 +583,7 @@ async fn run_agent_turn<B, T>(
     broker: &dyn PermissionBroker,
     resolver: Option<&SessionPermissionBroker>,
     renderer: &mut Renderer,
+    json_output: bool,
 ) -> Result<Option<AgentRunResult>, AppError>
 where
     B: ModelBackend + 'static,
@@ -550,7 +616,7 @@ where
                         resolver,
                         &cancellation,
                     );
-                } else {
+                } else if !json_output {
                     let mut stdout = io::stdout().lock();
                     renderer.handle(&event, &mut stdout)?;
                 }
@@ -563,7 +629,7 @@ where
             }
         }
     };
-    {
+    if !json_output {
         let mut stdout = io::stdout().lock();
         renderer.render_if_due(&mut stdout, true)?;
         stdout.flush()?;

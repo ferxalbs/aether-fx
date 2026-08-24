@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aether_core::{
     BoundedText, CONTEXT_GUIDANCE, CompactToolSummary, ContextSnapshot, FileExcerpt, GitSnapshot,
@@ -12,11 +12,31 @@ use serde_json::Value;
 
 use crate::repo_map::RepoMap;
 use crate::{
-    CommandIntent, ContextCandidate, ContextKind, classify_command, plan_verification,
-    select_context,
+    CommandIntent, ContextCandidate, ContextKind, SymbolHint, classify_command, plan_verification,
+    select_context_with_symbols,
 };
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
+
+fn relevant_symbol_paths(snapshot: &ContextSnapshot) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in snapshot
+        .inspected
+        .iter()
+        .map(|file| file.path.as_str())
+        .chain(snapshot.modified.iter().map(String::as_str))
+        .chain(snapshot.workflow.relevant_files.iter().map(String::as_str))
+    {
+        let path = PathBuf::from(path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        if paths.len() == crate::symbol_index::MAX_SYMBOL_FILES {
+            break;
+        }
+    }
+    paths
+}
 
 /// In-memory bounded context engine for one AETHER session.
 #[derive(Clone, Debug)]
@@ -230,6 +250,22 @@ impl ContextEngine {
             .as_ref()
             .and_then(|map| map.compact(MAX_REPO_MAP_CONTEXT_BYTES).ok())
             .unwrap_or_default();
+        let symbol_paths = relevant_symbol_paths(&self.snapshot);
+        let symbol_matches = self
+            .repo_map
+            .as_ref()
+            .and_then(|map| {
+                map.lookup_symbols(self.snapshot.current_task.as_str(), &symbol_paths, 64).ok()
+            })
+            .unwrap_or_default();
+        let symbol_hint_storage = symbol_matches
+            .iter()
+            .map(|symbol| (symbol.path.to_string_lossy().into_owned(), symbol.symbol.name.clone()))
+            .collect::<Vec<_>>();
+        let symbol_hints = symbol_hint_storage
+            .iter()
+            .map(|(path, name)| SymbolHint { path, name })
+            .collect::<Vec<_>>();
         let mut candidates = Vec::with_capacity(
             self.snapshot.inspected.len()
                 + self.snapshot.modified.len()
@@ -322,11 +358,12 @@ impl ContextEngine {
             });
         }
         let fixed_bytes = out.len() + CONTEXT_GUIDANCE.len() + 32;
-        let selection = select_context(
+        let selection = select_context_with_symbols(
             self.snapshot.current_task.as_str(),
             &candidates,
             MAX_CONTEXT_RENDER_BYTES.saturating_sub(fixed_bytes),
             MAX_CONTEXT_ITEMS,
+            &symbol_hints,
         );
         if !selection.items.is_empty() {
             out.push_str("selected context (relevance-ranked):\n");

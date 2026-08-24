@@ -26,6 +26,13 @@ pub struct ContextCandidate<'a> {
     pub stale: bool,
 }
 
+/// A symbol hit supplied by a targeted repository lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolHint<'a> {
+    pub path: &'a str,
+    pub name: &'a str,
+}
+
 impl<'a> ContextCandidate<'a> {
     #[must_use]
     pub fn new(kind: ContextKind, path: Option<&'a str>, content: &'a str) -> Self {
@@ -70,6 +77,18 @@ pub fn select_context(
     byte_budget: usize,
     item_limit: usize,
 ) -> SelectedContext {
+    select_context_with_symbols(task, candidates, byte_budget, item_limit, &[])
+}
+
+/// Rank context with bounded symbol hits from relevant source files.
+#[must_use]
+pub fn select_context_with_symbols(
+    task: &str,
+    candidates: &[ContextCandidate<'_>],
+    byte_budget: usize,
+    item_limit: usize,
+    symbols: &[SymbolHint<'_>],
+) -> SelectedContext {
     if byte_budget == 0 || item_limit == 0 {
         return SelectedContext { items: Vec::new(), used_bytes: 0 };
     }
@@ -86,6 +105,7 @@ pub fn select_context(
             (
                 Reverse(
                     score_candidate(*candidate, &terms, newest)
+                        + symbol_bonus(*candidate, &terms, symbols)
                         + relationship_bonus(*candidate, candidates),
                 ),
                 index,
@@ -119,6 +139,29 @@ pub fn select_context(
         used_bytes += bytes;
     }
     SelectedContext { items, used_bytes }
+}
+
+fn symbol_bonus(
+    candidate: ContextCandidate<'_>,
+    terms: &[&str],
+    symbols: &[SymbolHint<'_>],
+) -> i32 {
+    let Some(path) = candidate.path else { return 0 };
+    symbols
+        .iter()
+        .take(128)
+        .filter(|symbol| symbol.path == path)
+        .map(|symbol| {
+            terms
+                .iter()
+                .filter(|term| {
+                    symbol.name.eq_ignore_ascii_case(term)
+                        || contains_ascii_case_insensitive(symbol.name, term)
+                })
+                .count() as i32
+                * 40
+        })
+        .sum()
 }
 
 fn relationship_bonus(candidate: ContextCandidate<'_>, candidates: &[ContextCandidate<'_>]) -> i32 {
@@ -195,6 +238,14 @@ fn symbol_matches(path: &str, term: &str) -> bool {
         .any(|part| part.eq_ignore_ascii_case(term))
 }
 
+fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+    needle.len() <= value.len()
+        && value
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 fn is_duplicate(
     candidate: ContextCandidate<'_>,
     candidates: &[ContextCandidate<'_>],
@@ -228,6 +279,17 @@ mod tests {
             candidate(ContextKind::Excerpt, "src/context_selector.rs", "fn select_context"),
         ];
         let selected = select_context("fix context selector", &candidates, 4096, 2);
+        assert_eq!(selected.items[0].index, 1);
+    }
+
+    #[test]
+    fn targeted_symbol_hits_promote_the_relevant_inspected_file() {
+        let candidates = [
+            candidate(ContextKind::InspectedFile, "src/unrelated.rs", "unrelated"),
+            candidate(ContextKind::InspectedFile, "src/target.rs", "source"),
+        ];
+        let symbols = [SymbolHint { path: "src/target.rs", name: "open_session" }];
+        let selected = select_context_with_symbols("open_session", &candidates, 4096, 1, &symbols);
         assert_eq!(selected.items[0].index, 1);
     }
 

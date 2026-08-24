@@ -19,6 +19,11 @@ use blake3::Hasher;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::symbol_index::{
+    MAX_SYMBOL_FILES, MAX_SYMBOL_LOOKUP_RESULTS, SymbolFile, SymbolIndex, SymbolKind,
+    SymbolLanguage, SymbolMatch,
+};
+
 pub const DEFAULT_MAX_REPO_FILES: usize = 4_096;
 pub const DEFAULT_MAX_REPO_SPECIAL_FILES: usize = 1_024;
 pub const DEFAULT_MAX_REPO_MANIFEST_BYTES: usize = 64 * 1024;
@@ -75,6 +80,8 @@ pub enum RepoMapError {
     Git(#[source] io::Error),
     #[error("git ls-files failed: {0}")]
     GitCommand(String),
+    #[error("source path is outside the repository: {0}")]
+    InvalidSourcePath(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +212,15 @@ pub struct RepoSelection {
     pub path: PathBuf,
     pub kind: RepoSelectionKind,
     pub score: usize,
+    pub symbol: Option<RepoSymbolSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoSymbolSelection {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub line: usize,
+    pub container: Option<String>,
 }
 
 /// Bounded repository metadata produced by [`RepoMap`].
@@ -456,11 +472,17 @@ pub struct RepoMap {
     root: PathBuf,
     limits: RepoMapLimits,
     cache: Arc<Mutex<Option<CacheEntry>>>,
+    symbols: Arc<Mutex<SymbolIndex>>,
 }
 
 impl Clone for RepoMap {
     fn clone(&self) -> Self {
-        Self { root: self.root.clone(), limits: self.limits, cache: Arc::clone(&self.cache) }
+        Self {
+            root: self.root.clone(),
+            limits: self.limits,
+            cache: Arc::clone(&self.cache),
+            symbols: Arc::clone(&self.symbols),
+        }
     }
 }
 
@@ -470,7 +492,12 @@ impl RepoMap {
     }
 
     pub fn with_limits(root: impl Into<PathBuf>, limits: RepoMapLimits) -> Self {
-        Self { root: root.into(), limits: limits.normalized(), cache: Arc::new(Mutex::new(None)) }
+        Self {
+            root: root.into(),
+            limits: limits.normalized(),
+            cache: Arc::new(Mutex::new(None)),
+            symbols: Arc::new(Mutex::new(SymbolIndex::new())),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -514,7 +541,111 @@ impl RepoMap {
     }
 
     pub fn select(&self, query: &str, limit: usize) -> Result<Vec<RepoSelection>, RepoMapError> {
-        Ok(self.snapshot()?.select(query, limit))
+        let mut selections = self.snapshot()?.select(query, limit);
+        let paths = selections
+            .iter()
+            .filter(|selection| {
+                matches!(selection.kind, RepoSelectionKind::File | RepoSelectionKind::Test)
+            })
+            .map(|selection| selection.path.clone())
+            .collect::<Vec<_>>();
+        for symbol in self.lookup_symbols(query, &paths, limit)? {
+            let selection = selections.iter_mut().find(|selection| selection.path == symbol.path);
+            let symbol_selection = RepoSymbolSelection {
+                name: symbol.symbol.name.clone(),
+                kind: symbol.symbol.kind,
+                line: symbol.symbol.start_line,
+                container: symbol.symbol.container.clone(),
+            };
+            if let Some(selection) = selection {
+                selection.score = selection.score.saturating_add(symbol.score);
+                if selection.symbol.is_none() {
+                    selection.symbol = Some(symbol_selection);
+                }
+            } else {
+                selections.push(RepoSelection {
+                    path: symbol.path,
+                    kind: RepoSelectionKind::File,
+                    score: symbol.score,
+                    symbol: Some(symbol_selection),
+                });
+            }
+        }
+        selections.sort_by(|left, right| {
+            right.score.cmp(&left.score).then_with(|| left.path.cmp(&right.path))
+        });
+        selections.truncate(limit);
+        Ok(selections)
+    }
+
+    /// Parse and cache one targeted source file without reading unrelated files.
+    pub fn symbols_for_file(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Arc<SymbolFile>, RepoMapError> {
+        self.snapshot()?;
+        let Some(relative) = relative_path(&self.root, path.as_ref()) else {
+            return Err(RepoMapError::InvalidSourcePath(path.as_ref().to_path_buf()));
+        };
+        if safe_join(&self.root, &relative).is_none() {
+            return Err(RepoMapError::InvalidSourcePath(relative));
+        }
+        if !is_source_file(&relative) {
+            self.symbols
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove_file(&relative);
+            return Ok(Arc::new(empty_symbol_file(relative)));
+        }
+        let Some(source) = read_symbol_source(&self.root, &relative) else {
+            self.symbols
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove_file(&relative);
+            return Ok(Arc::new(empty_symbol_file(relative)));
+        };
+        let mut index = self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(file) = index.file(&relative)
+            && file.content_hash == source.content_hash
+            && file.truncated == source.truncated
+        {
+            return Ok(Arc::new(file.clone()));
+        }
+        Ok(Arc::new(index.index_file_hashed(
+            relative,
+            &source.content,
+            source.content_hash,
+            source.truncated,
+        )))
+    }
+
+    /// Look up symbols only in the caller-selected files. An empty path list performs no source
+    /// reads, which keeps repository-wide discovery lazy by default.
+    pub fn lookup_symbols(
+        &self,
+        query: &str,
+        paths: &[PathBuf],
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>, RepoMapError> {
+        let mut targeted = Vec::new();
+        for path in paths.iter().take(MAX_SYMBOL_FILES) {
+            let file = self.symbols_for_file(path)?;
+            if file.readable && !file.symbols.is_empty() {
+                targeted.push(path.clone());
+            }
+        }
+        let index = self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(index.lookup_in_paths(&targeted, query, limit.min(MAX_SYMBOL_LOOKUP_RESULTS)))
+    }
+
+    /// Retained symbol heap estimate for diagnostics.
+    pub fn estimated_symbol_bytes(&self) -> usize {
+        self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).estimated_bytes()
+    }
+
+    /// Number of source files currently retained by the ephemeral symbol cache.
+    pub fn indexed_symbol_files(&self) -> usize {
+        self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
     }
 
     pub fn estimated_bytes(&self) -> Result<usize, RepoMapError> {
@@ -798,6 +929,54 @@ fn read_special_file(root: &Path, path: &Path, limits: RepoMapLimits) -> ReadCon
     let truncated = content.len() > limit;
     content.truncate(limit);
     ReadContent { content, truncated, readable: true }
+}
+
+struct SymbolSource {
+    content: String,
+    content_hash: [u8; 32],
+    truncated: bool,
+}
+
+fn read_symbol_source(root: &Path, path: &Path) -> Option<SymbolSource> {
+    let full_path = safe_join(root, path)?;
+    let metadata = fs::symlink_metadata(&full_path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let mut file = File::open(full_path).ok()?;
+    let mut hasher = Hasher::new();
+    let mut retained = Vec::new();
+    let mut buffer = [0u8; 8 * 1024];
+    let mut total = 0usize;
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        if retained.len() < crate::symbol_index::MAX_SYMBOL_SOURCE_BYTES {
+            let available = crate::symbol_index::MAX_SYMBOL_SOURCE_BYTES - retained.len();
+            retained.extend_from_slice(&buffer[..read.min(available)]);
+        }
+        total = total.saturating_add(read);
+    }
+    Some(SymbolSource {
+        content: String::from_utf8_lossy(&retained).into_owned(),
+        content_hash: *hasher.finalize().as_bytes(),
+        truncated: total > crate::symbol_index::MAX_SYMBOL_SOURCE_BYTES,
+    })
+}
+
+fn empty_symbol_file(path: PathBuf) -> SymbolFile {
+    SymbolFile {
+        language: SymbolLanguage::for_path(&path),
+        path,
+        content_hash: [0; 32],
+        symbols: Vec::new(),
+        relationships: Vec::new(),
+        truncated: false,
+        readable: false,
+    }
 }
 
 fn build_snapshot(root: &Path, inventory: &Inventory, limits: RepoMapLimits) -> RepoMapSnapshot {
@@ -1086,7 +1265,7 @@ fn add_selection(
     if score == 0 || selections.iter().any(|selection| selection.path == path) {
         return;
     }
-    selections.push(RepoSelection { path: path.to_path_buf(), kind, score });
+    selections.push(RepoSelection { path: path.to_path_buf(), kind, score, symbol: None });
 }
 
 fn path_score(path: &Path, query: &[String]) -> usize {
@@ -1598,6 +1777,44 @@ mod tests {
                 .select("feature", 2)
                 .iter()
                 .any(|selection| selection.path == Path::new("src/feature.rs"))
+        );
+    }
+
+    #[test]
+    fn targeted_symbol_lookup_is_lazy_and_invalidates_on_content_hash_change() {
+        let repo = TempRepo::new();
+        repo.write("src/target.rs", "pub fn target_symbol() {}\n");
+        repo.write("src/unrelated.rs", "pub fn unrelated_symbol() {}\n");
+        repo.track(&["src/target.rs", "src/unrelated.rs"]);
+
+        let map = RepoMap::new(&repo.path);
+        let target = map.symbols_for_file("src/target.rs").expect("target symbols");
+        assert!(target.symbols.iter().any(|symbol| symbol.name == "target_symbol"));
+        assert_eq!(map.indexed_symbol_files(), 1);
+        assert!(map.lookup_symbols("unrelated_symbol", &[], 4).unwrap().is_empty());
+        assert_eq!(map.indexed_symbol_files(), 1);
+
+        repo.write("src/target.rs", "pub fn replacement_symbol() {}\n");
+        let replacement = map.symbols_for_file("src/target.rs").expect("replacement symbols");
+        assert_ne!(target.content_hash, replacement.content_hash);
+        assert!(replacement.symbols.iter().any(|symbol| symbol.name == "replacement_symbol"));
+        assert!(replacement.symbols.iter().all(|symbol| symbol.name != "target_symbol"));
+        fs::remove_file(repo.path.join("src/target.rs")).expect("remove target");
+        let missing = map.symbols_for_file("src/target.rs").expect("missing symbols");
+        assert!(!missing.readable);
+        assert_eq!(map.indexed_symbol_files(), 0);
+    }
+
+    #[test]
+    fn repo_map_selection_includes_targeted_symbol_metadata() {
+        let repo = TempRepo::new();
+        repo.write("src/target.rs", "pub fn target_symbol() {}\n");
+        repo.track(&["src/target.rs"]);
+        let selection = RepoMap::new(&repo.path).select("target", 4).expect("selection");
+        assert_eq!(selection[0].path, Path::new("src/target.rs"));
+        assert_eq!(
+            selection[0].symbol.as_ref().map(|symbol| symbol.name.as_str()),
+            Some("target_symbol")
         );
     }
 }
