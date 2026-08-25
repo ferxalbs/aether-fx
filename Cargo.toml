@@ -58,10 +58,17 @@ windows-sys = { version = "0.61.2", default-features = false, features = [
 ] }
 
 [profile.release]
-opt-level = 3
+# Optimize public artifacts for size without sacrificing hot-path inlining.
+# Fat LTO keeps cross-crate inlining and deduplication available.
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
 debug = false
 incremental = false
+
+# Keep agent decision, planning, context, verification, and scheduling paths
+# speed-optimized. Dependencies and CLI glue retain size optimization.
+[profile.release.package.aether-agent]
+opt-level = 3

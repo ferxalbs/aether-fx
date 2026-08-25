@@ -56,7 +56,9 @@ canonical-workspace, workspace-ID, and session-directory resolution. These are l
 diagnostics for the new layout; no cross-machine or speculative regression percentage is
 published.
 
-The release profile is `opt-level=3`, fat LTO, one codegen unit, aborting panic, stripped symbols, no debug info, and no incremental compilation. Public builds do not use `target-cpu=native`.
+The release profile is `opt-level="s"` with `aether-agent` retained at `opt-level=3`, fat LTO, one
+codegen unit, aborting panic, stripped symbols, no debug info, and no incremental compilation.
+Public builds do not use `target-cpu=native`.
 
 Repository planner verification on 2026-08-24 used the release Criterion benchmark with 10
 samples. Pure high-confidence planning measured a 1.627 µs median estimate, below the <20 µs

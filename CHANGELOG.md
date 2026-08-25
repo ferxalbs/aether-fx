@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-24 (3) - Smaller production startup artifact
+
+> Status: unreleased work. No artifact has been published.
+
+### Changed
+
+- Optimized release artifacts for size while retaining fat LTO, one codegen unit, aborting panic,
+  stripped symbols, and portable CPU targeting.
+- Added a Linux-compatible fresh-process startup probe for `--version`, `--help`, and minimal agent
+  startup, kept separate from in-process Criterion measurements.
+
+### Performance
+
+- Reduced stripped production binary size from 8,402,256 to 5,737,800 bytes (2,664,456 bytes,
+  31.71%) while keeping agent decision paths speed-optimized and preserving agent, policy,
+  planner, context, verification, tool, security, and deterministic evaluation behavior.
+
 ## Unreleased - 2026-08-24 (2) - Runtime allocation and state sharing
 
 > Status: unreleased work. No artifact has been published.
