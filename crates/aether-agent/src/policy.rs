@@ -13,7 +13,7 @@ use aether_core::{
 use serde_json::Value;
 
 use crate::context::ContextEngine;
-use crate::guardrails::LoopGuardrails;
+use crate::guardrails::{LoopGuardrails, WorkflowObservation};
 use crate::planner::{
     RepositoryActionPlan, RepositoryActionPlanner, RepositoryPlanRequest, RepositoryRequestKind,
 };
@@ -100,17 +100,13 @@ impl AutonomousCodingPolicy {
         result: &ToolResult,
         executed: bool,
     ) -> Option<String> {
-        let before = engine.snapshot().workflow.clone();
+        let before = WorkflowObservation::from(&engine.snapshot().workflow);
         engine.observe_tool(name, input, result);
         self.update_evidence(engine, name, input, result, executed);
         self.refresh_candidates(engine);
-        let after = engine.snapshot().workflow.clone();
-        let guard_feedback = self.guardrails.observe(name, input, result, &before, &after);
-        let advanced = before.progress != after.progress
-            || before.phase != after.phase
-            || before.workspace_revision != after.workspace_revision
-            || before.unresolved_failures != after.unresolved_failures
-            || before.decision.candidate_files != after.decision.candidate_files;
+        let after = WorkflowObservation::from(&engine.snapshot().workflow);
+        let guard_feedback = self.guardrails.observe_snapshot(name, input, result, &before, &after);
+        let advanced = before != after;
         let decision = &mut engine.snapshot_mut().workflow.decision;
         decision.note_observation_value(advanced && executed);
         if decision.low_value_observations >= 3 {
@@ -131,55 +127,67 @@ impl AutonomousCodingPolicy {
 
     /// Refresh target candidates from cached context and bounded RepoMap/symbol evidence.
     pub fn refresh_candidates(&mut self, engine: &mut ContextEngine) {
-        let snapshot = engine.snapshot().clone();
-        let key = candidate_key(&snapshot);
+        let key = candidate_key(engine.snapshot());
         if self.candidate_key == Some(key) {
             return;
         }
         self.candidate_key = Some(key);
-        let task = snapshot.current_task.as_str().trim();
+        let task = engine.snapshot().current_task.as_str().trim().to_owned();
         if task.is_empty() {
             return;
         }
 
-        let paths = relevant_paths(&snapshot);
+        let paths = relevant_paths(engine.snapshot());
         let Some(map) = engine.repository_map() else { return };
         let selections = if paths.is_empty() {
-            map.select(task, MAX_POLICY_CANDIDATES).unwrap_or_default()
+            map.select(&task, MAX_POLICY_CANDIDATES).unwrap_or_default()
         } else {
-            targeted_selections(map, task, &paths)
+            targeted_selections(map, &task, &paths)
         };
-        let workflow = &mut engine.snapshot_mut().workflow;
         for selection in selections {
             let path = selection.path.to_string_lossy().into_owned();
-            let inspected = snapshot.inspected.iter().any(|file| {
-                file.path == path && file.last_state == ObservedFileState::Present && !file.stale
-            });
-            let modified = snapshot.modified.iter().any(|modified| modified == &path);
+            let (inspected, modified, stale, revision) = {
+                let snapshot = engine.snapshot();
+                (
+                    snapshot.inspected.iter().any(|file| {
+                        file.path == path
+                            && file.last_state == ObservedFileState::Present
+                            && !file.stale
+                    }),
+                    snapshot.modified.iter().any(|modified| modified == &path),
+                    snapshot.inspected.iter().any(|file| file.path == path && file.stale),
+                    snapshot.workflow.workspace_revision,
+                )
+            };
             let evidence = usize::from(selection.symbol.is_some())
                 + usize::from(matches!(selection.kind, RepoSelectionKind::Test));
+            let selection_kind = selection.kind;
+            let selection_score = selection.score;
+            let symbol = selection.symbol;
+            let workflow = &mut engine.snapshot_mut().workflow;
             workflow.decision.upsert_candidate(
                 &path,
-                selection.score,
+                selection_score,
                 evidence,
                 inspected,
                 modified,
-                snapshot.inspected.iter().any(|file| file.path == path && file.stale),
+                stale,
             );
-            if let Some(symbol) = selection.symbol {
+            if let Some(symbol) = symbol {
                 workflow.decision.record_evidence(
-                    if matches!(selection.kind, RepoSelectionKind::Test) {
+                    if matches!(selection_kind, RepoSelectionKind::Test) {
                         DecisionEvidenceKind::Relationship
                     } else {
                         DecisionEvidenceKind::Symbol
                     },
                     &path,
                     format!("{} at line {}", symbol.name, symbol.line),
-                    selection.score.min(96) as u16,
-                    workflow.workspace_revision,
+                    selection_score.min(96) as u16,
+                    revision,
                 );
             }
         }
+        let workflow = &mut engine.snapshot_mut().workflow;
         if workflow.decision.candidate_files.is_empty() {
             workflow
                 .decision
@@ -422,8 +430,10 @@ impl AutonomousCodingPolicy {
     }
 
     fn update_next_action(&self, engine: &mut ContextEngine) {
-        let snapshot = engine.snapshot().clone();
-        let ranked = self.rank_next_actions(&snapshot);
+        let ranked = {
+            let snapshot = engine.snapshot();
+            self.rank_next_actions(snapshot)
+        };
         let Some(best) = ranked.first() else { return };
         let decision = &mut engine.snapshot_mut().workflow.decision;
         decision.set_next(best.action, best.target.as_deref(), &best.reason);
@@ -454,17 +464,17 @@ impl AutonomousCodingPolicy {
     }
 }
 
-fn targeted_selections(map: &RepoMap, task: &str, paths: &[PathBuf]) -> Vec<RepoSelection> {
+fn targeted_selections(map: &RepoMap, task: &str, paths: &[&str]) -> Vec<RepoSelection> {
     let mut selections = paths
         .iter()
         .map(|path| RepoSelection {
-            path: path.clone(),
+            path: PathBuf::from(path),
             kind: RepoSelectionKind::File,
             score: 32,
             symbol: None,
         })
         .collect::<Vec<_>>();
-    if let Ok(symbols) = map.lookup_symbols(task, paths, MAX_POLICY_CANDIDATES) {
+    if let Ok(symbols) = map.lookup_symbols_in_paths(task, paths, MAX_POLICY_CANDIDATES) {
         for symbol in symbols {
             selections.push(RepoSelection {
                 path: symbol.path,
@@ -479,7 +489,8 @@ fn targeted_selections(map: &RepoMap, task: &str, paths: &[PathBuf]) -> Vec<Repo
             });
         }
     }
-    if let Ok(relationships) = map.lookup_relationships(task, paths, MAX_POLICY_CANDIDATES) {
+    if let Ok(relationships) = map.lookup_relationships_in_paths(task, paths, MAX_POLICY_CANDIDATES)
+    {
         for relationship in relationships {
             let path = relationship.path;
             if let Some(existing) =
@@ -521,7 +532,7 @@ fn targeted_selections(map: &RepoMap, task: &str, paths: &[PathBuf]) -> Vec<Repo
     selections
 }
 
-fn relevant_paths(snapshot: &ContextSnapshot) -> Vec<PathBuf> {
+fn relevant_paths(snapshot: &ContextSnapshot) -> Vec<&str> {
     let mut paths = Vec::new();
     for path in snapshot
         .workflow
@@ -530,8 +541,7 @@ fn relevant_paths(snapshot: &ContextSnapshot) -> Vec<PathBuf> {
         .chain(snapshot.modified.iter())
         .chain(snapshot.inspected.iter().map(|file| &file.path))
     {
-        let path = PathBuf::from(path);
-        if !paths.contains(&path) {
+        if !paths.contains(&path.as_str()) {
             paths.push(path);
         }
         if paths.len() == MAX_POLICY_CANDIDATES {
@@ -546,7 +556,7 @@ fn candidate_key(snapshot: &ContextSnapshot) -> [u8; 16] {
     hasher.update(snapshot.current_task.as_str().as_bytes());
     hasher.update(&snapshot.workflow.workspace_revision.to_le_bytes());
     for path in relevant_paths(snapshot) {
-        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(path.as_bytes());
     }
     let hash = hasher.finalize();
     let mut key = [0; 16];

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use blake3::Hasher;
 
@@ -318,7 +319,7 @@ impl RelationshipIndex {
 
     fn lookup(
         &self,
-        files: &BTreeMap<PathBuf, SymbolFile>,
+        files: &BTreeMap<PathBuf, Arc<SymbolFile>>,
         query: &str,
         limit: usize,
     ) -> Vec<SymbolRelationshipMatch> {
@@ -434,7 +435,7 @@ impl RelationshipIndex {
 /// An in-memory, bounded collection of lazily supplied symbol files.
 #[derive(Clone, Debug)]
 pub struct SymbolIndex {
-    files: BTreeMap<PathBuf, SymbolFile>,
+    files: BTreeMap<PathBuf, Arc<SymbolFile>>,
     max_files: usize,
     relationship_index: RelationshipIndex,
 }
@@ -478,7 +479,11 @@ impl SymbolIndex {
 
     #[must_use]
     pub fn file(&self, path: &Path) -> Option<&SymbolFile> {
-        self.files.get(path)
+        self.files.get(path).map(Arc::as_ref)
+    }
+
+    pub(crate) fn file_arc(&self, path: &Path) -> Option<Arc<SymbolFile>> {
+        self.files.get(path).map(Arc::clone)
     }
 
     /// Parse and replace a file. Re-indexing the same path with changed content replaces the old
@@ -486,7 +491,7 @@ impl SymbolIndex {
     pub fn index_file(&mut self, path: impl Into<PathBuf>, source: &str) -> SymbolFile {
         let path = path.into();
         let file = parse_source(&path, source, false);
-        self.insert(file.clone());
+        self.insert(Arc::new(file.clone()));
         file
     }
 
@@ -499,7 +504,7 @@ impl SymbolIndex {
     ) -> SymbolFile {
         let path = path.into();
         let file = parse_source(&path, source, truncated);
-        self.insert(file.clone());
+        self.insert(Arc::new(file.clone()));
         file
     }
 
@@ -509,22 +514,26 @@ impl SymbolIndex {
         source: &str,
         content_hash: [u8; 32],
         truncated: bool,
-    ) -> SymbolFile {
+    ) -> Arc<SymbolFile> {
         let path = path.into();
         let mut file = parse_source(&path, source, truncated);
         file.content_hash = content_hash;
+        let file = Arc::new(file);
         self.insert(file.clone());
         file
     }
 
     pub fn remove_file(&mut self, path: &Path) -> Option<SymbolFile> {
         self.relationship_index.remove_file(path);
-        self.files.remove(path)
+        self.files.remove(path).map(|file| match Arc::try_unwrap(file) {
+            Ok(file) => file,
+            Err(file) => file.as_ref().clone(),
+        })
     }
 
     #[must_use]
     pub fn lookup(&self, query: &str, limit: usize) -> Vec<SymbolMatch> {
-        lookup_files(self.files.values(), query, limit)
+        lookup_files(self.files.values().map(Arc::as_ref), query, limit)
     }
 
     #[must_use]
@@ -534,7 +543,20 @@ impl SymbolIndex {
         query: &str,
         limit: usize,
     ) -> Vec<SymbolMatch> {
-        lookup_files(paths.iter().filter_map(|path| self.files.get(path)), query, limit)
+        self.lookup_in_path_refs(paths.iter().map(PathBuf::as_path), query, limit)
+    }
+
+    pub(crate) fn lookup_in_path_refs<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<SymbolMatch> {
+        lookup_files(
+            paths.into_iter().filter_map(|path| self.files.get(path).map(Arc::as_ref)),
+            query,
+            limit,
+        )
     }
 
     /// Rank likely definitions, callers, implementations, tests, and dependencies using only
@@ -572,7 +594,7 @@ impl SymbolIndex {
                 .sum::<usize>()
     }
 
-    fn insert(&mut self, file: SymbolFile) {
+    fn insert(&mut self, file: Arc<SymbolFile>) {
         self.relationship_index.remove_file(&file.path);
         if !self.files.contains_key(&file.path) && self.files.len() >= self.max_files {
             let Some(oldest) = self.files.keys().next().cloned() else { return };

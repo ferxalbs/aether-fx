@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::{fmt::Write as FmtWrite, path::Path};
 
 use aether_core::{
     BoundedText, CONTEXT_GUIDANCE, CommandEffects, CompactToolSummary, ContextSnapshot,
@@ -18,7 +18,7 @@ use crate::{
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
 
-fn relevant_symbol_paths(snapshot: &ContextSnapshot) -> Vec<PathBuf> {
+fn relevant_symbol_paths(snapshot: &ContextSnapshot) -> Vec<&str> {
     let mut paths = Vec::new();
     for path in snapshot
         .inspected
@@ -27,7 +27,6 @@ fn relevant_symbol_paths(snapshot: &ContextSnapshot) -> Vec<PathBuf> {
         .chain(snapshot.modified.iter().map(String::as_str))
         .chain(snapshot.workflow.relevant_files.iter().map(String::as_str))
     {
-        let path = PathBuf::from(path);
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -123,8 +122,9 @@ impl ContextEngine {
 
     /// Observe a completed tool call and fold it into bounded working state.
     pub fn observe_tool(&mut self, name: &str, input: &Value, result: &ToolResult) {
-        let failure_key = workflow_failure_key(name, input);
         let focused_verification = self.is_focused_verification(name, input);
+        let failure_key = (!result.ok || !self.snapshot.workflow.unresolved_failures.is_empty())
+            .then(|| workflow_failure_key(name, input));
         let command_effects = command_effects_for_tool(name, input);
         let mutation = is_workspace_mutation(name, input, command_effects.as_ref());
         let repository_observation =
@@ -150,9 +150,15 @@ impl ContextEngine {
             }
         }
         if result.ok {
-            self.snapshot.workflow.clear_failure(&failure_key);
+            if let Some(failure_key) = failure_key.as_deref() {
+                self.snapshot.workflow.clear_failure(failure_key);
+            }
         } else {
-            self.record_workflow_failure(&failure_key, name, result);
+            self.record_workflow_failure(
+                failure_key.as_deref().unwrap_or("operation"),
+                name,
+                result,
+            );
         }
         if mutation && mutation_applied(name, input, result, command_effects.as_ref()) {
             if let Some(effects) = command_effects.as_ref() {
@@ -184,10 +190,12 @@ impl ContextEngine {
                 self.snapshot.workflow.record_verification(passed);
             }
             if passed {
-                self.snapshot.workflow.clear_failure(&failure_key);
+                if let Some(failure_key) = failure_key.as_deref() {
+                    self.snapshot.workflow.clear_failure(failure_key);
+                }
             } else {
                 self.snapshot.workflow.record_failure(WorkflowFailure::new(
-                    failure_key,
+                    failure_key.as_deref().unwrap_or("operation"),
                     name,
                     "verification_failed",
                     verification_message(result),
@@ -213,11 +221,11 @@ impl ContextEngine {
         if self.repo_map.as_ref().is_none_or(|map| map.root() != workspace_root) {
             self.repo_map = Some(RepoMap::new(workspace_root));
         }
-        let mut valid = Vec::new();
-        for mut file in self.snapshot.inspected.drain(..) {
+        let mut invalid_path = false;
+        self.snapshot.inspected.retain_mut(|file| {
             if !path_is_workspace_relative(&file.path) {
-                self.snapshot.workspace_changed = true;
-                continue;
+                invalid_path = true;
+                return false;
             }
             match live_file_hash(workspace_root, &file.path) {
                 Some(hash) => {
@@ -232,7 +240,7 @@ impl ContextEngine {
                         file.stale = false;
                         file.last_state = ObservedFileState::Present;
                     }
-                    valid.push(file);
+                    true
                 }
                 None => {
                     if file.last_state == ObservedFileState::Present {
@@ -240,15 +248,18 @@ impl ContextEngine {
                         file.last_state = ObservedFileState::Missing;
                         stale_paths.push(file.path.clone());
                     }
-                    valid.push(file);
+                    true
                 }
             }
+        });
+        if invalid_path {
+            self.snapshot.workspace_changed = true;
         }
-        self.snapshot.inspected = valid;
         if !stale_paths.is_empty() {
             self.snapshot.workspace_changed = true;
-            let stale = stale_paths.iter().cloned().collect::<std::collections::HashSet<_>>();
-            self.snapshot.excerpts.retain(|excerpt| !stale.contains(&excerpt.path));
+            self.snapshot
+                .excerpts
+                .retain(|excerpt| !stale_paths.iter().any(|path| path == &excerpt.path));
         }
         if root_changed || !stale_paths.is_empty() {
             self.reset_workflow_for_workspace_change();
@@ -286,20 +297,25 @@ impl ContextEngine {
             .repo_map
             .as_ref()
             .and_then(|map| {
-                map.lookup_symbols(self.snapshot.current_task.as_str(), &symbol_paths, 64).ok()
+                map.lookup_symbols_in_paths(self.snapshot.current_task.as_str(), &symbol_paths, 64)
+                    .ok()
             })
             .unwrap_or_default();
         let relationship_matches = self
             .repo_map
             .as_ref()
             .and_then(|map| {
-                map.lookup_relationships(self.snapshot.current_task.as_str(), &symbol_paths, 64)
-                    .ok()
+                map.lookup_relationships_in_paths(
+                    self.snapshot.current_task.as_str(),
+                    &symbol_paths,
+                    64,
+                )
+                .ok()
             })
             .unwrap_or_default();
         let symbol_hint_storage = symbol_matches
             .iter()
-            .map(|symbol| (symbol.path.to_string_lossy().into_owned(), symbol.symbol.name.clone()))
+            .map(|symbol| (symbol.path.to_string_lossy(), symbol.symbol.name.as_str()))
             .collect::<Vec<_>>();
         let symbol_hints = symbol_hint_storage
             .iter()
@@ -309,7 +325,7 @@ impl ContextEngine {
             .iter()
             .map(|relationship| {
                 (
-                    relationship.path.to_string_lossy().into_owned(),
+                    relationship.path.to_string_lossy(),
                     relationship.kind,
                     relationship.score,
                     relationship.ambiguous,
@@ -444,7 +460,7 @@ impl ContextEngine {
                 out.push_str(path);
             }
             if candidate.start_line != 0 {
-                out.push_str(&format!(":{}-{}", candidate.start_line, candidate.end_line));
+                let _ = write!(out, ":{}-{}", candidate.start_line, candidate.end_line);
             }
             if candidate.kind == ContextKind::InspectedFile
                 && let Some(path) = candidate.path
@@ -452,7 +468,7 @@ impl ContextEngine {
                 && !file.ranges.is_empty()
             {
                 out.push_str(" ranges=");
-                out.push_str(&format_ranges(&file.ranges));
+                push_ranges(&mut out, &file.ranges);
             }
             if candidate.stale {
                 out.push_str(" [STALE]");
@@ -495,29 +511,29 @@ impl ContextEngine {
         out.push_str(" verification=");
         out.push_str(workflow.verification.as_str());
         out.push_str(" relevant=");
-        out.push_str(&workflow.relevant_files.len().to_string());
+        let _ = write!(out, "{}", workflow.relevant_files.len());
         out.push_str(" modified=");
-        out.push_str(&self.snapshot.modified.len().to_string());
+        let _ = write!(out, "{}", self.snapshot.modified.len());
         out.push_str(" failures=");
-        out.push_str(&workflow.unresolved_failures.len().to_string());
+        let _ = write!(out, "{}", workflow.unresolved_failures.len());
         out.push_str(" progress=");
-        out.push_str(&workflow.progress.discoveries.to_string());
+        let _ = write!(out, "{}", workflow.progress.discoveries);
         out.push('/');
-        out.push_str(&workflow.progress.inspections.to_string());
+        let _ = write!(out, "{}", workflow.progress.inspections);
         out.push('/');
-        out.push_str(&workflow.progress.mutations.to_string());
+        let _ = write!(out, "{}", workflow.progress.mutations);
         out.push('/');
-        out.push_str(&workflow.progress.verifications.to_string());
+        let _ = write!(out, "{}", workflow.progress.verifications);
         out.push('\n');
         let decision = &workflow.decision;
         out.push_str("decision: action=");
         out.push_str(decision.next_action.as_str());
         out.push_str(" confidence=");
-        out.push_str(&decision.progress_confidence.to_string());
+        let _ = write!(out, "{}", decision.progress_confidence);
         out.push_str(" candidates=");
-        out.push_str(&decision.candidate_files.len().to_string());
+        let _ = write!(out, "{}", decision.candidate_files.len());
         out.push_str(" questions=");
-        out.push_str(&decision.unresolved_questions.len().to_string());
+        let _ = write!(out, "{}", decision.unresolved_questions.len());
         if let Some(target) = &decision.next_target {
             out.push_str(" target=");
             out.push_str(target.as_str());
@@ -527,7 +543,7 @@ impl ContextEngine {
             out.push_str("decision_candidate: ");
             out.push_str(candidate.path.as_str());
             out.push_str(" score=");
-            out.push_str(&candidate.score.to_string());
+            let _ = write!(out, "{}", candidate.score);
             if !candidate.inspected || candidate.stale {
                 out.push_str(" inspect_required");
             }
@@ -597,25 +613,30 @@ impl ContextEngine {
     }
 
     fn invalidate_command_effects(&mut self, effects: &CommandEffects) {
-        let affected = effects.paths.iter().chain(effects.manifests.iter()).collect::<Vec<_>>();
-        if effects.uncertain || affected.is_empty() {
+        let has_affected = !effects.paths.is_empty() || !effects.manifests.is_empty();
+        if effects.uncertain || !has_affected {
             for file in &mut self.snapshot.inspected {
                 file.stale = true;
             }
             self.snapshot.excerpts.clear();
         } else {
             for file in &mut self.snapshot.inspected {
-                if affected.iter().any(|path| {
-                    file.path == path.as_str()
-                        || file.path.starts_with(&format!("{}/", path.trim_end_matches('/')))
-                        || path.starts_with(&format!("{}/", file.path.trim_end_matches('/')))
-                }) {
+                if effects
+                    .paths
+                    .iter()
+                    .chain(effects.manifests.iter())
+                    .any(|path| paths_overlap(&file.path, path))
+                {
                     file.stale = true;
                 }
             }
-            self.snapshot
-                .excerpts
-                .retain(|excerpt| !affected.iter().any(|path| excerpt.path == path.as_str()));
+            self.snapshot.excerpts.retain(|excerpt| {
+                !effects
+                    .paths
+                    .iter()
+                    .chain(effects.manifests.iter())
+                    .any(|path| excerpt.path == path.as_str())
+            });
         }
         self.snapshot.workspace_changed = true;
         if let Some(repo_map) = &self.repo_map {
@@ -820,25 +841,18 @@ impl ContextEngine {
         range: Option<LineRange>,
         last_state: ObservedFileState,
     ) {
-        if self.snapshot.inspected.iter().any(|file| file.path == path) {
-            let hash_changed = self.snapshot.inspected.iter().any(|file| {
-                file.path == path
-                    && hash.as_ref().is_some_and(|new_hash| {
-                        file.content_hash.as_ref().is_some_and(|old| old != new_hash)
-                    })
+        if let Some(existing) = self.snapshot.inspected.iter_mut().find(|file| file.path == path) {
+            let hash_changed = hash.as_ref().is_some_and(|new_hash| {
+                existing.content_hash.as_ref().is_some_and(|old| old != new_hash)
             });
-            if let Some(existing) =
-                self.snapshot.inspected.iter_mut().find(|file| file.path == path)
-            {
-                if let Some(hash) = hash.clone() {
-                    existing.content_hash = Some(hash);
-                }
-                existing.last_state = last_state;
-                existing.stale = false;
-                if let Some(range) = range {
-                    existing.ranges.push(range);
-                    merge_line_ranges(&mut existing.ranges);
-                }
+            if let Some(hash) = hash.as_deref() {
+                existing.content_hash = Some(hash.to_owned());
+            }
+            existing.last_state = last_state;
+            existing.stale = false;
+            if let Some(range) = range {
+                existing.ranges.push(range);
+                merge_line_ranges(&mut existing.ranges);
             }
             if hash_changed {
                 self.snapshot.excerpts.retain(|excerpt| excerpt.path != path);
@@ -906,6 +920,15 @@ impl ContextEngine {
 
 fn path_is_workspace_relative(path: &str) -> bool {
     WorkspacePath::new(path).is_ok()
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right || is_path_parent(left, right) || is_path_parent(right, left)
+}
+
+fn is_path_parent(parent: &str, child: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
+    child.strip_prefix(parent).is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn is_workspace_mutation(name: &str, _input: &Value, effects: Option<&CommandEffects>) -> bool {
@@ -1088,12 +1111,13 @@ fn push_bounded_workflow_path(out: &mut String, path: &str) {
     out.push_str(&path[..end]);
 }
 
-fn format_ranges(ranges: &[LineRange]) -> String {
-    ranges
-        .iter()
-        .map(|range| format!("{}-{}", range.start, range.end))
-        .collect::<Vec<_>>()
-        .join(",")
+fn push_ranges(out: &mut String, ranges: &[LineRange]) {
+    for (index, range) in ranges.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{}-{}", range.start, range.end);
+    }
 }
 
 fn line_range_from_read(lines: &[Value]) -> Option<LineRange> {

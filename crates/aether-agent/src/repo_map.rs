@@ -640,14 +640,14 @@ impl RepoMap {
             && file.content_hash == source.content_hash
             && file.truncated == source.truncated
         {
-            return Ok(Arc::new(file.clone()));
+            return Ok(index.file_arc(&relative).expect("indexed symbol file exists"));
         }
-        Ok(Arc::new(index.index_file_hashed(
+        Ok(index.index_file_hashed(
             relative,
             &source.content,
             source.content_hash,
             source.truncated,
-        )))
+        ))
     }
 
     /// Look up symbols only in the caller-selected files. An empty path list performs no source
@@ -669,12 +669,44 @@ impl RepoMap {
         Ok(index.lookup_in_paths(&targeted, query, limit.min(MAX_SYMBOL_LOOKUP_RESULTS)))
     }
 
+    /// Look up symbols in caller-owned UTF-8 paths without cloning a temporary `PathBuf` list.
+    pub(crate) fn lookup_symbols_in_paths(
+        &self,
+        query: &str,
+        paths: &[&str],
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>, RepoMapError> {
+        for path in paths.iter().take(MAX_SYMBOL_FILES) {
+            self.symbols_for_file(path)?;
+        }
+        let index = self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(index.lookup_in_path_refs(
+            paths.iter().take(MAX_SYMBOL_FILES).map(|path| Path::new(*path)),
+            query,
+            limit.min(MAX_SYMBOL_LOOKUP_RESULTS),
+        ))
+    }
+
     /// Look up bounded lexical relationships among the caller-selected and already indexed files.
     /// This never walks the workspace beyond `paths`.
     pub fn lookup_relationships(
         &self,
         query: &str,
         paths: &[PathBuf],
+        limit: usize,
+    ) -> Result<Vec<SymbolRelationshipMatch>, RepoMapError> {
+        for path in paths.iter().take(MAX_SYMBOL_FILES) {
+            self.symbols_for_file(path)?;
+        }
+        let index = self.symbols.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(index.lookup_relationships(query, limit.min(MAX_SYMBOL_LOOKUP_RESULTS)))
+    }
+
+    /// Look up relationships in caller-owned UTF-8 paths without a temporary path vector.
+    pub(crate) fn lookup_relationships_in_paths(
+        &self,
+        query: &str,
+        paths: &[&str],
         limit: usize,
     ) -> Result<Vec<SymbolRelationshipMatch>, RepoMapError> {
         for path in paths.iter().take(MAX_SYMBOL_FILES) {

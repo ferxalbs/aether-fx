@@ -4,8 +4,8 @@ use std::{
 };
 
 use aether_core::{
-    CommandClass, CommandEffects, DEFAULT_MAX_OUTPUT_BYTES, ToolCallId, ToolResult, WorkflowPhase,
-    WorkflowState, analyze_command,
+    CommandClass, CommandEffects, DEFAULT_MAX_OUTPUT_BYTES, DecisionCandidate, ToolCallId,
+    ToolResult, WorkflowFailure, WorkflowPhase, WorkflowState, analyze_command,
 };
 use serde_json::Value;
 
@@ -23,6 +23,84 @@ struct Observation {
     fingerprint: [u8; 16],
     revision: u32,
     result: ToolResult,
+}
+
+/// Small workflow projection used for progress comparisons between tool steps.
+///
+/// Keeping this projection separate from `WorkflowState` avoids cloning transcripts, evidence,
+/// verification plans, and other state that cannot affect the loop-progress decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowObservation {
+    workspace_revision: u32,
+    progress: [u16; 4],
+    unresolved_failures: Vec<WorkflowFailure>,
+    phase: WorkflowPhase,
+    candidate_files: Vec<DecisionCandidate>,
+}
+
+impl From<&WorkflowState> for WorkflowObservation {
+    fn from(workflow: &WorkflowState) -> Self {
+        Self {
+            workspace_revision: workflow.workspace_revision,
+            progress: [
+                workflow.progress.discoveries,
+                workflow.progress.inspections,
+                workflow.progress.mutations,
+                workflow.progress.verifications,
+            ],
+            unresolved_failures: workflow.unresolved_failures.clone(),
+            phase: workflow.phase,
+            candidate_files: workflow.decision.candidate_files.clone(),
+        }
+    }
+}
+
+trait WorkflowObservationView {
+    fn workspace_revision(&self) -> u32;
+    fn progress(&self) -> [u16; 4];
+    fn unresolved_failures(&self) -> &[WorkflowFailure];
+    fn phase(&self) -> WorkflowPhase;
+}
+
+impl WorkflowObservationView for WorkflowState {
+    fn workspace_revision(&self) -> u32 {
+        self.workspace_revision
+    }
+
+    fn progress(&self) -> [u16; 4] {
+        [
+            self.progress.discoveries,
+            self.progress.inspections,
+            self.progress.mutations,
+            self.progress.verifications,
+        ]
+    }
+
+    fn unresolved_failures(&self) -> &[WorkflowFailure] {
+        &self.unresolved_failures
+    }
+
+    fn phase(&self) -> WorkflowPhase {
+        self.phase
+    }
+}
+
+impl WorkflowObservationView for WorkflowObservation {
+    fn workspace_revision(&self) -> u32 {
+        self.workspace_revision
+    }
+
+    fn progress(&self) -> [u16; 4] {
+        self.progress
+    }
+
+    fn unresolved_failures(&self) -> &[WorkflowFailure] {
+        &self.unresolved_failures
+    }
+
+    fn phase(&self) -> WorkflowPhase {
+        self.phase
+    }
 }
 
 /// Bounded deterministic state for suppressing redundant agent-loop work.
@@ -95,17 +173,40 @@ impl LoopGuardrails {
         before: &WorkflowState,
         after: &WorkflowState,
     ) -> Option<String> {
+        self.observe_impl(name, input, result, before, after)
+    }
+
+    /// Fold one result using only workflow fields that affect loop progress.
+    pub(crate) fn observe_snapshot(
+        &mut self,
+        name: &str,
+        input: &Value,
+        result: &ToolResult,
+        before: &WorkflowObservation,
+        after: &WorkflowObservation,
+    ) -> Option<String> {
+        self.observe_impl(name, input, result, before, after)
+    }
+
+    fn observe_impl<W: WorkflowObservationView>(
+        &mut self,
+        name: &str,
+        input: &Value,
+        result: &ToolResult,
+        before: &W,
+        after: &W,
+    ) -> Option<String> {
         if result.ok
             && let Some(kind) = classify(name, input)
         {
             let fingerprint = call_fingerprint(kind, name, input);
             let observation = Observation {
                 fingerprint,
-                revision: after.workspace_revision,
+                revision: after.workspace_revision(),
                 result: result.clone(),
             };
             if !self.observations.iter().any(|item| {
-                item.revision == after.workspace_revision && item.fingerprint == fingerprint
+                item.revision == after.workspace_revision() && item.fingerprint == fingerprint
             }) {
                 if self.observations.len() == MAX_OBSERVATIONS {
                     self.observations.pop_front();
@@ -121,13 +222,10 @@ impl LoopGuardrails {
         }
 
         let progress = progress_fingerprint(after, result);
-        let state_advanced = before.workspace_revision != after.workspace_revision
-            || before.progress.discoveries != after.progress.discoveries
-            || before.progress.inspections != after.progress.inspections
-            || before.progress.mutations != after.progress.mutations
-            || before.progress.verifications != after.progress.verifications
-            || before.unresolved_failures != after.unresolved_failures
-            || before.phase != after.phase;
+        let state_advanced = before.workspace_revision() != after.workspace_revision()
+            || before.progress() != after.progress()
+            || before.unresolved_failures() != after.unresolved_failures()
+            || before.phase() != after.phase();
         if state_advanced || self.last_progress != Some(progress) {
             self.no_progress = 0;
         } else {
@@ -138,7 +236,8 @@ impl LoopGuardrails {
         if self.no_progress >= NO_PROGRESS_LIMIT {
             self.no_progress = 0;
             Some("guardrail: no progress across 3 successful tool steps; change arguments or approach, modify the workspace, or finish with the evidence already collected".to_owned())
-        } else if after.phase == WorkflowPhase::Complete && after.unresolved_failures.is_empty() {
+        } else if after.phase() == WorkflowPhase::Complete && after.unresolved_failures().is_empty()
+        {
             Some("completion_ready: required verification passed and no unresolved failures remain; summarize and finish".to_owned())
         } else {
             None
@@ -223,13 +322,12 @@ fn hash_value(hasher: &mut blake3::Hasher, value: &Value) {
     };
 }
 
-fn progress_fingerprint(workflow: &WorkflowState, result: &ToolResult) -> [u8; 16] {
+fn progress_fingerprint<W: WorkflowObservationView>(workflow: &W, result: &ToolResult) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&workflow.workspace_revision.to_le_bytes());
-    hasher.update(&workflow.progress.discoveries.to_le_bytes());
-    hasher.update(&workflow.progress.inspections.to_le_bytes());
-    hasher.update(&workflow.progress.mutations.to_le_bytes());
-    hasher.update(&workflow.progress.verifications.to_le_bytes());
+    hasher.update(&workflow.workspace_revision().to_le_bytes());
+    for counter in workflow.progress() {
+        hasher.update(&counter.to_le_bytes());
+    }
     hasher.update(result.output.as_str().as_bytes());
     truncated_hash(hasher.finalize())
 }

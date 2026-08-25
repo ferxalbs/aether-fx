@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentEvent, SessionId, StepId, ToolCallId, ToolDefinition, TurnId};
@@ -21,7 +23,7 @@ pub struct ModelRequest {
     /// Responses-style input assembled by the agent.
     pub input: serde_json::Value,
     /// Exact tool definitions visible to the model.
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Arc<Vec<ToolDefinition>>,
     /// Opaque continuation from the previous model step.
     pub continuation: Option<OpaqueContinuation>,
 }

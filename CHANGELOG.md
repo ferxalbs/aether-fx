@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-24 (2) - Runtime allocation and state sharing
+
+> Status: unreleased work. No artifact has been published.
+
+### Changed
+
+- Shared immutable model tool definitions and lazily indexed symbol metadata instead of copying
+  them for each model step or repository observation.
+- Replaced full workflow/context clones, temporary path collections, and transient render strings
+  with bounded projections, borrowed paths, and direct writes while preserving deterministic state.
+
+### Performance
+
+- Release `aether` size is 8,402,264 bytes after the runtime changes; startup probes remained in
+  the observed 0.05–0.06 second range on the local host.
+- Deterministic evaluation remains 9/9 successful with 53 model steps, 38 executed tool calls,
+  6 prevented redundant calls, and 5,874 context bytes.
+
 ## Unreleased - 2026-08-24 (1) - Bounded repository action planning
 
 > Status: unreleased work. No artifact has been published.

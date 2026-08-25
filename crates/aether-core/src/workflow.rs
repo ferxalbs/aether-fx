@@ -222,18 +222,19 @@ impl WorkflowState {
         if self.relevant_files.iter().any(|existing| existing == path.as_str()) {
             return;
         }
-        self.relevant_files.push(path.clone().into_string());
-        if self.relevant_files.len() > MAX_WORKFLOW_RELEVANT_FILES {
-            self.relevant_files.remove(0);
-        }
-        self.progress.note_discovery();
+        let path = path.into_string();
         self.decision.record_evidence(
             crate::DecisionEvidenceKind::Discovery,
-            path,
+            &path,
             "relevant path observed",
             24,
             self.workspace_revision,
         );
+        self.relevant_files.push(path);
+        if self.relevant_files.len() > MAX_WORKFLOW_RELEVANT_FILES {
+            self.relevant_files.remove(0);
+        }
+        self.progress.note_discovery();
         if matches!(self.phase, WorkflowPhase::Discover | WorkflowPhase::Complete) {
             self.phase = WorkflowPhase::Inspect;
         }

@@ -152,6 +152,7 @@ pub enum AgentError {
 pub struct Agent<B, T> {
     backend: Arc<B>,
     tools: Arc<T>,
+    tool_definitions: Arc<Vec<aether_core::ToolDefinition>>,
     context: Mutex<ContextEngine>,
 }
 
@@ -162,9 +163,11 @@ where
 {
     /// Compose one backend and one tool executor.
     pub fn new(backend: B, tools: T) -> Self {
+        let tool_definitions = Arc::new(tools.definitions().to_vec());
         Self {
             backend: Arc::new(backend),
             tools: Arc::new(tools),
+            tool_definitions,
             context: Mutex::new(ContextEngine::new(String::new(), None)),
         }
     }
@@ -230,7 +233,7 @@ where
                 step_id,
                 model: request.model.clone(),
                 input: input.clone(),
-                tools: self.tools.definitions().to_vec(),
+                tools: Arc::clone(&self.tool_definitions),
                 continuation: continuation.clone(),
             };
             if let Some(metrics) = &mut metrics {
@@ -361,7 +364,7 @@ where
                     steps,
                     cancelled: false,
                     continuation,
-                    context: self.current_context(),
+                    context,
                     metrics: final_metrics,
                 });
             }
@@ -434,11 +437,13 @@ where
                 let name = completed.name;
                 let tool_input = completed.input;
                 let result = completed.result;
-                let before = self.current_context().workflow;
+                let before_verifications =
+                    self.with_context(|engine| engine.snapshot().workflow.progress.verifications);
                 let feedback = self.with_context(|engine| {
                     policy.observe(engine, &name, &tool_input, &result, completed.executed)
                 });
-                let after = self.current_context().workflow;
+                let after_verifications =
+                    self.with_context(|engine| engine.snapshot().workflow.progress.verifications);
                 if let Some(metrics) = &mut metrics {
                     if completed.executed {
                         metrics.value.executed_tool_calls =
@@ -462,11 +467,11 @@ where
                         .value
                         .bytes_read
                         .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
-                    if after.progress.verifications > before.progress.verifications {
-                        metrics.value.verification_attempts =
-                            metrics.value.verification_attempts.saturating_add(u64::from(
-                                after.progress.verifications - before.progress.verifications,
-                            ));
+                    if after_verifications > before_verifications {
+                        metrics.value.verification_attempts = metrics
+                            .value
+                            .verification_attempts
+                            .saturating_add(u64::from(after_verifications - before_verifications));
                     }
                 }
                 outputs.push(json!({
