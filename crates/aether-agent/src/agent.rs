@@ -143,6 +143,9 @@ pub enum AgentError {
     /// The turn exceeded its semantic step cap.
     #[error("agent step limit exceeded")]
     StepLimit,
+    /// The model attempted to finish without the workflow evidence required by policy.
+    #[error("agent completion blocked: workflow evidence is incomplete")]
+    CompletionBlocked,
     /// The user cancelled the turn.
     #[error("agent turn cancelled")]
     Cancelled,
@@ -194,15 +197,19 @@ where
         let mut metrics = request.metrics.then(MetricsState::new);
         self.prepare_turn(&request);
         if let Some(root) = request.workspace_root.clone() {
-            let git =
-                tokio::task::spawn_blocking(move || capture_git_snapshot(&PathBuf::from(root)))
-                    .await
-                    .unwrap_or_else(|_| aether_core::GitSnapshot {
-                        branch: None,
-                        status: BoundedText::new("git snapshot cancelled", 128),
-                        available: false,
-                    });
-            self.with_context(|engine| engine.set_git(git));
+            let workspace_path = PathBuf::from(&root);
+            let git = tokio::task::spawn_blocking(move || capture_git_snapshot(&workspace_path))
+                .await
+                .unwrap_or_else(|_| aether_core::GitSnapshot {
+                    branch: None,
+                    status: BoundedText::new("git snapshot cancelled", 128),
+                    available: false,
+                });
+            let workspace_path = PathBuf::from(root);
+            self.with_context(|engine| {
+                engine.refresh_against_workspace(&workspace_path);
+                engine.set_git(git);
+            });
         }
         let mut continuation = request.continuation.clone();
         let mut policy = AutonomousCodingPolicy::new();
@@ -211,6 +218,7 @@ where
             assemble_user_input(&request.prompt, self.context_packet(continuation.is_some()));
         let mut steps = 0_u16;
         let mut reconstructed = false;
+        let mut blocked_completions = 0_u8;
 
         loop {
             if cancellation.is_cancelled() {
@@ -345,11 +353,26 @@ where
             }
 
             if tool_calls.is_empty() {
-                send_event(&events, AgentEvent::Done).await?;
-                self.with_context(|engine| {
+                let complete = self.with_context(|engine| {
                     engine.set_continuation(continuation.clone());
-                    policy.finish_turn(engine);
+                    policy.finish_turn(engine)
                 });
+                if !complete {
+                    blocked_completions = blocked_completions.saturating_add(1);
+                    let feedback = self.with_context(|engine| {
+                        policy.completion_feedback(engine.snapshot(), blocked_completions)
+                    });
+                    if blocked_completions >= 3 {
+                        return Err(AgentError::CompletionBlocked);
+                    }
+                    input = json!([{
+                        "type": "message",
+                        "role": "developer",
+                        "content": feedback
+                    }]);
+                    continue;
+                }
+                send_event(&events, AgentEvent::Done).await?;
                 let context = self.current_context();
                 let final_metrics = metrics.map(|metrics| {
                     let mut value = metrics.finish();
@@ -369,35 +392,33 @@ where
                 });
             }
 
+            blocked_completions = 0;
+
             let snapshot = self.current_context();
-            let planner_plan = if tool_calls.len() == 1 {
-                let (call_id, name, input) = &tool_calls[0];
-                let invocation = ToolInvocation {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                };
-                let plan = if self.tools.permission_request(&invocation).is_some() {
-                    None
-                } else {
-                    self.with_context(|engine| {
-                        policy.repository_plan_for_call(engine.snapshot(), name, input)
+            let planner_plan = if tool_calls.iter().all(|(call_id, name, input)| {
+                self.tools
+                    .permission_request(&ToolInvocation {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
                     })
-                };
-                if let Some(plan) = &plan
-                    && let Some(metrics) = &mut metrics
-                {
-                    metrics.value.planner_attempts =
-                        metrics.value.planner_attempts.saturating_add(1);
-                    if plan.is_ambiguous() {
-                        metrics.value.planner_aborted_ambiguity =
-                            metrics.value.planner_aborted_ambiguity.saturating_add(1);
-                    }
-                }
-                plan
+                    .is_none()
+            }) {
+                self.with_context(|engine| {
+                    policy.repository_plan_for_calls(engine.snapshot(), &tool_calls)
+                })
             } else {
                 None
             };
+            if planner_plan.is_some()
+                && let Some(metrics) = &mut metrics
+            {
+                metrics.value.planner_attempts = metrics.value.planner_attempts.saturating_add(1);
+                if planner_plan.as_ref().is_some_and(RepositoryActionPlan::is_ambiguous) {
+                    metrics.value.planner_aborted_ambiguity =
+                        metrics.value.planner_aborted_ambiguity.saturating_add(1);
+                }
+            }
             let gate = AgentToolGate {
                 workflow: WorkflowMutationGate { snapshot: snapshot.clone() },
                 policy: &policy,
@@ -405,10 +426,10 @@ where
             let completed = if planner_plan.as_ref().is_some_and(RepositoryActionPlan::is_usable) {
                 let plan = planner_plan.expect("usable planner plan is present");
                 match self
-                    .execute_repository_plan(&policy, plan, &tool_calls[0], &events, &cancellation)
+                    .execute_repository_batch(&policy, plan, &tool_calls, &events, &cancellation)
                     .await?
                 {
-                    Some(planned) => vec![planned],
+                    Some(planned) => planned,
                     None => {
                         execute_tool_calls_with_gate(
                             self.tools.as_ref(),
@@ -526,65 +547,87 @@ where
 
     fn context_packet(&self, has_continuation: bool) -> Option<String> {
         self.with_context(|engine| {
-            engine.should_attach_to_prompt(has_continuation).then(|| engine.render(true))
+            engine.should_attach_to_prompt(has_continuation).then(|| engine.render_delta(true))
         })
     }
 
-    async fn execute_repository_plan(
+    async fn execute_repository_batch(
         &self,
         policy: &AutonomousCodingPolicy,
         plan: RepositoryActionPlan,
-        call: &(ToolCallId, String, serde_json::Value),
+        calls: &[(ToolCallId, String, serde_json::Value)],
         events: &mpsc::Sender<AgentEvent>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<ScheduledToolResult>, AgentError> {
+    ) -> Result<Option<Vec<ScheduledToolResult>>, AgentError> {
         let (snapshot, repo) = self
             .with_context(|engine| (engine.snapshot().clone(), engine.repository_map().cloned()));
-        let Some(repo) = repo else {
+        if calls.is_empty() {
             return Ok(None);
-        };
+        }
         let planner_actions = plan.actions.len();
-        let planner = *policy.planner();
-        let cancellation_for_worker = cancellation.clone();
-        let execution = tokio::task::spawn_blocking(move || {
-            planner.execute(&plan, &repo, &snapshot, &cancellation_for_worker)
-        });
-        let observation = tokio::select! {
-            _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-            result = execution => result,
+        let observation = if plan.actions.is_empty() {
+            plan.observation
+        } else {
+            let Some(repo) = repo else { return Ok(None) };
+            let planner = *policy.planner();
+            let cancellation_for_worker = cancellation.clone();
+            let execution = tokio::task::spawn_blocking(move || {
+                planner.execute(&plan, &repo, &snapshot, &cancellation_for_worker)
+            });
+            let observation = tokio::select! {
+                _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                result = execution => result,
+            };
+            match observation {
+                Ok(Ok(observation)) => observation,
+                Ok(Err(crate::PlannerExecutionError::Cancelled)) => {
+                    return Err(AgentError::Cancelled);
+                }
+                Ok(Err(_)) | Err(_) => return Ok(None),
+            }
         };
-        let observation = match observation {
-            Ok(Ok(observation)) => observation,
-            Ok(Err(crate::PlannerExecutionError::Cancelled)) => return Err(AgentError::Cancelled),
-            Ok(Err(_)) | Err(_) => return Ok(None),
-        };
-        let result = observation.into_tool_result(call.0.clone());
-        send_event(
-            events,
-            AgentEvent::ToolStarted {
-                call_id: call.0.clone(),
-                name: call.1.clone(),
-                permission: "read_only".to_owned(),
-                operation: call.1.clone(),
-                step_id: None,
-            },
-        )
-        .await?;
-        send_event(
-            events,
-            AgentEvent::ToolOutput { call_id: call.0.clone(), output: result.output.clone() },
-        )
-        .await?;
-        send_event(events, AgentEvent::ToolFinished { call_id: call.0.clone(), ok: result.ok })
+        let mut completed = Vec::with_capacity(calls.len());
+        let anchor_call_id = calls[0].0.as_str().to_owned();
+        for (index, call) in calls.iter().enumerate() {
+            let result = if index == 0 {
+                observation.clone().into_tool_result(call.0.clone())
+            } else {
+                ToolResult::success_text(
+                    call.0.clone(),
+                    format!(
+                        "repository planner: this read-only request was coalesced into the bounded observation returned for call {anchor_call_id}"
+                    ),
+                    DEFAULT_MAX_OUTPUT_BYTES,
+                )
+            };
+            send_event(
+                events,
+                AgentEvent::ToolStarted {
+                    call_id: call.0.clone(),
+                    name: call.1.clone(),
+                    permission: "read_only".to_owned(),
+                    operation: call.1.clone(),
+                    step_id: None,
+                },
+            )
             .await?;
-        Ok(Some(ScheduledToolResult {
-            name: call.1.clone(),
-            input: call.2.clone(),
-            result,
-            executed: true,
-            planned: true,
-            planner_actions,
-        }))
+            send_event(
+                events,
+                AgentEvent::ToolOutput { call_id: call.0.clone(), output: result.output.clone() },
+            )
+            .await?;
+            send_event(events, AgentEvent::ToolFinished { call_id: call.0.clone(), ok: result.ok })
+                .await?;
+            completed.push(ScheduledToolResult {
+                name: call.1.clone(),
+                input: call.2.clone(),
+                result,
+                executed: true,
+                planned: true,
+                planner_actions: if index == 0 { planner_actions } else { 0 },
+            });
+        }
+        Ok(Some(completed))
     }
 }
 
@@ -669,8 +712,9 @@ fn mutation_targets_inspected(
 ) -> bool {
     match name {
         "write" => input.get("path").and_then(serde_json::Value::as_str).is_some_and(|path| {
-            target_is_currently_inspected(snapshot, path)
-                || (input.get("create_only").and_then(serde_json::Value::as_bool) == Some(true)
+            target_is_currently_inspected(snapshot, path, input)
+                || (WorkspacePath::new(path).is_ok()
+                    && input.get("create_only").and_then(serde_json::Value::as_bool) == Some(true)
                     && new_target_has_discovered_parent(snapshot, path))
         }),
         "patch" => input.get("files").and_then(serde_json::Value::as_array).is_some_and(|files| {
@@ -678,22 +722,47 @@ fn mutation_targets_inspected(
                 && files.iter().all(|file| {
                     file.get("path")
                         .and_then(serde_json::Value::as_str)
-                        .is_some_and(|path| target_is_currently_inspected(snapshot, path))
+                        .is_some_and(|path| target_is_currently_inspected(snapshot, path, file))
                 })
         }),
         _ => true,
     }
 }
 
-fn target_is_currently_inspected(snapshot: &ContextSnapshot, path: &str) -> bool {
+fn target_is_currently_inspected(
+    snapshot: &ContextSnapshot,
+    path: &str,
+    input: &serde_json::Value,
+) -> bool {
     WorkspacePath::new(path).is_ok()
         && snapshot.workflow.relevant_files.iter().any(|relevant| relevant == path)
+        && (snapshot.user_modified.iter().all(|owned| owned != path)
+            || expected_hash_matches(
+                snapshot,
+                path,
+                input.get("expected_hash").and_then(serde_json::Value::as_str),
+            ))
         && snapshot.inspected.iter().any(|file| {
             file.path == path
                 && file.last_state == ObservedFileState::Present
                 && !file.stale
                 && file.content_hash.is_some()
+                && expected_hash_matches(
+                    snapshot,
+                    path,
+                    input.get("expected_hash").and_then(serde_json::Value::as_str),
+                )
         })
+}
+
+fn expected_hash_matches(snapshot: &ContextSnapshot, path: &str, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else { return false };
+    snapshot
+        .inspected
+        .iter()
+        .find(|file| file.path == path)
+        .and_then(|file| file.content_hash.as_deref())
+        == Some(expected)
 }
 
 fn new_target_has_discovered_parent(snapshot: &ContextSnapshot, path: &str) -> bool {
@@ -784,13 +853,28 @@ mod tests {
         }
     }
 
+    fn completed_context() -> ContextSnapshot {
+        let mut context = ContextSnapshot::new("/workspace", None);
+        context.workflow.record_relevant_file("src/lib.rs");
+        context.inspected.push(InspectedFile {
+            path: "src/lib.rs".to_owned(),
+            content_hash: Some("current".to_owned()),
+            ranges: vec![aether_core::LineRange { start: 1, end: 4 }],
+            last_state: ObservedFileState::Present,
+            stale: false,
+        });
+        context.workflow.record_inspection();
+        assert!(context.workflow.complete_if_ready(&[]));
+        context
+    }
+
     #[test]
     fn mutation_gate_requires_current_inspection_before_execution() {
         let call_id = ToolCallId::new("workflow-gate").unwrap();
         let invocation = ToolInvocation {
             call_id: call_id.clone(),
             name: "write".to_owned(),
-            input: json!({"path": "src/lib.rs"}),
+            input: json!({"path": "src/lib.rs", "expected_hash": "current"}),
         };
         let gate = WorkflowMutationGate { snapshot: ContextSnapshot::new("/workspace", None) };
         let blocked = gate.preflight(&invocation).expect("uninspected mutation must be blocked");
@@ -818,6 +902,7 @@ mod tests {
         let turn = TurnId::new("turn-test").unwrap();
         let mut request = AgentRequest::new(session, turn, "inspect");
         request.max_steps = 4;
+        request.context_seed = Some(completed_context());
         let (sender, mut receiver) = mpsc::channel(32);
         let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
         let mut kinds = Vec::new();
@@ -832,6 +917,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_model_cannot_complete_without_workflow_evidence() {
+        let agent = Agent::new(crate::FakeBackend::new("premature"), tools());
+        let mut request = AgentRequest::new(
+            SessionId::new("session-premature").unwrap(),
+            TurnId::new("turn-premature").unwrap(),
+            "repair the workspace",
+        );
+        request.max_steps = 5;
+        let (sender, mut receiver) = mpsc::channel(16);
+        let result = agent.run(request, sender, CancellationToken::new()).await;
+        assert!(matches!(result, Err(AgentError::CompletionBlocked)));
+        assert!(
+            !std::iter::from_fn(|| receiver.try_recv().ok())
+                .any(|event| matches!(event, AgentEvent::Done))
+        );
+        assert_ne!(agent.current_context().workflow.phase, aether_core::WorkflowPhase::Complete);
+    }
+
+    #[tokio::test]
+    async fn live_workspace_refresh_reopens_stale_seeded_context() {
+        let root = std::env::temp_dir().join(format!(
+            "aether-agent-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "new").unwrap();
+        let mut seed = ContextSnapshot::new(root.display().to_string(), None);
+        seed.workflow.record_relevant_file("lib.rs");
+        seed.inspected.push(InspectedFile {
+            path: "lib.rs".to_owned(),
+            content_hash: Some(blake3::hash(b"old").to_hex().to_string()),
+            ranges: vec![aether_core::LineRange { start: 1, end: 1 }],
+            last_state: ObservedFileState::Present,
+            stale: false,
+        });
+        seed.workflow.record_inspection();
+        assert!(seed.workflow.complete_if_ready(&[]));
+
+        let agent = Agent::new(crate::FakeBackend::new("premature"), tools());
+        let mut request = AgentRequest::new(
+            SessionId::new("session-live-stale").unwrap(),
+            TurnId::new("turn-live-stale").unwrap(),
+            "inspect the changed file",
+        );
+        request.workspace_root = Some(root.display().to_string());
+        request.context_seed = Some(seed);
+        let (sender, _receiver) = mpsc::channel(16);
+        assert!(matches!(
+            agent.run(request, sender, CancellationToken::new()).await,
+            Err(AgentError::CompletionBlocked)
+        ));
+        let context = agent.current_context();
+        assert!(context.workspace_changed);
+        assert!(context.inspected[0].stale);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn metrics_account_requested_executed_and_prevented_calls() {
         let backend =
             crate::FakeBackend::new("completed").with_tool_call("read", json!({"files": []}));
@@ -842,6 +986,7 @@ mod tests {
             "inspect",
         );
         request.metrics = true;
+        request.context_seed = Some(completed_context());
         let (sender, _receiver) = mpsc::channel(32);
         let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
         let metrics = result.metrics.unwrap();
@@ -886,12 +1031,13 @@ mod tests {
     #[tokio::test]
     async fn metrics_disabled_avoids_collection_and_cancellation_remains_terminal() {
         let agent = Agent::new(crate::FakeBackend::new("done"), tools());
-        let request = AgentRequest::new(
+        let mut request = AgentRequest::new(
             SessionId::new("metrics-disabled").unwrap(),
             TurnId::new("metrics-disabled-turn").unwrap(),
             "finish",
         );
         let (sender, _receiver) = mpsc::channel(8);
+        request.context_seed = Some(completed_context());
         let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
         assert!(result.metrics.is_none());
 
@@ -934,7 +1080,7 @@ mod tests {
                         .send(Ok(ModelEvent::ToolCall {
                             call_id: ToolCallId::new("workflow-write-1").unwrap(),
                             name: "write".to_owned(),
-                            arguments: json!({"path": "src/lib.rs", "content": "new"}),
+                            arguments: json!({"path": "src/lib.rs", "content": "new", "expected_hash": "current"}),
                         }))
                         .await
                         .unwrap(),
@@ -1116,14 +1262,10 @@ mod tests {
         let session = SessionId::new("session-continuity").unwrap();
         let (sender, _receiver) = mpsc::channel(8);
 
-        let first = agent
-            .run(
-                AgentRequest::new(session.clone(), TurnId::new("turn-1").unwrap(), "first"),
-                sender,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        let mut first_request =
+            AgentRequest::new(session.clone(), TurnId::new("turn-1").unwrap(), "first");
+        first_request.context_seed = Some(completed_context());
+        let first = agent.run(first_request, sender, CancellationToken::new()).await.unwrap();
         let (sender, _receiver) = mpsc::channel(8);
         let mut second_request =
             AgentRequest::new(session.clone(), TurnId::new("turn-2").unwrap(), "second");
@@ -1185,7 +1327,8 @@ mod tests {
     async fn noninteractive_mutation_is_denied_before_tool_execution() {
         let executions = Arc::new(AtomicUsize::new(0));
         let agent = Agent::new(
-            crate::FakeBackend::new("done").with_tool_call("write", json!({"path": "test.txt"})),
+            crate::FakeBackend::new("done")
+                .with_tool_call("write", json!({"path": "test.txt", "expected_hash": "current"})),
             PermissionTools { executions: executions.clone() },
         );
         let (sender, mut receiver) = mpsc::channel(16);
@@ -1199,8 +1342,8 @@ mod tests {
                 sender,
                 CancellationToken::new(),
             )
-            .await
-            .unwrap();
+            .await;
+        assert!(matches!(result, Err(AgentError::CompletionBlocked)));
         assert_eq!(executions.load(Ordering::Relaxed), 0);
         let mut denied = false;
         while let Ok(event) = receiver.try_recv() {
@@ -1209,14 +1352,14 @@ mod tests {
             }
         }
         assert!(denied);
-        assert_eq!(result.text.as_str(), "done");
     }
 
     #[tokio::test]
     async fn agent_permission_event_resolves_allow_once_before_execution() {
         let executions = Arc::new(AtomicUsize::new(0));
         let agent = Arc::new(Agent::new(
-            crate::FakeBackend::new("done").with_tool_call("write", json!({"path": "test.txt"})),
+            crate::FakeBackend::new("done")
+                .with_tool_call("write", json!({"path": "test.txt", "expected_hash": "current"})),
             PermissionTools { executions: executions.clone() },
         ));
         let broker = SessionPermissionBroker::new();
@@ -1240,15 +1383,19 @@ mod tests {
                     stale: false,
                 }],
                 modified: Vec::new(),
+                user_modified: Vec::new(),
                 excerpts: Vec::new(),
                 tool_summaries: Vec::new(),
                 git: None,
                 continuation: None,
                 model: None,
                 workspace_changed: false,
+                rendered_fingerprints: Vec::new(),
                 workflow: aether_core::WorkflowState::new(),
             });
             request.context_seed.as_mut().unwrap().workflow.record_relevant_file("test.txt");
+            request.context_seed.as_mut().unwrap().workflow.record_inspection();
+            assert!(request.context_seed.as_mut().unwrap().workflow.complete_if_ready(&[]));
             task_agent
                 .run_with_broker(request, sender, CancellationToken::new(), &task_broker)
                 .await
@@ -1259,7 +1406,7 @@ mod tests {
                 break;
             }
         }
-        assert!(task.await.unwrap().is_ok());
+        assert!(matches!(task.await.unwrap(), Err(AgentError::CompletionBlocked)));
         assert_eq!(executions.load(Ordering::Relaxed), 1);
     }
 
@@ -1461,7 +1608,7 @@ mod tests {
         );
         request.continuation =
             Some(OpaqueContinuation(json!({"previous_response_id": "stale-response"})));
-        request.context_seed = Some(ContextSnapshot::new("/workspace", Some("model-a".to_owned())));
+        request.context_seed = Some(completed_context());
         request.metrics = true;
         let (sender, _receiver) = mpsc::channel(8);
         let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
@@ -1528,19 +1675,14 @@ mod tests {
                 .with_tool_call("read", json!({"files": [{"path": "src/lib.rs"}]})),
             tools(),
         );
+        let mut request = AgentRequest::new(
+            SessionId::new("session-compact").unwrap(),
+            TurnId::new("turn-compact").unwrap(),
+            "inspect",
+        );
+        request.context_seed = Some(completed_context());
         let (sender, _receiver) = mpsc::channel(8);
-        let result = agent
-            .run(
-                AgentRequest::new(
-                    SessionId::new("session-compact").unwrap(),
-                    TurnId::new("turn-compact").unwrap(),
-                    "inspect",
-                ),
-                sender,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        let result = agent.run(request, sender, CancellationToken::new()).await.unwrap();
         assert_eq!(result.context.tool_summaries.len(), 1);
         assert_eq!(result.context.tool_summaries[0].tool, "read");
         assert!(result.context.tool_summaries[0].summary.as_str().contains("read"));

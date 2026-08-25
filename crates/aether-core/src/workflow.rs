@@ -368,6 +368,7 @@ impl WorkflowState {
                 WorkflowVerification::Pending | WorkflowVerification::Failed
             );
         let ready = !self.relevant_files.is_empty()
+            && (!modified.is_empty() || self.progress.inspections > 0)
             && self.unresolved_failures.is_empty()
             && self
                 .verification_steps
@@ -475,6 +476,15 @@ mod tests {
         state.record_failure(WorkflowFailure::new("read:src/lib.rs", "read", "io", "retry"));
         assert_ne!(state.phase, WorkflowPhase::Complete);
         assert!(!state.complete_if_ready(&[]));
+    }
+
+    #[test]
+    fn discovery_without_inspection_cannot_complete() {
+        let mut state = WorkflowState::new();
+        state.record_relevant_file("src/lib.rs");
+        assert!(!state.complete_if_ready(&[]));
+        state.record_inspection();
+        assert!(state.complete_if_ready(&[]));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -644,6 +645,8 @@ struct Workspace {
     root: PathBuf,
 }
 
+static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
+
 impl Workspace {
     fn copy_fixture(fixture: &str) -> Result<Self, String> {
         let source =
@@ -652,7 +655,9 @@ impl Workspace {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("aether-eval-{}-{nonce}", std::process::id()));
+        let sequence = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("aether-eval-{}-{nonce}-{sequence}", std::process::id()));
         copy_tree(&source, &root).map_err(|error| format!("copy fixture {fixture}: {error}"))?;
         Ok(Self { root })
     }
@@ -987,8 +992,28 @@ const RELATIONSHIP_HEAVY_EXPLORATION_SCRIPT: &[Action] = &[
 ];
 
 #[cfg(test)]
+const PREMATURE_COMPLETION: Task = Task {
+    id: "premature-completion-blocked",
+    prompt: "repair the target and prove the change before finishing",
+    fixture: "targeted-bug",
+    expected_outcomes: TARGETED_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 3,
+    max_tool_calls: 1,
+    max_verification_attempts: 1,
+};
+#[cfg(test)]
+const PREMATURE_COMPLETION_SCRIPT: &[Action] = &[Action::Finish];
+
+#[cfg(test)]
 mod tests {
-    use super::{compact_summary, run_suite};
+    use aether_agent::{AutonomousCodingPolicy, LoopGuardrails, RepositoryReadTarget};
+    use aether_core::{
+        InspectedFile, LineRange, ObservedFileState, ToolCallId, ToolResult, WorkflowState,
+    };
+
+    use super::*;
 
     #[test]
     fn deterministic_suite_meets_correctness_and_efficiency_thresholds() {
@@ -1022,5 +1047,79 @@ mod tests {
         assert!(planned.after.planner_hits >= 2);
         assert!(planned.after.planner_hit_rate() > 0.5);
         assert!(suite.aggregate.planner_hit_rate > 0.0);
+    }
+
+    #[test]
+    fn targeted_adversarial_evals_cover_completion_recovery_scope_and_ownership() {
+        let mut premature = ScriptedBackend::new("premature", PREMATURE_COMPLETION_SCRIPT);
+        let premature_result = run_task_mode(&PREMATURE_COMPLETION, &mut premature, true)
+            .expect("premature completion eval runs");
+        assert!(!premature_result.success);
+        assert_eq!(premature_result.final_test_status, "not_run");
+
+        let mut recovery = ScriptedBackend::new("recovery", FAILED_FIRST_SCRIPT);
+        let recovery_result =
+            run_task_mode(&FAILED_FIRST, &mut recovery, true).expect("recovery eval runs");
+        assert!(recovery_result.success);
+        assert_eq!(recovery_result.verification_attempts, 2);
+
+        let mut cross_file = ScriptedBackend::new("cross-file", MULTI_FILE_SCRIPT);
+        let cross_file_result =
+            run_task_mode(&MULTI_FILE, &mut cross_file, true).expect("cross-file eval runs");
+        assert!(cross_file_result.success);
+
+        let mut discovery =
+            ScriptedBackend::new("multi-tool-discovery", RELATIONSHIP_HEAVY_EXPLORATION_SCRIPT);
+        let discovery_result = run_task_mode(&RELATIONSHIP_HEAVY_EXPLORATION, &mut discovery, true)
+            .expect("multi-tool discovery eval runs");
+        assert!(discovery_result.success);
+        assert!(discovery_result.after.planner_hits >= 2);
+
+        let mut stale = ContextSnapshot::new("/workspace", None);
+        stale.workspace_changed = true;
+        let stale_plan = RepositoryActionPlanner::default().plan_read_targets(
+            &stale,
+            &[RepositoryReadTarget {
+                path: "src/lib.rs".to_owned(),
+                ranges: vec![LineRange { start: 1, end: 4 }],
+            }],
+        );
+        assert!(stale_plan.aborted);
+
+        let mut dirty = ContextSnapshot::new("/workspace", None);
+        dirty.workflow.record_relevant_file("src/lib.rs");
+        dirty.inspected.push(InspectedFile {
+            path: "src/lib.rs".to_owned(),
+            content_hash: Some("current".to_owned()),
+            ranges: vec![LineRange { start: 1, end: 4 }],
+            last_state: ObservedFileState::Present,
+            stale: false,
+        });
+        dirty.user_modified.push("src/lib.rs".to_owned());
+        let dirty_result = AutonomousCodingPolicy::new().preflight(
+            &dirty,
+            ToolCallId::new("dirty").unwrap(),
+            "write",
+            &serde_json::json!({"path": "src/lib.rs"}),
+        );
+        assert_eq!(dirty_result.unwrap().error.unwrap().code.as_str(), "insufficient_evidence");
+
+        let mut guard = LoopGuardrails::new();
+        let workflow = WorkflowState::new();
+        let input = serde_json::json!({"files": [{"path": "src/lib.rs"}]});
+        for index in 0..3 {
+            let failure = ToolResult::failure(
+                ToolCallId::new(format!("eval-failure-{index}")).unwrap(),
+                "io",
+                "same failure",
+                true,
+                1024,
+            );
+            guard.observe("read", &input, &failure, &workflow, &workflow);
+        }
+        let repeated = guard
+            .preflight(ToolCallId::new("eval-circuit").unwrap(), "read", &input, 0)
+            .expect("repeated no-progress action is bounded");
+        assert_eq!(repeated.error.unwrap().code.as_str(), "repeated_failure");
     }
 }

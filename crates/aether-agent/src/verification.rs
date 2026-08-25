@@ -145,7 +145,9 @@ fn supports_path(kind: ManifestKind, manifest: &Path, path: &Path) -> bool {
     }
     let extension = path.extension().and_then(|extension| extension.to_str());
     match kind {
-        ManifestKind::Cargo => extension == Some("rs") || path.ends_with("Cargo.lock"),
+        ManifestKind::Cargo => {
+            extension == Some("rs") || path.ends_with("Cargo.lock") || path.ends_with("Cargo.toml")
+        }
         ManifestKind::Node => {
             matches!(extension, Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx"))
                 || matches!(
@@ -259,6 +261,15 @@ mod tests {
             plan_verification(&repo, &["crates/api/src/a.rs".into(), "crates/api/src/b.rs".into()]);
         assert_eq!(plan.commands.len(), 2);
         assert_eq!(plan.commands[0].display(), "cargo test -p api");
+    }
+
+    #[test]
+    fn cargo_manifest_changes_keep_package_scope() {
+        let repo = repo(ManifestKind::Cargo, "crates/api/Cargo.toml", Some("api"));
+        let plan = plan_verification(&repo, &["crates/api/Cargo.toml".into()]);
+        assert!(!plan.unsupported);
+        assert_eq!(plan.commands[0].display(), "cargo test -p api");
+        assert_eq!(plan.commands[1].display(), "cargo check -p api");
     }
 
     #[test]

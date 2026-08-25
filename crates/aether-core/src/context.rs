@@ -23,6 +23,14 @@ pub const MAX_FILE_EXCERPTS: usize = 16;
 pub const MAX_EXCERPT_BYTES: usize = 4 * 1024;
 /// Maximum inspected files tracked for stale detection.
 pub const MAX_INSPECTED_FILES: usize = 64;
+/// Maximum user-owned dirty paths retained for mutation ownership checks.
+pub const MAX_USER_MODIFIED_FILES: usize = 32;
+/// Maximum context-item fingerprints retained for delta rendering.
+pub const MAX_CONTEXT_FINGERPRINTS: usize = 64;
+/// Maximum encoded bytes retained for one context-item fingerprint.
+pub const MAX_CONTEXT_FINGERPRINT_BYTES: usize = 32;
+/// Maximum bytes retained for one workspace-relative context path.
+pub const MAX_CONTEXT_PATH_BYTES: usize = 256;
 /// Maximum bytes of one compact tool summary.
 pub const MAX_COMPACT_SUMMARY_BYTES: usize = 2 * 1024;
 /// Maximum bytes of a stored git snapshot.
@@ -118,6 +126,9 @@ pub struct ContextSnapshot {
     pub inspected: Vec<InspectedFile>,
     /// Files modified by AETHER write/patch in this session.
     pub modified: Vec<String>,
+    /// Files already dirty outside this agent session and therefore not implicitly owned by AETHER.
+    #[serde(default)]
+    pub user_modified: Vec<String>,
     /// Targeted excerpts retained for reconstruction.
     pub excerpts: Vec<FileExcerpt>,
     /// Compact recent tool results.
@@ -130,6 +141,9 @@ pub struct ContextSnapshot {
     pub model: Option<String>,
     /// Whether resume detected a workspace or file-state change.
     pub workspace_changed: bool,
+    /// Fingerprints of the last bounded context items sent to the model.
+    #[serde(default)]
+    pub rendered_fingerprints: Vec<String>,
     /// Deterministic repository-aware coding workflow state.
     #[serde(default)]
     pub workflow: WorkflowState,
@@ -143,12 +157,14 @@ impl ContextSnapshot {
             current_task: BoundedText::new("", MAX_TASK_BYTES),
             inspected: Vec::new(),
             modified: Vec::new(),
+            user_modified: Vec::new(),
             excerpts: Vec::new(),
             tool_summaries: Vec::new(),
             git: None,
             continuation: None,
             model,
             workspace_changed: false,
+            rendered_fingerprints: Vec::new(),
             workflow: WorkflowState::new(),
         }
     }
@@ -167,6 +183,13 @@ impl ContextSnapshot {
             current_task: BoundedText::new("", MAX_TASK_BYTES),
             inspected: self.inspected.clone(),
             modified: self.modified.clone(),
+            user_modified: self
+                .user_modified
+                .iter()
+                .take(MAX_USER_MODIFIED_FILES)
+                .map(|path| BoundedText::new(path, MAX_CONTEXT_PATH_BYTES).into_string())
+                .filter(|path| !path.is_empty())
+                .collect(),
             excerpts: Vec::new(),
             tool_summaries: self
                 .tool_summaries
@@ -182,6 +205,14 @@ impl ContextSnapshot {
             continuation: self.continuation.as_ref().and_then(persistable_continuation),
             model: self.model.clone(),
             workspace_changed: self.workspace_changed,
+            rendered_fingerprints: self
+                .rendered_fingerprints
+                .iter()
+                .take(MAX_CONTEXT_FINGERPRINTS)
+                .map(|fingerprint| {
+                    BoundedText::new(fingerprint, MAX_CONTEXT_FINGERPRINT_BYTES).into_string()
+                })
+                .collect(),
             workflow,
         }
     }
@@ -191,6 +222,7 @@ impl ContextSnapshot {
         self.current_task.as_str().is_empty()
             && self.inspected.is_empty()
             && self.modified.is_empty()
+            && self.user_modified.is_empty()
             && self.excerpts.is_empty()
             && self.tool_summaries.is_empty()
             && self.git.is_none()

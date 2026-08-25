@@ -7,15 +7,17 @@
 use std::path::PathBuf;
 
 use aether_core::{
-    CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind, ObservedFileState,
-    ToolCallId, ToolResult, WorkflowPhase, WorkflowVerification, analyze_command,
+    CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind, LineRange,
+    ObservedFileState, ToolCallId, ToolResult, WorkflowPhase, WorkflowVerification, WorkspacePath,
+    analyze_command,
 };
 use serde_json::Value;
 
 use crate::context::ContextEngine;
 use crate::guardrails::{LoopGuardrails, WorkflowObservation};
 use crate::planner::{
-    RepositoryActionPlan, RepositoryActionPlanner, RepositoryPlanRequest, RepositoryRequestKind,
+    RepositoryActionPlan, RepositoryActionPlanner, RepositoryPlanRequest, RepositoryReadTarget,
+    RepositoryRequestKind,
 };
 use crate::{RepoMap, RepoSelection, RepoSelectionKind};
 
@@ -49,20 +51,66 @@ impl AutonomousCodingPolicy {
         Self::default()
     }
 
-    /// Return a pure read-only plan for one model search request, when it is eligible for local
-    /// repository observation.  Ambiguous plans are returned to the caller so it can record the
-    /// abort and fall back to the normal permissioned scheduler path.
-    pub(crate) fn repository_plan_for_call(
+    /// Build one bounded physical plan for a compatible batch of read-only model calls.
+    pub(crate) fn repository_plan_for_calls(
         &self,
         snapshot: &ContextSnapshot,
-        name: &str,
-        input: &Value,
+        calls: &[(ToolCallId, String, Value)],
     ) -> Option<RepositoryActionPlan> {
-        if name != "search" {
+        if calls.is_empty() || calls.len() > 8 {
             return None;
         }
-        if self.guardrails.has_cached_observation(name, input, snapshot.workflow.workspace_revision)
-        {
+        let mut plans = Vec::with_capacity(calls.len());
+        let mut read_targets = Vec::new();
+        let mut saw_read = false;
+        for (_, name, input) in calls {
+            if self.guardrails.has_cached_observation(
+                name,
+                input,
+                snapshot.workflow.workspace_revision,
+            ) {
+                return None;
+            }
+            match name.as_str() {
+                "search" => {
+                    plans.push(self.repository_search_plan(snapshot, input)?);
+                }
+                "read" => {
+                    saw_read = true;
+                    if input.get("max_bytes").is_some() {
+                        return None;
+                    }
+                    let files = input.get("files")?.as_array()?;
+                    if files.is_empty() || files.len() > 64 {
+                        return None;
+                    }
+                    for file in files.iter().take(64) {
+                        let path = file.get("path")?.as_str()?;
+                        let ranges = match (file.get("start_line"), file.get("end_line")) {
+                            (Some(start), Some(end)) => vec![LineRange {
+                                start: usize::try_from(start.as_u64()?).ok()?,
+                                end: usize::try_from(end.as_u64()?).ok()?,
+                            }],
+                            _ => Vec::new(),
+                        };
+                        read_targets.push(RepositoryReadTarget { path: path.to_owned(), ranges });
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if saw_read {
+            plans.push(self.planner.plan_read_targets(snapshot, &read_targets));
+        }
+        self.planner.coalesce(&plans)
+    }
+
+    fn repository_search_plan(
+        &self,
+        snapshot: &ContextSnapshot,
+        input: &Value,
+    ) -> Option<RepositoryActionPlan> {
+        if input.as_object()?.keys().any(|key| key != "patterns") {
             return None;
         }
         let patterns = input.get("patterns")?.as_array()?;
@@ -203,6 +251,20 @@ impl AutonomousCodingPolicy {
         let complete = engine.finish_turn();
         self.update_next_action(engine);
         complete
+    }
+
+    /// Explain the deterministic evidence that still blocks a model's silent finish.
+    pub(crate) fn completion_feedback(&self, snapshot: &ContextSnapshot, attempts: u8) -> String {
+        let action = self.rank_next_actions(snapshot).into_iter().next();
+        let next = action
+            .as_ref()
+            .map_or("continue with bounded evidence", |action| action.reason.as_str());
+        format!(
+            "completion_blocked: attempt={attempts}; phase={}; failures={}; verification={}; next={next}",
+            snapshot.workflow.phase.as_str(),
+            snapshot.workflow.unresolved_failures.len(),
+            snapshot.workflow.verification.as_str(),
+        )
     }
 
     /// Return deterministic highest-value actions, with stable score and path tie-breaking.
@@ -361,7 +423,7 @@ impl AutonomousCodingPolicy {
         Some(ToolResult::failure(
             call_id,
             "insufficient_evidence",
-            "inspect the exact target and establish a relevant symbol or relationship before modifying it",
+            "inspect the exact target, preserve user-owned changes, and provide the current expected_hash before replacing it",
             true,
             aether_core::DEFAULT_MAX_OUTPUT_BYTES,
         ))
@@ -638,6 +700,9 @@ fn command_mutation_has_evidence(snapshot: &ContextSnapshot, effects: &CommandEf
     let paths = paths.collect::<Vec<_>>();
     !paths.is_empty()
         && paths.iter().all(|path| {
+            if snapshot.user_modified.iter().any(|user_path| user_path == *path) {
+                return false;
+            }
             snapshot.workflow.relevant_files.iter().any(|relevant| relevant == *path)
                 && snapshot.inspected.iter().any(|file| {
                     file.path == **path
@@ -649,34 +714,53 @@ fn command_mutation_has_evidence(snapshot: &ContextSnapshot, effects: &CommandEf
 }
 
 fn mutation_has_evidence(snapshot: &ContextSnapshot, name: &str, input: &Value) -> bool {
-    let paths = if name == "write" {
-        input.get("path").and_then(Value::as_str).into_iter().map(str::to_owned).collect::<Vec<_>>()
-    } else {
-        input
-            .get("files")
-            .and_then(Value::as_array)
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    !paths.is_empty()
-        && paths.iter().all(|path| {
-            let create_only = name == "write"
-                && input.get("create_only").and_then(Value::as_bool) == Some(true)
-                && new_target_has_discovered_parent(snapshot, path);
-            create_only
-                || (snapshot.workflow.relevant_files.iter().any(|relevant| relevant == path)
-                    && snapshot.inspected.iter().any(|file| {
-                        file.path == *path
-                            && file.last_state == ObservedFileState::Present
-                            && !file.stale
-                            && file.content_hash.is_some()
-                    }))
+    if name == "write" {
+        let Some(path) = input.get("path").and_then(Value::as_str) else { return false };
+        let create_only = input.get("create_only").and_then(Value::as_bool) == Some(true);
+        if create_only
+            && WorkspacePath::new(path).is_ok()
+            && new_target_has_discovered_parent(snapshot, path)
+        {
+            return !snapshot.user_modified.iter().any(|existing| existing == path);
+        }
+        return current_target_has_evidence(snapshot, path)
+            && expected_hash_matches(
+                snapshot,
+                path,
+                input.get("expected_hash").and_then(Value::as_str),
+            );
+    }
+
+    let Some(files) = input.get("files").and_then(Value::as_array) else { return false };
+    !files.is_empty()
+        && files.iter().all(|file| {
+            let Some(path) = file.get("path").and_then(Value::as_str) else { return false };
+            current_target_has_evidence(snapshot, path)
+                && expected_hash_matches(
+                    snapshot,
+                    path,
+                    file.get("expected_hash").and_then(Value::as_str),
+                )
         })
+}
+
+fn current_target_has_evidence(snapshot: &ContextSnapshot, path: &str) -> bool {
+    WorkspacePath::new(path).is_ok()
+        && snapshot.workflow.relevant_files.iter().any(|relevant| relevant == path)
+        && snapshot.inspected.iter().any(|file| {
+            file.path == path
+                && file.last_state == ObservedFileState::Present
+                && !file.stale
+                && file.content_hash.is_some()
+        })
+}
+
+fn expected_hash_matches(snapshot: &ContextSnapshot, path: &str, expected: Option<&str>) -> bool {
+    let Some(file) = snapshot.inspected.iter().find(|file| file.path == path) else {
+        return false;
+    };
+    let Some(expected) = expected else { return false };
+    file.content_hash.as_deref() == Some(expected)
 }
 
 fn new_target_has_discovered_parent(snapshot: &ContextSnapshot, path: &str) -> bool {
@@ -762,6 +846,79 @@ mod tests {
                 &json!({"program": "cargo", "args": ["fmt"]}),
             )
             .unwrap();
+        assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");
+    }
+
+    #[test]
+    fn compatible_read_calls_share_one_bounded_repository_plan() {
+        let policy = AutonomousCodingPolicy::new();
+        let snapshot = inspected_snapshot();
+        let calls = vec![
+            (
+                ToolCallId::new("read-one").unwrap(),
+                "read".to_owned(),
+                json!({"files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 4}]}),
+            ),
+            (
+                ToolCallId::new("read-two").unwrap(),
+                "read".to_owned(),
+                json!({"files": [{"path": "src/main.rs", "start_line": 1, "end_line": 4}]}),
+            ),
+        ];
+        let plan = policy
+            .repository_plan_for_calls(&snapshot, &calls)
+            .expect("read-only calls are compatible");
+        assert!(plan.is_usable());
+        assert_eq!(plan.actions.len(), 2);
+        assert!(plan.observation.collapsed);
+    }
+
+    #[test]
+    fn planner_falls_back_for_search_semantics_it_does_not_model() {
+        let policy = AutonomousCodingPolicy::new();
+        let snapshot = inspected_snapshot();
+        let calls = vec![(
+            ToolCallId::new("regex-search").unwrap(),
+            "search".to_owned(),
+            json!({"patterns": ["parse"], "regex": true}),
+        )];
+        assert!(policy.repository_plan_for_calls(&snapshot, &calls).is_none());
+    }
+
+    #[test]
+    fn dirty_or_stale_targets_require_explicit_current_evidence() {
+        let policy = AutonomousCodingPolicy::new();
+        let mut dirty = inspected_snapshot();
+        dirty.user_modified.push("src/lib.rs".to_owned());
+        let blocked = policy
+            .preflight(
+                &dirty,
+                ToolCallId::new("dirty-write").unwrap(),
+                "write",
+                &json!({"path": "src/lib.rs"}),
+            )
+            .expect("dirty target without a hash must be blocked");
+        assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");
+        assert!(
+            policy
+                .preflight(
+                    &dirty,
+                    ToolCallId::new("explicit-write").unwrap(),
+                    "write",
+                    &json!({"path": "src/lib.rs", "expected_hash": "hash"}),
+                )
+                .is_none()
+        );
+
+        dirty.inspected[0].stale = true;
+        let blocked = policy
+            .preflight(
+                &dirty,
+                ToolCallId::new("stale-write").unwrap(),
+                "write",
+                &json!({"path": "src/lib.rs", "expected_hash": "hash"}),
+            )
+            .expect("stale target must be blocked");
         assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");
     }
 

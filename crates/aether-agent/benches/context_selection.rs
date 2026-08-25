@@ -19,6 +19,9 @@ fn benchmark_size(c: &mut Criterion, count: usize) {
             recency: index,
             modified: index % 97 == 0,
             stale: index % 211 == 0,
+            phase: aether_core::WorkflowPhase::Inspect,
+            delta: true,
+            fingerprint: [0; 16],
         })
         .collect();
     c.bench_function(&format!("context_selection_{count}_candidates"), |bencher| {

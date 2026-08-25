@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-25 (1) - Evidence-gated adaptive coding loop
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added evidence-gated completion feedback, compatible multi-read planning, phase-aware delta
+  context, dirty-worktree ownership tracking, scoped verification recovery, and bounded adversarial
+  eval coverage.
+
+### Changed
+
+- The loop now treats policy and workflow evidence as the completion control-plane, coalesces safe
+  read-only discovery, and requires current expected hashes for replacing inspected files.
+
+### Security
+
+- Stale, user-owned, repeated-failure, and no-progress actions now fail closed or trip bounded
+  circuit breakers without weakening workspace containment or permission gates.
+
 ## Unreleased - 2026-08-24 (3) - Smaller production startup artifact
 
 > Status: unreleased work. No artifact has been published.

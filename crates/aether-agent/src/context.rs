@@ -2,11 +2,12 @@ use std::{fmt::Write as FmtWrite, path::Path};
 
 use aether_core::{
     BoundedText, CONTEXT_GUIDANCE, CommandEffects, CompactToolSummary, ContextSnapshot,
-    FileExcerpt, GitSnapshot, InspectedFile, LineRange, MAX_CONTEXT_ITEMS,
-    MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES, MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES,
-    MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS, MAX_TASK_BYTES, MAX_WORKFLOW_FIELD_BYTES,
-    ObservedFileState, OpaqueContinuation, ToolResult, WorkflowFailure, WorkflowPhase,
-    WorkflowVerification, WorkspacePath, analyze_command, compact_tool_result, merge_line_ranges,
+    FileExcerpt, GitSnapshot, InspectedFile, LineRange, MAX_CONTEXT_FINGERPRINT_BYTES,
+    MAX_CONTEXT_FINGERPRINTS, MAX_CONTEXT_ITEMS, MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES,
+    MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES, MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS,
+    MAX_TASK_BYTES, MAX_USER_MODIFIED_FILES, MAX_WORKFLOW_FIELD_BYTES, ObservedFileState,
+    OpaqueContinuation, ToolResult, WorkflowFailure, WorkflowPhase, WorkflowVerification,
+    WorkspacePath, analyze_command, compact_tool_result, merge_line_ranges,
 };
 use serde_json::Value;
 
@@ -58,6 +59,14 @@ impl ContextEngine {
         snapshot.excerpts.truncate(MAX_FILE_EXCERPTS);
         snapshot.tool_summaries.truncate(MAX_STORED_TOOL_SUMMARIES);
         snapshot.modified.truncate(MAX_CONTEXT_ITEMS);
+        snapshot.user_modified.truncate(MAX_USER_MODIFIED_FILES);
+        snapshot.rendered_fingerprints.truncate(MAX_CONTEXT_FINGERPRINTS);
+        snapshot
+            .user_modified
+            .retain(|path| !path.is_empty() && path.len() <= aether_core::MAX_CONTEXT_PATH_BYTES);
+        snapshot.rendered_fingerprints.retain(|fingerprint| {
+            !fingerprint.is_empty() && fingerprint.len() <= MAX_CONTEXT_FINGERPRINT_BYTES
+        });
         snapshot.workflow.enforce_bounds();
         let repo_map =
             (!snapshot.workspace_root.is_empty()).then(|| RepoMap::new(&snapshot.workspace_root));
@@ -97,6 +106,7 @@ impl ContextEngine {
 
     /// Record a compact git snapshot.
     pub fn set_git(&mut self, git: GitSnapshot) {
+        self.record_user_modified_from_status(git.status.as_str());
         self.snapshot.git = Some(git);
     }
 
@@ -117,7 +127,26 @@ impl ContextEngine {
 
     /// Apply deterministic completion criteria at normal turn termination.
     pub fn finish_turn(&mut self) -> bool {
+        if self.snapshot.workspace_changed || self.snapshot.inspected.iter().any(|file| file.stale)
+        {
+            self.reset_workflow_for_workspace_change();
+            return false;
+        }
         self.snapshot.workflow.complete_if_ready(&self.snapshot.modified)
+    }
+
+    /// Record a bounded dirty-worktree path as user-owned unless this session owns it already.
+    pub fn record_user_modified(&mut self, path: &str) {
+        if !path_is_workspace_relative(path)
+            || self.snapshot.modified.iter().any(|owned| owned == path)
+            || self.snapshot.user_modified.iter().any(|existing| existing == path)
+        {
+            return;
+        }
+        self.snapshot.user_modified.push(path.to_owned());
+        if self.snapshot.user_modified.len() > MAX_USER_MODIFIED_FILES {
+            self.snapshot.user_modified.remove(0);
+        }
     }
 
     /// Observe a completed tool call and fold it into bounded working state.
@@ -143,7 +172,7 @@ impl ContextEngine {
             "git" => self.observe_git(result),
             _ => {}
         }
-        if repository_observation {
+        if repository_observation && name != "read" {
             self.observe_read(result);
             if read_contains_files(result) {
                 self.snapshot.workflow.record_inspection();
@@ -204,6 +233,12 @@ impl ContextEngine {
         }
         if name == "read" && result.ok && read_contains_files(result) {
             self.snapshot.workflow.record_inspection();
+        }
+        if result.ok
+            && matches!(name, "read" | "find" | "list" | "search" | "git" | "write" | "patch")
+            && !self.snapshot.inspected.iter().any(|file| file.stale)
+        {
+            self.snapshot.workspace_changed = false;
         }
         self.enforce_bounds();
     }
@@ -269,7 +304,16 @@ impl ContextEngine {
     }
 
     /// Render a token-conscious packet for model reconstruction. Full files are never included.
-    pub fn render(&self, include_guidance: bool) -> String {
+    pub fn render(&mut self, include_guidance: bool) -> String {
+        self.render_internal(include_guidance, false)
+    }
+
+    /// Render only context items whose bounded fingerprints changed since the last packet.
+    pub fn render_delta(&mut self, include_guidance: bool) -> String {
+        self.render_internal(include_guidance, true)
+    }
+
+    fn render_internal(&mut self, include_guidance: bool, delta_only: bool) -> String {
         let mut out = String::from("# AETHER workspace context\n");
         if !self.snapshot.workspace_root.is_empty() {
             out.push_str("workspace: ");
@@ -349,7 +393,19 @@ impl ContextEngine {
                 + 2,
         );
         let mut recency = 0;
+        let phase = self.snapshot.workflow.phase;
+        let task = self.snapshot.current_task.as_str();
+        let previous_fingerprints = &self.snapshot.rendered_fingerprints;
         for file in &self.snapshot.inspected {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::InspectedFile,
+                Some(&file.path),
+                file.content_hash.as_deref().unwrap_or(""),
+                &file.ranges,
+                self.snapshot.modified.iter().any(|path| path == &file.path),
+                file.stale,
+            );
             candidates.push(ContextCandidate {
                 kind: ContextKind::InspectedFile,
                 path: Some(&file.path),
@@ -359,10 +415,23 @@ impl ContextEngine {
                 recency,
                 modified: self.snapshot.modified.iter().any(|path| path == &file.path),
                 stale: file.stale,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
             });
             recency += 1;
         }
         for path in &self.snapshot.modified {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::ModifiedPath,
+                Some(path),
+                "",
+                &[],
+                true,
+                false,
+            );
             candidates.push(ContextCandidate {
                 kind: ContextKind::ModifiedPath,
                 path: Some(path),
@@ -372,10 +441,49 @@ impl ContextEngine {
                 recency,
                 modified: true,
                 stale: false,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
+            });
+            recency += 1;
+        }
+        for path in &self.snapshot.user_modified {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::UserModifiedPath,
+                Some(path),
+                "",
+                &[],
+                false,
+                false,
+            );
+            candidates.push(ContextCandidate {
+                kind: ContextKind::UserModifiedPath,
+                path: Some(path),
+                content: "",
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: false,
+                stale: false,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
             });
             recency += 1;
         }
         for summary in &self.snapshot.tool_summaries {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::ToolSummary,
+                None,
+                summary.summary.as_str(),
+                &[],
+                false,
+                false,
+            );
             candidates.push(ContextCandidate {
                 kind: ContextKind::ToolSummary,
                 path: None,
@@ -385,6 +493,10 @@ impl ContextEngine {
                 recency,
                 modified: false,
                 stale: false,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
             });
             recency += 1;
         }
@@ -395,6 +507,17 @@ impl ContextEngine {
                 .iter()
                 .find(|file| file.path == excerpt.path)
                 .is_some_and(|file| file.stale);
+            let modified = self.snapshot.modified.iter().any(|path| path == &excerpt.path);
+            let ranges = [LineRange { start: excerpt.start_line, end: excerpt.end_line }];
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::Excerpt,
+                Some(&excerpt.path),
+                excerpt.text.as_str(),
+                &ranges,
+                modified,
+                stale,
+            );
             candidates.push(ContextCandidate {
                 kind: ContextKind::Excerpt,
                 path: Some(&excerpt.path),
@@ -402,12 +525,25 @@ impl ContextEngine {
                 start_line: excerpt.start_line,
                 end_line: excerpt.end_line,
                 recency,
-                modified: self.snapshot.modified.iter().any(|path| path == &excerpt.path),
+                modified,
                 stale,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
             });
             recency += 1;
         }
         if let Some(git) = &self.snapshot.git {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::GitMetadata,
+                git.branch.as_deref(),
+                git.status.as_str(),
+                &[],
+                false,
+                self.snapshot.workspace_changed,
+            );
             candidates.push(ContextCandidate {
                 kind: ContextKind::GitMetadata,
                 path: git.branch.as_deref(),
@@ -417,10 +553,23 @@ impl ContextEngine {
                 recency,
                 modified: false,
                 stale: self.snapshot.workspace_changed,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
             });
             recency += 1;
         }
         if !repo_metadata.is_empty() {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::RepositoryMetadata,
+                None,
+                &repo_metadata,
+                &[],
+                false,
+                self.snapshot.workspace_changed,
+            );
             candidates.push(ContextCandidate {
                 kind: ContextKind::RepositoryMetadata,
                 path: None,
@@ -430,6 +579,10 @@ impl ContextEngine {
                 recency,
                 modified: false,
                 stale: self.snapshot.workspace_changed,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
             });
         }
         let fixed_bytes = out.len() + CONTEXT_GUIDANCE.len() + 32;
@@ -441,6 +594,21 @@ impl ContextEngine {
             &symbol_hints,
             &relationship_hints,
         );
+        for item in selection.items.iter().take(MAX_CONTEXT_FINGERPRINTS) {
+            if !item.truncated {
+                let fingerprint = fingerprint_hex(candidates[item.index].fingerprint);
+                if !self.snapshot.rendered_fingerprints.iter().any(|seen| seen == &fingerprint) {
+                    self.snapshot.rendered_fingerprints.push(fingerprint);
+                }
+            }
+        }
+        if self.snapshot.rendered_fingerprints.len() > MAX_CONTEXT_FINGERPRINTS {
+            let excess = self.snapshot.rendered_fingerprints.len() - MAX_CONTEXT_FINGERPRINTS;
+            self.snapshot.rendered_fingerprints.drain(..excess);
+        }
+        if delta_only {
+            out.push_str("context_mode: delta\n");
+        }
         if !selection.items.is_empty() {
             out.push_str("selected context (relevance-ranked):\n");
         }
@@ -449,6 +617,7 @@ impl ContextEngine {
             out.push_str("- ");
             out.push_str(match candidate.kind {
                 ContextKind::ModifiedPath => "modified",
+                ContextKind::UserModifiedPath => "user-modified",
                 ContextKind::Excerpt => "excerpt",
                 ContextKind::InspectedFile => "inspected",
                 ContextKind::ToolSummary => "tool",
@@ -570,6 +739,7 @@ impl ContextEngine {
         }
         render_workflow_paths(out, "workflow_relevant", &workflow.relevant_files);
         render_workflow_paths(out, "workflow_modified", &self.snapshot.modified);
+        render_workflow_paths(out, "workflow_user_modified", &self.snapshot.user_modified);
         for step in workflow
             .verification_steps
             .iter()
@@ -832,6 +1002,13 @@ impl ContextEngine {
             status: BoundedText::new(stdout, aether_core::MAX_GIT_SNAPSHOT_BYTES),
             available: result.ok,
         });
+        self.record_user_modified_from_status(stdout);
+    }
+
+    fn record_user_modified_from_status(&mut self, status: &str) {
+        for path in dirty_paths(status).into_iter().take(MAX_USER_MODIFIED_FILES) {
+            self.record_user_modified(&path);
+        }
     }
 
     fn upsert_inspected(
@@ -1186,6 +1363,60 @@ pub fn capture_git_snapshot(workspace_root: &Path) -> GitSnapshot {
     }
 }
 
+fn dirty_paths(status: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in status.lines().skip_while(|line| line.starts_with("## ")) {
+        if line.starts_with("## ") || line.len() < 3 {
+            continue;
+        }
+        let value = line[2..].trim();
+        let path = value.rsplit_once(" -> ").map_or(value, |(_, current)| current).trim();
+        if path_is_workspace_relative(path)
+            && !paths.iter().any(|existing| existing == path)
+            && paths.len() < MAX_USER_MODIFIED_FILES
+        {
+            paths.push(path.to_owned());
+        }
+    }
+    paths
+}
+
+fn candidate_fingerprint(
+    task: &str,
+    kind: ContextKind,
+    path: Option<&str>,
+    content: &str,
+    ranges: &[LineRange],
+    modified: bool,
+    stale: bool,
+) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(task.as_bytes());
+    hasher.update(&[kind as u8, u8::from(modified), u8::from(stale)]);
+    for range in ranges {
+        hasher.update(&range.start.to_le_bytes());
+        hasher.update(&range.end.to_le_bytes());
+    }
+    if let Some(path) = path {
+        hasher.update(path.as_bytes());
+    }
+    hasher.update(content.as_bytes());
+    let hash = hasher.finalize();
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&hash.as_bytes()[..16]);
+    fingerprint
+}
+
+fn fingerprint_hex(fingerprint: [u8; 16]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(fingerprint.len() * 2);
+    for byte in fingerprint {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,5 +1656,75 @@ mod tests {
         engine.set_workspace_changed(true);
         assert_eq!(engine.snapshot().workflow.phase, WorkflowPhase::Discover);
         assert!(engine.snapshot().workflow.relevant_files.is_empty());
+    }
+
+    #[test]
+    fn stale_context_blocks_completion_until_current_observation() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        let input = serde_json::json!({
+            "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
+        });
+        let read = success(serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "content_hash": "current",
+                "lines": [{"number": 1, "text": "fn main() {}"}]
+            }]
+        }));
+        engine.observe_tool("read", &input, &read);
+        assert!(engine.finish_turn());
+
+        engine.set_workspace_changed(true);
+        assert!(!engine.finish_turn());
+        engine.observe_tool("read", &input, &read);
+        assert!(!engine.snapshot().workspace_changed);
+        assert!(engine.finish_turn());
+    }
+
+    #[test]
+    fn delta_render_omits_unchanged_excerpts_but_keeps_new_observations() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        engine.set_task("inspect main");
+        let first = success(serde_json::json!({
+            "files": [{
+                "path": "src/main.rs",
+                "content_hash": "before",
+                "lines": [{"number": 1, "text": "fn main() {}"}]
+            }]
+        }));
+        engine.observe_tool("read", &Value::Null, &first);
+        let full = engine.render(false);
+        assert!(full.contains("fn main() {}"));
+
+        let unchanged = engine.render_delta(false);
+        assert!(unchanged.contains("context_mode: delta"));
+        assert!(!unchanged.contains("fn main() {}"));
+
+        let changed = success(serde_json::json!({
+            "files": [{
+                "path": "src/main.rs",
+                "content_hash": "after",
+                "lines": [{"number": 1, "text": "fn main() { println!(\"changed\"); }"}]
+            }]
+        }));
+        engine.observe_tool("read", &Value::Null, &changed);
+        let delta = engine.render_delta(false);
+        assert!(delta.contains("changed"));
+        let unchanged_again = engine.render_delta(false);
+        assert!(!unchanged_again.contains("changed"));
+    }
+
+    #[test]
+    fn git_status_records_dirty_paths_as_user_owned() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        engine.set_git(GitSnapshot {
+            branch: Some("main".to_owned()),
+            status: BoundedText::new(
+                "## main\n M src/lib.rs\n?? src/new.rs\nR  old.rs -> src/renamed.rs",
+                aether_core::MAX_GIT_SNAPSHOT_BYTES,
+            ),
+            available: true,
+        });
+        assert_eq!(engine.snapshot().user_modified, ["src/lib.rs", "src/new.rs", "src/renamed.rs"]);
     }
 }

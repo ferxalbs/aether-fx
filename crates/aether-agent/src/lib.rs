@@ -40,8 +40,8 @@ pub use planner::{
     DEFAULT_MAX_PLANNER_DEPTH, DEFAULT_MAX_PLANNER_EXECUTION_MICROS, DEFAULT_MAX_PLANNER_FILES,
     MAX_PLANNER_OBSERVATION_BYTES, MIN_PLANNER_CONFIDENCE, PlannerExecutionError, PlannerLimits,
     RepositoryAction, RepositoryActionPlan, RepositoryActionPlanner, RepositoryExcerpt,
-    RepositoryFileObservation, RepositoryObservation, RepositoryPlanRequest, RepositoryRequestKind,
-    RepositorySymbolObservation,
+    RepositoryFileObservation, RepositoryObservation, RepositoryPlanRequest, RepositoryReadTarget,
+    RepositoryRequestKind, RepositorySymbolObservation,
 };
 pub use policy::{
     AutonomousCodingPolicy, MAX_POLICY_CANDIDATES, MAX_POLICY_OBSERVED_PATHS,

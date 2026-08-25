@@ -10,6 +10,7 @@ use aether_core::{
 use serde_json::Value;
 
 const MAX_OBSERVATIONS: usize = 64;
+const MAX_FAILURE_OBSERVATIONS: usize = 16;
 const NO_PROGRESS_LIMIT: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,14 @@ enum CallKind {
 struct Observation {
     fingerprint: [u8; 16],
     revision: u32,
+    result: ToolResult,
+}
+
+#[derive(Clone, Debug)]
+struct FailureObservation {
+    fingerprint: [u8; 16],
+    revision: u32,
+    attempts: u8,
     result: ToolResult,
 }
 
@@ -107,6 +116,7 @@ impl WorkflowObservationView for WorkflowObservation {
 #[derive(Debug, Default)]
 pub struct LoopGuardrails {
     observations: VecDeque<Observation>,
+    failures: VecDeque<FailureObservation>,
     last_progress: Option<[u8; 16]>,
     no_progress: u8,
     prevented: AtomicU16,
@@ -128,6 +138,31 @@ impl LoopGuardrails {
     ) -> Option<ToolResult> {
         let kind = classify(name, input)?;
         let fingerprint = call_fingerprint(kind, name, input);
+        if !self.failures.is_empty()
+            && let Some(failure) = self.failures.iter().rev().find(|item| {
+                item.revision == revision
+                    && item.fingerprint == fingerprint
+                    && item.attempts >= NO_PROGRESS_LIMIT
+            })
+        {
+            let mut result = ToolResult::failure(
+                call_id,
+                "repeated_failure",
+                "guardrail: repeated failure for the same action; change arguments or approach",
+                false,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            );
+            if let Some(error) = failure.result.error.as_ref() {
+                result.output = aether_core::BoundedText::new(
+                    format!("{}; last failure={}", result.output.as_str(), error.code.as_str()),
+                    DEFAULT_MAX_OUTPUT_BYTES,
+                );
+            }
+            let _ = self.prevented.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            });
+            return Some(result);
+        }
         let cached = self.observations
             .iter()
             .rev()
@@ -196,8 +231,30 @@ impl LoopGuardrails {
         before: &W,
         after: &W,
     ) -> Option<String> {
+        let kind = classify(name, input);
+        if !result.ok
+            && let Some(kind) = kind
+        {
+            let fingerprint = call_fingerprint(kind, name, input);
+            if let Some(existing) = self.failures.iter_mut().find(|item| {
+                item.revision == after.workspace_revision() && item.fingerprint == fingerprint
+            }) {
+                existing.attempts = existing.attempts.saturating_add(1);
+                existing.result = result.clone();
+            } else {
+                if self.failures.len() == MAX_FAILURE_OBSERVATIONS {
+                    self.failures.pop_front();
+                }
+                self.failures.push_back(FailureObservation {
+                    fingerprint,
+                    revision: after.workspace_revision(),
+                    attempts: 1,
+                    result: result.clone(),
+                });
+            }
+        }
         if result.ok
-            && let Some(kind) = classify(name, input)
+            && let Some(kind) = kind
         {
             let fingerprint = call_fingerprint(kind, name, input);
             let observation = Observation {
@@ -216,8 +273,21 @@ impl LoopGuardrails {
         }
 
         if !result.ok {
-            self.no_progress = 0;
-            self.last_progress = None;
+            let repeated = kind.is_some_and(|kind| {
+                let fingerprint = call_fingerprint(kind, name, input);
+                self.failures.iter().any(|item| {
+                    item.revision == after.workspace_revision()
+                        && item.fingerprint == fingerprint
+                        && item.attempts >= NO_PROGRESS_LIMIT
+                })
+            });
+            if repeated {
+                return Some(
+                    "guardrail: repeated failure circuit breaker; change arguments or approach"
+                        .to_owned(),
+                );
+            }
+            self.no_progress = self.no_progress.saturating_add(1);
             return None;
         }
 
@@ -381,6 +451,29 @@ mod tests {
         let mut clean = LoopGuardrails::new();
         clean.observe("read", &input, &failed, &state, &state);
         assert!(clean.preflight(ToolCallId::new("retry").unwrap(), "read", &input, 0).is_none());
+    }
+
+    #[test]
+    fn repeated_failures_trip_a_bounded_circuit_breaker() {
+        let mut guard = LoopGuardrails::new();
+        let state = WorkflowState::new();
+        let input = json!({"files":[{"path":"src/lib.rs"}]});
+        for index in 0..3 {
+            let failed = ToolResult::failure(
+                ToolCallId::new(format!("failure-{index}")).unwrap(),
+                "io",
+                "same failure",
+                true,
+                1024,
+            );
+            guard.observe("read", &input, &failed, &state, &state);
+        }
+        let blocked = guard
+            .preflight(ToolCallId::new("circuit").unwrap(), "read", &input, 0)
+            .expect("same failed action must be circuit-broken");
+        let error = blocked.error.unwrap();
+        assert_eq!(error.code.as_str(), "repeated_failure");
+        assert!(!error.retryable);
     }
 
     #[test]

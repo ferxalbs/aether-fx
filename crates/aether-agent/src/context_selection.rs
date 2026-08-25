@@ -3,11 +3,13 @@
 use std::cmp::Reverse;
 
 use crate::symbol_index::SymbolRelationshipKind;
+use aether_core::WorkflowPhase;
 
 /// The origin of a context candidate.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ContextKind {
     ModifiedPath,
+    UserModifiedPath,
     Excerpt,
     InspectedFile,
     ToolSummary,
@@ -26,6 +28,12 @@ pub struct ContextCandidate<'a> {
     pub recency: usize,
     pub modified: bool,
     pub stale: bool,
+    /// Workflow phase in which this candidate is being considered.
+    pub phase: WorkflowPhase,
+    /// Whether this item changed since the previous bounded context packet.
+    pub delta: bool,
+    /// Stable content fingerprint used for delta-aware selection.
+    pub fingerprint: [u8; 16],
 }
 
 /// A symbol hit supplied by a targeted repository lookup.
@@ -56,6 +64,9 @@ impl<'a> ContextCandidate<'a> {
             recency: 0,
             modified: false,
             stale: false,
+            phase: WorkflowPhase::Discover,
+            delta: true,
+            fingerprint: [0; 16],
         }
     }
 
@@ -122,21 +133,30 @@ pub fn select_context_with_relationships(
         .take(32)
         .collect();
     let newest = candidates.iter().map(|candidate| candidate.recency).max().unwrap_or(0);
-    let mut ranked: Vec<(Reverse<i32>, usize)> = candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            (
-                Reverse(
-                    score_candidate(*candidate, &terms, newest)
-                        + symbol_bonus(*candidate, &terms, symbols)
-                        + relationship_hint_bonus(*candidate, relationships)
-                        + relationship_bonus(*candidate, candidates),
-                ),
-                index,
-            )
-        })
-        .collect();
+    let mut rank = |(index, candidate): (usize, &ContextCandidate<'_>)| {
+        (
+            Reverse(
+                score_candidate(*candidate, &terms, newest)
+                    + phase_bonus(*candidate)
+                    + delta_bonus(*candidate)
+                    + symbol_bonus(*candidate, &terms, symbols)
+                    + relationship_hint_bonus(*candidate, relationships)
+                    + relationship_bonus(*candidate, candidates),
+            ),
+            index,
+        )
+    };
+    let mut ranked: Vec<(Reverse<i32>, usize)> =
+        if candidates.iter().all(|candidate| candidate.delta) {
+            candidates.iter().enumerate().map(&mut rank).collect()
+        } else {
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.delta)
+                .map(&mut rank)
+                .collect()
+        };
     let ranked_limit = item_limit.saturating_mul(4).min(ranked.len());
     if ranked_limit < ranked.len() {
         ranked.select_nth_unstable_by_key(ranked_limit, |(score, index)| (*score, *index));
@@ -254,6 +274,7 @@ fn path_stem(path: &str) -> &str {
 fn score_candidate(candidate: ContextCandidate<'_>, terms: &[&str], newest: usize) -> i32 {
     let mut score = match candidate.kind {
         ContextKind::ModifiedPath => 90,
+        ContextKind::UserModifiedPath => 94,
         ContextKind::Excerpt => 55,
         ContextKind::InspectedFile => 35,
         ContextKind::ToolSummary => 25,
@@ -282,6 +303,48 @@ fn score_candidate(candidate: ContextCandidate<'_>, terms: &[&str], newest: usiz
         }
     }
     score
+}
+
+fn delta_bonus(candidate: ContextCandidate<'_>) -> i32 {
+    if candidate.delta { 48 } else { -320 }
+}
+
+fn phase_bonus(candidate: ContextCandidate<'_>) -> i32 {
+    match candidate.phase {
+        WorkflowPhase::Discover => match candidate.kind {
+            ContextKind::RepositoryMetadata
+            | ContextKind::GitMetadata
+            | ContextKind::ModifiedPath
+            | ContextKind::UserModifiedPath
+            | ContextKind::ToolSummary => 32,
+            ContextKind::Excerpt | ContextKind::InspectedFile => 8,
+        },
+        WorkflowPhase::Inspect => match candidate.kind {
+            ContextKind::Excerpt | ContextKind::InspectedFile => 42,
+            ContextKind::RepositoryMetadata | ContextKind::ToolSummary => 16,
+            ContextKind::ModifiedPath
+            | ContextKind::UserModifiedPath
+            | ContextKind::GitMetadata => 8,
+        },
+        WorkflowPhase::Modify => match candidate.kind {
+            ContextKind::ModifiedPath | ContextKind::UserModifiedPath => 48,
+            ContextKind::Excerpt | ContextKind::InspectedFile => 32,
+            ContextKind::ToolSummary => 20,
+            ContextKind::RepositoryMetadata | ContextKind::GitMetadata => 4,
+        },
+        WorkflowPhase::Verify => match candidate.kind {
+            ContextKind::ModifiedPath | ContextKind::Excerpt | ContextKind::InspectedFile => 38,
+            ContextKind::ToolSummary | ContextKind::GitMetadata => 34,
+            ContextKind::UserModifiedPath => 28,
+            ContextKind::RepositoryMetadata => 4,
+        },
+        WorkflowPhase::Complete => match candidate.kind {
+            ContextKind::ToolSummary | ContextKind::GitMetadata => 30,
+            ContextKind::ModifiedPath | ContextKind::Excerpt | ContextKind::InspectedFile => 24,
+            ContextKind::UserModifiedPath => 20,
+            ContextKind::RepositoryMetadata => 4,
+        },
+    }
 }
 
 fn symbol_matches(path: &str, term: &str) -> bool {
@@ -428,5 +491,43 @@ mod tests {
         let second = select_context("none", &candidates, 4096, 2);
         assert_eq!(first, second);
         assert_eq!(first.items.iter().map(|item| item.index).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn workflow_phase_and_delta_state_change_selection() {
+        let mut modified = candidate(ContextKind::ModifiedPath, "src/lib.rs", "");
+        modified.modified = true;
+        modified.phase = WorkflowPhase::Verify;
+        let mut metadata = candidate(ContextKind::RepositoryMetadata, "Cargo.toml", "package");
+        metadata.phase = WorkflowPhase::Verify;
+        let selected = select_context("verify", &[metadata, modified], 4096, 1);
+        assert_eq!(selected.items[0].index, 1);
+
+        metadata.delta = false;
+        modified.delta = false;
+        let empty = select_context("verify", &[metadata, modified], 4096, 1);
+        assert!(empty.items.is_empty());
+    }
+
+    #[test]
+    fn delta_selection_keeps_new_low_ranked_evidence_visible() {
+        let mut unchanged = [
+            candidate(ContextKind::ModifiedPath, "src/a.rs", ""),
+            candidate(ContextKind::ModifiedPath, "src/b.rs", ""),
+            candidate(ContextKind::ModifiedPath, "src/c.rs", ""),
+            candidate(ContextKind::ModifiedPath, "src/d.rs", ""),
+        ];
+        for item in &mut unchanged {
+            item.delta = false;
+        }
+        let mut new_metadata = candidate(ContextKind::RepositoryMetadata, "Cargo.toml", "new");
+        new_metadata.delta = true;
+        let selected = select_context(
+            "unrelated",
+            &[unchanged[0], unchanged[1], unchanged[2], unchanged[3], new_metadata],
+            4096,
+            1,
+        );
+        assert_eq!(selected.items[0].index, 4);
     }
 }

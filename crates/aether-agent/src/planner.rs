@@ -101,6 +101,13 @@ pub enum RepositoryRequestKind {
     Read,
 }
 
+/// One exact read request eligible for bounded local coalescing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryReadTarget {
+    pub path: String,
+    pub ranges: Vec<LineRange>,
+}
+
 /// Inputs to the pure planning step.  All slices are caller-owned bounded evidence.
 #[derive(Clone, Copy, Debug)]
 pub struct RepositoryPlanRequest<'a> {
@@ -316,6 +323,115 @@ impl RepositoryActionPlanner {
     #[must_use]
     pub fn limits(&self) -> PlannerLimits {
         self.limits
+    }
+
+    /// Plan exact read-only requests without requiring a model search round-trip.
+    #[must_use]
+    pub fn plan_read_targets(
+        &self,
+        context: &ContextSnapshot,
+        targets: &[RepositoryReadTarget],
+    ) -> RepositoryActionPlan {
+        let mut plan = empty_plan(self.limits.max_depth);
+        if context.workspace_changed || targets.is_empty() {
+            return abort_plan(
+                plan,
+                if context.workspace_changed {
+                    "workspace changed; exact reads require fresh evidence"
+                } else {
+                    "exact read request is empty"
+                },
+            );
+        }
+        let mut seen = Vec::new();
+        for target in targets.iter().take(self.limits.max_candidates) {
+            let Ok(relative) = WorkspacePath::new(&target.path) else {
+                return abort_plan(plan, "exact read path is outside the workspace");
+            };
+            let path = relative.display();
+            if path.is_empty() || seen.iter().any(|existing: &String| existing == &path) {
+                continue;
+            }
+            if seen.len() >= self.limits.max_files {
+                break;
+            }
+            let ranges = normalize_ranges(&target.ranges);
+            let inspected = context.inspected.iter().find(|file| file.path == path);
+            plan.observation.files.push(RepositoryFileObservation {
+                path: path.clone(),
+                score: 100,
+                inspected: inspected.is_some_and(is_current_file),
+                stale: inspected.is_some_and(|file| file.stale),
+            });
+            if inspected.is_some_and(|file| ranges_covered(file, &ranges))
+                && let Some(excerpt) = current_excerpt(context, &path, &ranges)
+            {
+                push_excerpt(&mut plan.observation, excerpt, self.limits.max_files);
+                seen.push(path);
+                continue;
+            }
+            if plan.actions.len() < self.limits.max_actions {
+                plan.actions.push(RepositoryAction::Read { path: path.clone(), ranges });
+            }
+            seen.push(path);
+        }
+        if plan.actions.is_empty() && !plan.observation.cache_hit {
+            return abort_plan(plan, "no bounded exact read survived selection");
+        }
+        plan.observation.collapsed = true;
+        plan.aborted = false;
+        plan
+    }
+
+    /// Merge compatible read-only plans into one bounded physical execution plan.
+    #[must_use]
+    pub fn coalesce(&self, plans: &[RepositoryActionPlan]) -> Option<RepositoryActionPlan> {
+        if plans.is_empty() || plans.iter().any(|plan| plan.aborted) {
+            return None;
+        }
+        let mut merged = empty_plan(self.limits.max_depth);
+        merged.aborted = false;
+        merged.observation.collapsed = true;
+        for plan in plans {
+            merged.observation.confidence =
+                merged.observation.confidence.max(plan.observation.confidence);
+            merged.observation.cache_hit |= plan.observation.cache_hit;
+            for file in &plan.observation.files {
+                if !merged.observation.files.iter().any(|existing| existing.path == file.path) {
+                    merged.observation.files.push(file.clone());
+                }
+            }
+            for symbol in &plan.observation.symbols {
+                if !merged.observation.symbols.iter().any(|existing| {
+                    existing.path == symbol.path
+                        && existing.name == symbol.name
+                        && existing.relationship == symbol.relationship
+                }) {
+                    merged.observation.symbols.push(symbol.clone());
+                }
+            }
+            for excerpt in &plan.observation.excerpts {
+                push_excerpt(&mut merged.observation, excerpt.clone(), self.limits.max_files);
+            }
+            merged.observation.bytes_read =
+                merged.observation.bytes_read.saturating_add(plan.observation.bytes_read);
+            merged.observation.files_read =
+                merged.observation.files_read.saturating_add(plan.observation.files_read);
+            for action in &plan.actions {
+                if merged.actions.len() >= self.limits.max_actions {
+                    break;
+                }
+                if !merged.actions.iter().any(|existing| existing == action) {
+                    merged.actions.push(action.clone());
+                }
+            }
+        }
+        merged.observation.files.truncate(self.limits.max_candidates);
+        merged.observation.symbols.truncate(self.limits.max_candidates);
+        if merged.actions.is_empty() && !merged.observation.cache_hit {
+            return None;
+        }
+        Some(merged)
     }
 
     /// Plan from bounded indexed/context evidence without touching the filesystem.
@@ -767,6 +883,23 @@ fn candidate_ranges(candidate: &Candidate, inspected: Option<&InspectedFile>) ->
     vec![LineRange { start: 1, end: 96 }]
 }
 
+fn normalize_ranges(ranges: &[LineRange]) -> Vec<LineRange> {
+    let mut normalized = ranges
+        .iter()
+        .take(16)
+        .filter_map(|range| {
+            (range.start > 0 && range.end >= range.start).then_some(LineRange {
+                start: range.start,
+                end: range.end.min(range.start.saturating_add(256)),
+            })
+        })
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        normalized.push(LineRange { start: 1, end: usize::MAX });
+    }
+    normalized
+}
+
 fn ranges_covered(file: &InspectedFile, ranges: &[LineRange]) -> bool {
     is_current_file(file)
         && ranges.iter().all(|needed| {
@@ -999,6 +1132,42 @@ mod tests {
         assert!(plan.actions.is_empty());
         assert!(plan.observation.cache_hit);
         assert_eq!(plan.observation.excerpts.len(), 1);
+    }
+
+    #[test]
+    fn exact_read_targets_coalesce_without_duplicate_physical_reads() {
+        let context = ContextSnapshot::new("/workspace", None);
+        let planner = RepositoryActionPlanner::default();
+        let targets = [
+            RepositoryReadTarget {
+                path: "src/lib.rs".to_owned(),
+                ranges: vec![LineRange { start: 1, end: 8 }],
+            },
+            RepositoryReadTarget {
+                path: "src/main.rs".to_owned(),
+                ranges: vec![LineRange { start: 1, end: 4 }],
+            },
+        ];
+        let first = planner.plan_read_targets(&context, &targets);
+        let second = planner.plan_read_targets(&context, &targets[..1]);
+        let merged = planner.coalesce(&[first, second]).expect("compatible reads coalesce");
+        assert!(merged.is_usable());
+        assert_eq!(merged.actions.len(), 2);
+        assert_eq!(merged.observation.files.len(), 2);
+        assert!(merged.observation.collapsed);
+    }
+
+    #[test]
+    fn exact_read_planning_fails_closed_after_workspace_drift() {
+        let mut context = ContextSnapshot::new("/workspace", None);
+        context.workspace_changed = true;
+        let plan = RepositoryActionPlanner::default().plan_read_targets(
+            &context,
+            &[RepositoryReadTarget { path: "src/lib.rs".to_owned(), ranges: Vec::new() }],
+        );
+        assert!(!plan.is_usable());
+        assert!(plan.aborted);
+        assert!(plan.actions.is_empty());
     }
 
     #[test]
