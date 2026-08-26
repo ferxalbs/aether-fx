@@ -67,3 +67,21 @@ bounded local read. The
 planner retains at most 8 candidates, 4 files/actions, 12 KiB of read bytes, 16 KiB of structured
 observation bytes, and 10 ms of execution time. Planning uses only indexed/context evidence, so
 the indexed-context path performs zero filesystem I/O.
+
+Deterministic production-loop evaluation on 2026-08-25 used 9 standalone offline Rust fixtures,
+real tool execution, and a deterministic fake model trace. It achieved 9/9 success@1 in both
+baseline and optimized runs. The optimized run used 54 model requests versus 55 baseline, 39
+executed tool calls versus 45, prevented 6 redundant calls, reduced model-visible bytes from
+328,924 to 318,728 (3.10%), and reduced context bytes from 40,229 to 35,282 (12.29%). It spawned
+13 finite processes, attempted verification 10 times, and reported 15,765 ms aggregate agent wall
+time on this host. CPU time, RSS, and allocation counters are zero when no portable in-process
+probe is available; `evals/compare.py` records external wall/RSS measurements for fresh processes.
+The suite gates correctness, step count, executed calls, and context bytes; timing is diagnostic.
+
+The full Criterion suite also completed on this host during the same verification pass. Selected
+medians were 105.45 µs for tool dispatch, 59.127 µs for blocking dispatch, 71.496 µs for a
+small-file read, 1.6755 ms for a large-file read, 783.78 µs for content search, 1.9264 ms for
+staged patch application, 75.541 µs for persistent-process buffer reads, 6.0157 µs for process
+registry lookup, and 4.1667 ms for session replay. Process startup measured 48.749 ms and the
+fresh `rg` comparison measured 50.907 ms; both include process startup and are diagnostic rather
+than direct in-process comparisons.

@@ -6,6 +6,7 @@
 //! remains allocation- and filesystem-light when current excerpts already answer the request.
 
 use std::{
+    fmt::Write as _,
     fs::{self, File},
     io::{self, Read},
     path::Path,
@@ -13,8 +14,8 @@ use std::{
 };
 
 use aether_core::{
-    BoundedText, CommandEffects, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, InspectedFile,
-    LineRange, MAX_EXCERPT_BYTES, ObservedFileState, ToolCallId, ToolResult, WorkspacePath,
+    BoundedText, CommandEffects, ContextSnapshot, InspectedFile, LineRange, MAX_EXCERPT_BYTES,
+    ObservedFileState, ToolCallId, ToolResult, WorkspacePath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -254,13 +255,64 @@ impl RepositoryObservation {
                 })
             })
             .collect::<Vec<_>>();
+        let mut model_output = String::new();
+        let _ = writeln!(
+            &mut model_output,
+            "repository observation: confidence={} files={} read={}B cache_hit={}",
+            self.confidence,
+            self.files.len(),
+            self.bytes_read,
+            self.cache_hit
+        );
+        for symbol in &self.symbols {
+            let _ = writeln!(
+                &mut model_output,
+                "symbol: {} {} {}",
+                symbol.path,
+                symbol.line.map_or_else(|| "-".to_owned(), |line| line.to_string()),
+                symbol.name.as_deref().unwrap_or("repository symbol")
+            );
+        }
+        for excerpt in &self.excerpts {
+            let _ = writeln!(
+                &mut model_output,
+                "file: {}:{}-{}",
+                excerpt.path, excerpt.start_line, excerpt.end_line
+            );
+            model_output.push_str(excerpt.text.as_str());
+            if !excerpt.text.as_str().ends_with('\n') {
+                model_output.push('\n');
+            }
+        }
+        if let Some(ambiguity) = &self.ambiguity {
+            let _ = writeln!(&mut model_output, "ambiguity: {}", ambiguity.as_str());
+        }
+        // The excerpts are represented once in `files.lines`; retaining them a second time in
+        // the planner metadata needlessly inflates the next model request.
+        let metadata = Self {
+            files: self.files,
+            symbols: self.symbols,
+            excerpts: Vec::new(),
+            confidence: self.confidence,
+            ambiguity: self.ambiguity,
+            bytes_read: self.bytes_read,
+            files_read: self.files_read,
+            cache_hit: self.cache_hit,
+            collapsed: self.collapsed,
+        };
         let value = json!({
-            "repository_observation": self,
+            "repository_observation": metadata,
             "matches": matches,
             "files": files,
             "truncated": false
         });
-        ToolResult::success_json(call_id, value, DEFAULT_MAX_OUTPUT_BYTES)
+        ToolResult {
+            call_id,
+            ok: true,
+            output: BoundedText::new(&model_output, MAX_PLANNER_OBSERVATION_BYTES),
+            data: Some(value),
+            error: None,
+        }
     }
 }
 

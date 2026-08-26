@@ -29,7 +29,7 @@ pub use context_selection::{
     ContextCandidate, ContextKind, RelationshipHint, SelectedContext, SelectedContextItem,
     SymbolHint, select_context, select_context_with_relationships, select_context_with_symbols,
 };
-pub use fake::{FakeBackend, FakeToolCall};
+pub use fake::{FakeBackend, FakeStep, FakeToolCall};
 pub use guardrails::LoopGuardrails;
 pub use permission::{
     AllowAllPermissionBroker, NoPermissionBroker, PermissionBroker, PermissionFuture,

@@ -4,8 +4,8 @@ use std::{
 };
 
 use aether_core::{
-    CommandClass, CommandEffects, DEFAULT_MAX_OUTPUT_BYTES, DecisionCandidate, ToolCallId,
-    ToolResult, WorkflowFailure, WorkflowPhase, WorkflowState, analyze_command,
+    ActionClassification, CommandClass, CommandEffects, DEFAULT_MAX_OUTPUT_BYTES, PreparedAction,
+    ToolCallId, ToolResult, WorkflowPhase, WorkflowState, analyze_command,
 };
 use serde_json::Value;
 
@@ -42,9 +42,9 @@ struct FailureObservation {
 pub(crate) struct WorkflowObservation {
     workspace_revision: u32,
     progress: [u16; 4],
-    unresolved_failures: Vec<WorkflowFailure>,
+    unresolved_failures: [u8; 16],
     phase: WorkflowPhase,
-    candidate_files: Vec<DecisionCandidate>,
+    candidate_files: [u8; 16],
 }
 
 impl From<&WorkflowState> for WorkflowObservation {
@@ -57,9 +57,9 @@ impl From<&WorkflowState> for WorkflowObservation {
                 workflow.progress.mutations,
                 workflow.progress.verifications,
             ],
-            unresolved_failures: workflow.unresolved_failures.clone(),
+            unresolved_failures: digest_failures(&workflow.unresolved_failures),
             phase: workflow.phase,
-            candidate_files: workflow.decision.candidate_files.clone(),
+            candidate_files: digest_candidates(&workflow.decision.candidate_files),
         }
     }
 }
@@ -67,7 +67,7 @@ impl From<&WorkflowState> for WorkflowObservation {
 trait WorkflowObservationView {
     fn workspace_revision(&self) -> u32;
     fn progress(&self) -> [u16; 4];
-    fn unresolved_failures(&self) -> &[WorkflowFailure];
+    fn unresolved_failures(&self) -> [u8; 16];
     fn phase(&self) -> WorkflowPhase;
 }
 
@@ -85,13 +85,48 @@ impl WorkflowObservationView for WorkflowState {
         ]
     }
 
-    fn unresolved_failures(&self) -> &[WorkflowFailure] {
-        &self.unresolved_failures
+    fn unresolved_failures(&self) -> [u8; 16] {
+        digest_failures(&self.unresolved_failures)
     }
 
     fn phase(&self) -> WorkflowPhase {
         self.phase
     }
+}
+
+fn digest_failures(failures: &[aether_core::WorkflowFailure]) -> [u8; 16] {
+    if failures.is_empty() {
+        return [0; 16];
+    }
+    let mut hasher = blake3::Hasher::new();
+    for failure in failures {
+        hasher.update(failure.key.as_str().as_bytes());
+        hasher.update(failure.tool.as_str().as_bytes());
+        hasher.update(failure.code.as_str().as_bytes());
+        hasher.update(failure.message.as_str().as_bytes());
+    }
+    let hash = hasher.finalize();
+    let mut digest = [0; 16];
+    digest.copy_from_slice(&hash.as_bytes()[..16]);
+    digest
+}
+
+fn digest_candidates(candidates: &[aether_core::DecisionCandidate]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    for candidate in candidates {
+        hasher.update(candidate.path.as_str().as_bytes());
+        hasher.update(&candidate.score.to_le_bytes());
+        hasher.update(&candidate.evidence.to_le_bytes());
+        hasher.update(&[
+            candidate.inspected as u8,
+            candidate.modified as u8,
+            candidate.stale as u8,
+        ]);
+    }
+    let hash = hasher.finalize();
+    let mut digest = [0; 16];
+    digest.copy_from_slice(&hash.as_bytes()[..16]);
+    digest
 }
 
 impl WorkflowObservationView for WorkflowObservation {
@@ -103,8 +138,8 @@ impl WorkflowObservationView for WorkflowObservation {
         self.progress
     }
 
-    fn unresolved_failures(&self) -> &[WorkflowFailure] {
-        &self.unresolved_failures
+    fn unresolved_failures(&self) -> [u8; 16] {
+        self.unresolved_failures
     }
 
     fn phase(&self) -> WorkflowPhase {
@@ -185,6 +220,70 @@ impl LoopGuardrails {
         cached
     }
 
+    /// Fast preflight using the action fingerprint and classification prepared by the registry.
+    pub(crate) fn preflight_prepared(
+        &self,
+        action: &PreparedAction,
+        revision: u32,
+    ) -> Option<ToolResult> {
+        let kind = prepared_kind(action)?;
+        let fingerprint = action.fingerprint;
+        if let Some(failure) = self.failures.iter().rev().find(|item| {
+            item.revision == revision
+                && item.fingerprint == fingerprint
+                && item.attempts >= NO_PROGRESS_LIMIT
+        }) {
+            let mut result = ToolResult::failure(
+                action.call_id.clone(),
+                "repeated_failure",
+                "guardrail: repeated failure for the same action; change arguments or approach",
+                false,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            );
+            if let Some(error) = failure.result.error.as_ref() {
+                result.output = aether_core::BoundedText::new(
+                    format!("{}; last failure={}", result.output.as_str(), error.code.as_str()),
+                    DEFAULT_MAX_OUTPUT_BYTES,
+                );
+            }
+            self.prevented.fetch_add(1, Ordering::Relaxed);
+            return Some(result);
+        }
+        let cached = self
+            .observations
+            .iter()
+            .rev()
+            .find(|item| item.revision == revision && item.fingerprint == fingerprint)
+            .map(|item| {
+                let mut cached = item.result.clone();
+                cached.call_id = action.call_id.clone();
+                cached.output = aether_core::BoundedText::new(
+                    format!(
+                        "guardrail: redundant {} skipped; cached observation for workspace revision {}:\n{}",
+                        action.tool,
+                        revision,
+                        item.result.output.as_str()
+                    ),
+                    DEFAULT_MAX_OUTPUT_BYTES,
+                );
+                cached
+            });
+        if cached.is_some() {
+            self.prevented.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = kind;
+        cached
+    }
+
+    /// Return whether a prepared read/verification is already cached at this revision.
+    pub(crate) fn has_cached_prepared(&self, action: &PreparedAction, revision: u32) -> bool {
+        prepared_kind(action).is_some_and(|_| {
+            self.observations
+                .iter()
+                .any(|item| item.revision == revision && item.fingerprint == action.fingerprint)
+        })
+    }
+
     /// Return whether a call is already represented by the current revision without changing
     /// the prevented counter.  The agent uses this read-only probe before considering a local
     /// planner shortcut; the normal scheduler remains responsible for producing the cached
@@ -223,6 +322,25 @@ impl LoopGuardrails {
         self.observe_impl(name, input, result, before, after)
     }
 
+    /// Fold a prepared action while reusing its binary fingerprint and classification.
+    pub(crate) fn observe_snapshot_prepared(
+        &mut self,
+        action: &PreparedAction,
+        result: &ToolResult,
+        before: &WorkflowObservation,
+        after: &WorkflowObservation,
+    ) -> Option<String> {
+        self.observe_impl_with_fingerprint(
+            &action.tool,
+            &action.normalized_input,
+            result,
+            before,
+            after,
+            prepared_kind(action),
+            Some(action.fingerprint),
+        )
+    }
+
     fn observe_impl<W: WorkflowObservationView>(
         &mut self,
         name: &str,
@@ -232,10 +350,24 @@ impl LoopGuardrails {
         after: &W,
     ) -> Option<String> {
         let kind = classify(name, input);
-        if !result.ok
-            && let Some(kind) = kind
-        {
-            let fingerprint = call_fingerprint(kind, name, input);
+        let fingerprint = kind.map(|kind| call_fingerprint(kind, name, input));
+        self.observe_impl_with_fingerprint(name, input, result, before, after, kind, fingerprint)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_impl_with_fingerprint<W: WorkflowObservationView>(
+        &mut self,
+        name: &str,
+        input: &Value,
+        result: &ToolResult,
+        before: &W,
+        after: &W,
+        kind: Option<CallKind>,
+        action_fingerprint: Option<[u8; 16]>,
+    ) -> Option<String> {
+        let fingerprint = action_fingerprint
+            .unwrap_or_else(|| call_fingerprint(CallKind::Observation, name, input));
+        if !result.ok && kind.is_some() {
             if let Some(existing) = self.failures.iter_mut().find(|item| {
                 item.revision == after.workspace_revision() && item.fingerprint == fingerprint
             }) {
@@ -253,10 +385,7 @@ impl LoopGuardrails {
                 });
             }
         }
-        if result.ok
-            && let Some(kind) = kind
-        {
-            let fingerprint = call_fingerprint(kind, name, input);
+        if result.ok && kind.is_some() {
             let observation = Observation {
                 fingerprint,
                 revision: after.workspace_revision(),
@@ -273,8 +402,7 @@ impl LoopGuardrails {
         }
 
         if !result.ok {
-            let repeated = kind.is_some_and(|kind| {
-                let fingerprint = call_fingerprint(kind, name, input);
+            let repeated = kind.is_some_and(|_| {
                 self.failures.iter().any(|item| {
                     item.revision == after.workspace_revision()
                         && item.fingerprint == fingerprint
@@ -306,7 +434,7 @@ impl LoopGuardrails {
         if self.no_progress >= NO_PROGRESS_LIMIT {
             self.no_progress = 0;
             Some("guardrail: no progress across 3 successful tool steps; change arguments or approach, modify the workspace, or finish with the evidence already collected".to_owned())
-        } else if after.phase() == WorkflowPhase::Complete && after.unresolved_failures().is_empty()
+        } else if after.phase() == WorkflowPhase::Complete && after.unresolved_failures() == [0; 16]
         {
             Some("completion_ready: required verification passed and no unresolved failures remain; summarize and finish".to_owned())
         } else {
@@ -330,6 +458,14 @@ fn classify(name: &str, input: &Value) -> Option<CallKind> {
         "read" | "search" | "find" | "list" => Some(CallKind::Observation),
         "shell" | "process" if verification_command(input) => Some(CallKind::Verification),
         _ => None,
+    }
+}
+
+fn prepared_kind(action: &PreparedAction) -> Option<CallKind> {
+    match action.classification {
+        ActionClassification::Read => Some(CallKind::Observation),
+        ActionClassification::Verification => Some(CallKind::Verification),
+        ActionClassification::Mutation | ActionClassification::Other => None,
     }
 }
 

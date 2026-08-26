@@ -31,6 +31,54 @@ pub(crate) const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_PROCESS_READ_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PERSISTENT_PROCESSES: usize = 16;
 pub(crate) const PROCESS_STREAM_BUFFER_BYTES: usize = 256 * 1024;
+pub(crate) const MIN_PROCESS_TIMEOUT_MS: u64 = 1;
+pub(crate) const MAX_PROCESS_TIMEOUT_MS: u64 = 600_000;
+
+/// Shared bounded runtime policy for finite commands and persistent stream reads.
+///
+/// Process lifetime is owned by the persistent-process registry when applicable; this value owns
+/// only the common output and deadline invariants so the two execution modes cannot drift apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessRuntime {
+    pub output_limit: usize,
+    pub timeout: std::time::Duration,
+}
+
+impl ProcessRuntime {
+    pub(crate) fn finite(
+        workspace: &Workspace,
+        requested_bytes: Option<usize>,
+        requested_timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            output_limit: bounded_limit(requested_bytes, workspace.max_output_bytes()),
+            timeout: std::time::Duration::from_millis(
+                requested_timeout_ms
+                    .unwrap_or(120_000)
+                    .clamp(MIN_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS),
+            ),
+        }
+    }
+
+    pub(crate) fn persistent_read(
+        workspace: &Workspace,
+        requested_bytes: Option<usize>,
+        requested_timeout_ms: Option<u64>,
+    ) -> Self {
+        let max_read_output = (workspace.max_output_bytes() / 8).max(1);
+        Self {
+            output_limit: bounded_limit(
+                requested_bytes,
+                MAX_PROCESS_READ_BYTES.min(max_read_output),
+            ),
+            timeout: std::time::Duration::from_millis(
+                requested_timeout_ms
+                    .unwrap_or(1_000)
+                    .clamp(MIN_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS),
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ToolInternalError {

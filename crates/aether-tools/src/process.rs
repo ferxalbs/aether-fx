@@ -10,8 +10,8 @@ use tokio::{
 };
 
 use crate::common::{
-    MAX_PROCESS_READ_BYTES, PROCESS_STREAM_BUFFER_BYTES, ProcessHandle, ProcessState,
-    ProcessTermination, ProcessTerminationError, ToolInternalError, Workspace, bounded_limit,
+    MAX_PROCESS_READ_BYTES, PROCESS_STREAM_BUFFER_BYTES, ProcessHandle, ProcessRuntime,
+    ProcessState, ProcessTermination, ProcessTerminationError, ToolInternalError, Workspace,
     resolve_existing_blocking,
 };
 
@@ -101,6 +101,15 @@ pub(crate) async fn execute(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
+    execute_parsed(workspace, call_id, parsed, context).await
+}
+
+pub(crate) async fn execute_parsed(
+    workspace: &Workspace,
+    call_id: ToolCallId,
+    parsed: ProcessInput,
+    context: ToolExecutionContext,
+) -> aether_core::ToolResult {
     if let Err(error) =
         workspace.require_permit(&context, &call_id, "process", PermissionClass::ProcessPersistent)
     {
@@ -379,10 +388,9 @@ async fn read(
     let stream = input.stream.unwrap_or(ProcessStream::Stdout);
     // Leave room for JSON metadata and escaping so buffered_bytes/dropped_bytes remain visible
     // even when the stream contains control characters.
-    let max_read_output = (workspace.max_output_bytes() / 8).max(1);
-    let max_bytes = bounded_limit(input.max_bytes, MAX_PROCESS_READ_BYTES.min(max_read_output));
-    let timeout_duration =
-        Duration::from_millis(input.timeout_ms.unwrap_or(1000).clamp(1, 600_000));
+    let runtime = ProcessRuntime::persistent_read(workspace, input.max_bytes, input.timeout_ms);
+    let max_bytes = runtime.output_limit;
+    let timeout_duration = runtime.timeout;
     let Some(handle) = workspace.processes().get(process_id) else {
         return workspace
             .result_error(call_id, ToolInternalError::Input("unknown process_id".to_owned()));

@@ -64,6 +64,15 @@ pub(crate) async fn execute(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
+    execute_parsed(workspace, call_id, parsed, context).await
+}
+
+pub(crate) async fn execute_parsed(
+    workspace: &Workspace,
+    call_id: ToolCallId,
+    parsed: PatchInput,
+    context: ToolExecutionContext,
+) -> aether_core::ToolResult {
     if parsed.files.is_empty() || parsed.files.len() > 64 {
         return workspace.result_error(
             call_id,

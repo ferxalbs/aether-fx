@@ -14,16 +14,19 @@ Fixtures are
 small standalone Rust workspaces. The runner copies one into a new temporary directory for every
 task and removes the copy afterward, so runs never mutate fixture sources or reuse build state.
 
-The default backend is scripted and deterministic. It performs no provider or network calls and
-sets Cargo offline for fixture verification. `EvalBackend` is the integration boundary for real
-providers; provider-backed evaluations should use a separate binary or feature so default CI remains
-offline and reproducible.
+The default backend is a deterministic offline trace replay, but each trace is executed by the
+production `Agent`, policy, scheduler, `ContextEngine`, nine-tool registry, and real fixture
+filesystem. It performs no provider or network calls and sets Cargo offline for fixture
+verification. `EvalBackend` remains the trace-generation boundary for real providers; provider-
+backed evaluations should use a separate binary or feature so default CI remains offline and
+reproducible.
 
-JSON output includes per-task correctness, wall time, harness overhead, model steps, requested and
-executed tool calls, prevented redundant calls, bytes read, context bytes, verification attempts,
-verification scope and quality, planner attempts/hits, ambiguity aborts, planned actions, planner
-bytes, and final test status. The `relationship-heavy-exploration` scenario requires repeated
-search-to-read navigation in baseline mode and exercises the bounded planner in policy mode.
-Regression gates cover correctness, steps, executed calls, and context size; shell-heavy and
-planner scenarios report before/after metrics in the same result for direct comparison.
-Wall time is diagnostic only because shared CI timing is unstable.
+JSON output includes per-task correctness, model requests, tokens when the provider reports them,
+requested and executed calls, prevented calls, bytes read, bytes shown to the model, context bytes,
+process spawns, verification attempts, wall/CPU time, and platform probes for RSS and allocations.
+The `relationship-heavy-exploration` scenario requires repeated search-to-read navigation in
+baseline mode and exercises the bounded planner in policy mode. Regression gates cover correctness,
+steps, executed calls, and context size; shell-heavy and planner scenarios report before/after
+metrics in the same result for direct comparison. Wall time is diagnostic only because shared CI
+timing is unstable; RSS is measured by the external comparison wrapper, while unavailable in-process
+probes are reported as zero.

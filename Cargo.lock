@@ -36,6 +36,7 @@ dependencies = [
 name = "aether-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "thiserror",
@@ -47,8 +48,11 @@ version = "0.1.0"
 dependencies = [
  "aether-agent",
  "aether-core",
+ "aether-tools",
+ "blake3",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,13 +1,14 @@
 use std::{fmt::Write as FmtWrite, path::Path};
 
 use aether_core::{
-    BoundedText, CONTEXT_GUIDANCE, CommandEffects, CompactToolSummary, ContextSnapshot,
-    FileExcerpt, GitSnapshot, InspectedFile, LineRange, MAX_CONTEXT_FINGERPRINT_BYTES,
-    MAX_CONTEXT_FINGERPRINTS, MAX_CONTEXT_ITEMS, MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES,
-    MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES, MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS,
-    MAX_TASK_BYTES, MAX_USER_MODIFIED_FILES, MAX_WORKFLOW_FIELD_BYTES, ObservedFileState,
-    OpaqueContinuation, ToolResult, WorkflowFailure, WorkflowPhase, WorkflowVerification,
-    WorkspacePath, analyze_command, compact_tool_result, merge_line_ranges,
+    ActionClassification, BoundedText, CONTEXT_GUIDANCE, CommandEffects, CompactToolSummary,
+    ContextSnapshot, FileExcerpt, GitSnapshot, InspectedFile, LineRange,
+    MAX_CONTEXT_FINGERPRINT_BYTES, MAX_CONTEXT_FINGERPRINTS, MAX_CONTEXT_ITEMS,
+    MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES, MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES,
+    MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS, MAX_TASK_BYTES, MAX_USER_MODIFIED_FILES,
+    MAX_WORKFLOW_FIELD_BYTES, ObservedFileState, OpaqueContinuation, PreparedAction, ToolResult,
+    WorkflowFailure, WorkflowPhase, WorkflowVerification, WorkspacePath, analyze_command,
+    compact_tool_result, merge_line_ranges,
 };
 use serde_json::Value;
 
@@ -151,11 +152,41 @@ impl ContextEngine {
 
     /// Observe a completed tool call and fold it into bounded working state.
     pub fn observe_tool(&mut self, name: &str, input: &Value, result: &ToolResult) {
-        let focused_verification = self.is_focused_verification(name, input);
-        let failure_key = (!result.ok || !self.snapshot.workflow.unresolved_failures.is_empty())
-            .then(|| workflow_failure_key(name, input));
         let command_effects = command_effects_for_tool(name, input);
-        let mutation = is_workspace_mutation(name, input, command_effects.as_ref());
+        self.observe_with_effects(name, input, result, command_effects.as_ref(), None);
+    }
+
+    fn observe_with_effects(
+        &mut self,
+        name: &str,
+        input: &Value,
+        result: &ToolResult,
+        command_effects: Option<&CommandEffects>,
+        prepared_classification: Option<ActionClassification>,
+    ) {
+        let focused_verification = prepared_classification.map_or_else(
+            || self.is_focused_verification(name, input),
+            |classification| {
+                (matches!(classification, ActionClassification::Verification)
+                    || (matches!(classification, ActionClassification::Read)
+                        && matches!(name, "read" | "git")
+                        && self.is_focused_verification(name, input)))
+                    && matches!(
+                        self.snapshot.workflow.verification,
+                        WorkflowVerification::Pending | WorkflowVerification::Failed
+                    )
+            },
+        );
+        let failure_key = (focused_verification
+            || prepared_classification == Some(ActionClassification::Verification)
+            || (prepared_classification.is_none() && is_verification_command(input))
+            || !result.ok
+            || !self.snapshot.workflow.unresolved_failures.is_empty())
+        .then(|| workflow_failure_key(name, input));
+        let mutation = prepared_classification.map_or_else(
+            || is_workspace_mutation(name, input, command_effects),
+            |classification| classification == ActionClassification::Mutation,
+        );
         let repository_observation =
             result.data.as_ref().is_some_and(|data| data.get("repository_observation").is_some());
         self.snapshot.workflow.progress.note_tool_result();
@@ -189,7 +220,7 @@ impl ContextEngine {
                 result,
             );
         }
-        if mutation && mutation_applied(name, input, result, command_effects.as_ref()) {
+        if mutation && mutation_applied(name, input, result, command_effects) {
             if let Some(effects) = command_effects.as_ref() {
                 let include_manifests = matches!(
                     effects.class,
@@ -241,6 +272,17 @@ impl ContextEngine {
             self.snapshot.workspace_changed = false;
         }
         self.enforce_bounds();
+    }
+
+    /// Observe an action whose normalized representation is shared across the turn hot path.
+    pub(crate) fn observe_prepared(&mut self, action: &PreparedAction, result: &ToolResult) {
+        self.observe_with_effects(
+            &action.tool,
+            &action.normalized_input,
+            result,
+            action.command_effects.as_ref(),
+            Some(action.classification),
+        );
     }
 
     /// Re-hash inspected files against the live workspace. Stale hashes never win.

@@ -31,6 +31,15 @@ pub(crate) async fn execute(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
+    execute_parsed(workspace, call_id, parsed, context).await
+}
+
+pub(crate) async fn execute_parsed(
+    workspace: &Workspace,
+    call_id: ToolCallId,
+    parsed: FindInput,
+    context: ToolExecutionContext,
+) -> aether_core::ToolResult {
     if parsed.patterns.is_empty() || parsed.patterns.len() > 32 {
         return workspace.result_error(
             call_id,

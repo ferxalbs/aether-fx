@@ -10,6 +10,7 @@ description = "AETHER Fx domain primitives and boundaries"
 workspace = true
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

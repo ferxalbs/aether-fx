@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, task::Poll};
 
 use aether_core::{
-    AgentEvent, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit, PermissionDecision,
+    AgentEvent, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit, PermissionDecision, PreparedAction,
     ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResult,
 };
 use serde_json::Value;
@@ -15,7 +15,7 @@ pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
 const MAX_TOOL_CALLS_PER_STEP: usize = 64;
 
 struct ScheduledCall {
-    invocation: ToolInvocation,
+    action: PreparedAction,
     permit: Option<ExecutionPermit>,
     preflight: Option<ToolResult>,
     footprint: ToolFootprint,
@@ -23,16 +23,13 @@ struct ScheduledCall {
 }
 
 struct CompletedCall {
-    call_id: aether_core::ToolCallId,
-    name: String,
-    input: Value,
+    action: PreparedAction,
     executed: bool,
 }
 
 /// A completed tool result with the original invocation needed for context observation.
 pub(crate) struct ScheduledToolResult {
-    pub(crate) name: String,
-    pub(crate) input: Value,
+    pub(crate) action: PreparedAction,
     pub(crate) result: ToolResult,
     pub(crate) executed: bool,
     pub(crate) planned: bool,
@@ -42,14 +39,14 @@ pub(crate) struct ScheduledToolResult {
 /// Deterministic pre-execution gate for workflow or composition-root policy.
 pub(crate) trait ToolCallGate {
     /// Return a typed result when the call must not execute.
-    fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult>;
+    fn preflight(&self, action: &PreparedAction) -> Option<ToolResult>;
 }
 
 #[allow(dead_code)]
 struct AllowAllToolCallGate;
 
 impl ToolCallGate for AllowAllToolCallGate {
-    fn preflight(&self, _: &ToolInvocation) -> Option<ToolResult> {
+    fn preflight(&self, _: &PreparedAction) -> Option<ToolResult> {
         None
     }
 }
@@ -67,7 +64,7 @@ pub fn schedule_ready_calls(
             break;
         }
         if selected[..count].iter().any(|&prior| footprints[index].conflicts(&footprints[prior])) {
-            break;
+            continue;
         }
         selected[count] = index;
         count += 1;
@@ -88,9 +85,13 @@ where
     T: ToolExecutor,
     P: PermissionBroker + ?Sized,
 {
-    execute_tool_calls_with_gate(
+    let actions = tool_calls
+        .into_iter()
+        .map(|(call_id, name, input)| tools.prepare(ToolInvocation { call_id, name, input }))
+        .collect();
+    execute_prepared_tool_calls_with_gate(
         tools,
-        tool_calls,
+        actions,
         events,
         cancellation,
         broker,
@@ -99,9 +100,9 @@ where
     .await
 }
 
-pub(crate) async fn execute_tool_calls_with_gate<T, P, G>(
+pub(crate) async fn execute_prepared_tool_calls_with_gate<T, P, G>(
     tools: &T,
-    tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
+    actions: Vec<PreparedAction>,
     events: &mpsc::Sender<AgentEvent>,
     cancellation: &CancellationToken,
     broker: &P,
@@ -112,7 +113,7 @@ where
     P: PermissionBroker + ?Sized,
     G: ToolCallGate + ?Sized,
 {
-    let mut calls = prepare_calls(tools, tool_calls, events, cancellation, broker, gate).await?;
+    let mut calls = prepare_calls(actions, events, cancellation, broker, gate).await?;
     let mut completed = 0_usize;
     let mut outputs = Vec::with_capacity(calls.len());
     let mut selected = [0_usize; DEFAULT_MAX_PARALLEL_TOOLS];
@@ -134,31 +135,27 @@ where
             send_event(
                 events,
                 AgentEvent::ToolStarted {
-                    call_id: call.invocation.call_id.clone(),
-                    name: call.invocation.name.clone(),
+                    call_id: call.action.call_id.clone(),
+                    name: call.action.tool.clone(),
                     permission: call.permission.clone(),
-                    operation: call.invocation.name.clone(),
+                    operation: call.action.tool.clone(),
                     step_id: None,
                 },
             )
             .await?;
         }
 
-        let mut futures = std::array::from_fn(|_| None);
-        let mut batch_results = std::array::from_fn(|_| None);
         let mut metadata: [Option<CompletedCall>; DEFAULT_MAX_PARALLEL_TOOLS] =
             std::array::from_fn(|_| None);
+        let mut futures = std::array::from_fn(|_| None);
+        let mut batch_results = std::array::from_fn(|_| None);
         for (slot, &index) in selected[..selected_len].iter().enumerate() {
             let call = calls[index].take().ok_or_else(|| {
                 AgentError::Tool("tool scheduler lost a selected call".to_owned())
             })?;
-            let ScheduledCall { invocation, permit, preflight, .. } = call;
-            let completed_call = CompletedCall {
-                call_id: invocation.call_id.clone(),
-                name: invocation.name.clone(),
-                input: invocation.input.clone(),
-                executed: permit.is_some() && preflight.is_none(),
-            };
+            let ScheduledCall { action, permit, preflight, .. } = call;
+            let completed_call =
+                CompletedCall { action, executed: permit.is_some() && preflight.is_none() };
             metadata[slot] = Some(completed_call);
             if let Some(result) = preflight {
                 batch_results[slot] = Some(result);
@@ -168,6 +165,7 @@ where
                 let call_id = metadata[slot]
                     .as_ref()
                     .expect("metadata inserted for every selected call")
+                    .action
                     .call_id
                     .clone();
                 batch_results[slot] = Some(ToolResult::failure(
@@ -180,7 +178,14 @@ where
                 continue;
             };
             let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tools.execute(invocation, ToolExecutionContext::new(cancellation.flag(), permit))
+                tools.execute_prepared(
+                    metadata[slot]
+                        .as_ref()
+                        .expect("metadata inserted for every selected call")
+                        .action
+                        .clone(),
+                    ToolExecutionContext::new(cancellation.flag(), permit),
+                )
             }));
             match future {
                 Ok(future) => futures[slot] = Some(future),
@@ -188,6 +193,7 @@ where
                     let call_id = metadata[slot]
                         .as_ref()
                         .expect("metadata inserted for every selected call")
+                        .action
                         .call_id
                         .clone();
                     batch_results[slot] = Some(tool_panic_result(call_id));
@@ -197,6 +203,7 @@ where
 
         wait_for_batch(&mut futures, &mut batch_results, &metadata, selected_len, cancellation)
             .await?;
+        drop(futures);
 
         for slot in 0..selected_len {
             let metadata = metadata[slot]
@@ -209,14 +216,17 @@ where
             send_event(
                 events,
                 AgentEvent::ToolOutput {
-                    call_id: metadata.call_id.clone(),
+                    call_id: metadata.action.call_id.clone(),
                     output: result.output.clone(),
                 },
             )
             .await?;
             send_event(
                 events,
-                AgentEvent::ToolFinished { call_id: metadata.call_id.clone(), ok: result.ok },
+                AgentEvent::ToolFinished {
+                    call_id: metadata.action.call_id.clone(),
+                    ok: result.ok,
+                },
             )
             .await?;
             outputs.push((metadata, result));
@@ -226,8 +236,7 @@ where
     Ok(outputs
         .into_iter()
         .map(|(metadata, result)| ScheduledToolResult {
-            name: metadata.name,
-            input: metadata.input,
+            action: metadata.action,
             result,
             executed: metadata.executed,
             planned: false,
@@ -267,6 +276,7 @@ async fn wait_for_batch<'a>(
                     let call_id = metadata[slot]
                         .as_ref()
                         .expect("metadata inserted for every selected call")
+                        .action
                         .call_id
                         .clone();
                     results[slot] = Some(tool_panic_result(call_id));
@@ -289,33 +299,31 @@ fn tool_panic_result(call_id: aether_core::ToolCallId) -> ToolResult {
     )
 }
 
-async fn prepare_calls<T, P, G>(
-    tools: &T,
-    tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
+async fn prepare_calls<P, G>(
+    actions: Vec<PreparedAction>,
     events: &mpsc::Sender<AgentEvent>,
     cancellation: &CancellationToken,
     broker: &P,
     gate: &G,
 ) -> Result<Vec<Option<ScheduledCall>>, AgentError>
 where
-    T: ToolExecutor,
     P: PermissionBroker + ?Sized,
     G: ToolCallGate + ?Sized,
 {
-    if tool_calls.len() > MAX_TOOL_CALLS_PER_STEP {
+    if actions.len() > MAX_TOOL_CALLS_PER_STEP {
         return Err(AgentError::Tool(
             "tool call batch exceeds the bounded scheduler limit".to_owned(),
         ));
     }
-    let mut calls = Vec::with_capacity(tool_calls.len());
-    for (call_id, name, arguments) in tool_calls {
+    let mut calls = Vec::with_capacity(actions.len());
+    for action in actions {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let invocation =
-            ToolInvocation { call_id: call_id.clone(), name: name.clone(), input: arguments };
-        let class = definition_class(tools, &name);
-        let permission_request = tools.permission_request(&invocation);
+        let call_id = action.call_id.clone();
+        let name = action.tool.clone();
+        let class = action.requirements.permission;
+        let permission_request = action.permission_request.clone();
         let permit = if let Some(permission_request) = permission_request {
             let needs_prompt = broker.needs_prompt(&permission_request);
             let decision_future = broker.decide(permission_request.clone());
@@ -353,28 +361,16 @@ where
         } else {
             Some(ExecutionPermit::new(call_id.clone(), name.clone(), class))
         };
-        let preflight = permit.as_ref().and_then(|_| gate.preflight(&invocation));
+        let preflight = permit.as_ref().and_then(|_| gate.preflight(&action));
         let permission = class.to_string();
         let footprint = if permit.is_some() && preflight.is_none() {
-            tools.footprint(&invocation)
+            action.effects.clone()
         } else {
             ToolFootprint::empty()
         };
-        calls.push(Some(ScheduledCall { invocation, permit, preflight, footprint, permission }));
+        calls.push(Some(ScheduledCall { action, permit, preflight, footprint, permission }));
     }
     Ok(calls)
-}
-
-fn definition_class<T: ToolExecutor + ?Sized>(
-    tools: &T,
-    name: &str,
-) -> aether_core::PermissionClass {
-    tools
-        .definitions()
-        .iter()
-        .find(|definition| definition.name == name)
-        .map(|definition| definition.permission)
-        .unwrap_or(aether_core::PermissionClass::ReadOnly)
 }
 
 fn blocked_by_pending_conflict(index: usize, calls: &[Option<ScheduledCall>]) -> bool {
@@ -401,10 +397,6 @@ fn select_pending_calls(
         if call.permit.is_none() || !blocked_by_pending_conflict(index, calls) {
             selected[count] = index;
             count += 1;
-        } else {
-            // Preserve model-order event visibility: a later call is not
-            // admitted around an earlier unresolved dependency.
-            break;
         }
     }
     count

@@ -51,8 +51,9 @@ pub use session::{
     TurnSnapshot,
 };
 pub use tools::{
-    ExecutionPermit, MAX_TOOL_FOOTPRINT_RESOURCES, ToolDefinition, ToolEffect,
-    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
+    ActionClassification, ActionRequirements, EvidenceProvenance, ExecutionPermit,
+    MAX_TOOL_FOOTPRINT_RESOURCES, PreparedAction, ToolDefinition, ToolEffect, ToolExecutionContext,
+    ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
 };
 pub use workflow::{
     MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES, MAX_WORKFLOW_RELEVANT_FILES,

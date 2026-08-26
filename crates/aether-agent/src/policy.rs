@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 
 use aether_core::{
-    CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind, LineRange,
-    ObservedFileState, ToolCallId, ToolResult, WorkflowPhase, WorkflowVerification, WorkspacePath,
-    analyze_command,
+    ActionClassification, CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind,
+    LineRange, ObservedFileState, PreparedAction, ToolCallId, ToolResult, WorkflowPhase,
+    WorkflowVerification, WorkspacePath, analyze_command,
 };
 use serde_json::Value;
 
@@ -43,44 +43,48 @@ pub struct AutonomousCodingPolicy {
     guardrails: LoopGuardrails,
     candidate_key: Option<[u8; 16]>,
     planner: RepositoryActionPlanner,
+    optimizations_enabled: bool,
 }
 
 impl AutonomousCodingPolicy {
     /// Construct a fresh per-turn policy. Persisted decision state lives in the context snapshot.
     pub fn new() -> Self {
-        Self::default()
+        Self { optimizations_enabled: true, ..Self::default() }
     }
 
-    /// Build one bounded physical plan for a compatible batch of read-only model calls.
-    pub(crate) fn repository_plan_for_calls(
+    pub(crate) fn set_optimizations_enabled(&mut self, enabled: bool) {
+        self.optimizations_enabled = enabled;
+    }
+
+    /// Build a plan from already-normalized actions without reparsing permission or footprint data.
+    pub(crate) fn repository_plan_for_actions(
         &self,
         snapshot: &ContextSnapshot,
-        calls: &[(ToolCallId, String, Value)],
+        actions: &[PreparedAction],
     ) -> Option<RepositoryActionPlan> {
-        if calls.is_empty() || calls.len() > 8 {
+        if !self.optimizations_enabled {
             return None;
         }
-        let mut plans = Vec::with_capacity(calls.len());
+        if actions.is_empty() || actions.len() > 8 {
+            return None;
+        }
+        let mut plans = Vec::with_capacity(actions.len());
         let mut read_targets = Vec::new();
         let mut saw_read = false;
-        for (_, name, input) in calls {
-            if self.guardrails.has_cached_observation(
-                name,
-                input,
-                snapshot.workflow.workspace_revision,
-            ) {
+        for action in actions {
+            if self.guardrails.has_cached_prepared(action, snapshot.workflow.workspace_revision) {
                 return None;
             }
-            match name.as_str() {
+            match action.tool.as_str() {
                 "search" => {
-                    plans.push(self.repository_search_plan(snapshot, input)?);
+                    plans.push(self.repository_search_plan(snapshot, &action.normalized_input)?)
                 }
                 "read" => {
                     saw_read = true;
-                    if input.get("max_bytes").is_some() {
+                    if action.normalized_input.get("max_bytes").is_some() {
                         return None;
                     }
-                    let files = input.get("files")?.as_array()?;
+                    let files = action.normalized_input.get("files")?.as_array()?;
                     if files.is_empty() || files.len() > 64 {
                         return None;
                     }
@@ -103,6 +107,28 @@ impl AutonomousCodingPolicy {
             plans.push(self.planner.plan_read_targets(snapshot, &read_targets));
         }
         self.planner.coalesce(&plans)
+    }
+
+    #[cfg(test)]
+    fn repository_plan_for_calls(
+        &self,
+        snapshot: &ContextSnapshot,
+        calls: &[(ToolCallId, String, Value)],
+    ) -> Option<RepositoryActionPlan> {
+        let actions = calls
+            .iter()
+            .map(|(call_id, name, input)| {
+                PreparedAction::fallback(
+                    aether_core::ToolInvocation {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    },
+                    aether_core::PermissionClass::ReadOnly,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.repository_plan_for_actions(snapshot, &actions)
     }
 
     fn repository_search_plan(
@@ -139,6 +165,20 @@ impl AutonomousCodingPolicy {
             .or_else(|| self.mutation_preflight(snapshot, call_id, name, input))
     }
 
+    /// Run policy checks against the normalized action shared by scheduler and executor.
+    pub(crate) fn preflight_prepared(
+        &self,
+        snapshot: &ContextSnapshot,
+        action: &PreparedAction,
+    ) -> Option<ToolResult> {
+        self.optimizations_enabled
+            .then(|| {
+                self.guardrails.preflight_prepared(action, snapshot.workflow.workspace_revision)
+            })
+            .flatten()
+            .or_else(|| self.mutation_preflight_prepared(snapshot, action))
+    }
+
     /// Fold one completed observation into the shared context and decision state.
     pub fn observe(
         &mut self,
@@ -154,6 +194,40 @@ impl AutonomousCodingPolicy {
         self.refresh_candidates(engine);
         let after = WorkflowObservation::from(&engine.snapshot().workflow);
         let guard_feedback = self.guardrails.observe_snapshot(name, input, result, &before, &after);
+        let advanced = before != after;
+        let decision = &mut engine.snapshot_mut().workflow.decision;
+        decision.note_observation_value(advanced && executed);
+        if decision.low_value_observations >= 3 {
+            decision.set_next(
+                DecisionAction::Escalate,
+                None::<&str>,
+                "repeated observations did not add evidence; change scope or arguments",
+            );
+        } else {
+            self.update_next_action(engine);
+        }
+        let action_feedback = self.compact_feedback(engine.snapshot());
+        Some(match guard_feedback {
+            Some(feedback) => format!("{feedback}\n{action_feedback}"),
+            None => action_feedback,
+        })
+    }
+
+    /// Fold one prepared action without reconstructing its invocation or command classification.
+    pub(crate) fn observe_prepared(
+        &mut self,
+        engine: &mut ContextEngine,
+        action: &PreparedAction,
+        result: &ToolResult,
+        executed: bool,
+    ) -> Option<String> {
+        let before = WorkflowObservation::from(&engine.snapshot().workflow);
+        engine.observe_prepared(action, result);
+        self.update_evidence_prepared(engine, action, result, executed);
+        self.refresh_candidates(engine);
+        let after = WorkflowObservation::from(&engine.snapshot().workflow);
+        let guard_feedback =
+            self.guardrails.observe_snapshot_prepared(action, result, &before, &after);
         let advanced = before != after;
         let decision = &mut engine.snapshot_mut().workflow.decision;
         decision.note_observation_value(advanced && executed);
@@ -429,6 +503,22 @@ impl AutonomousCodingPolicy {
         ))
     }
 
+    fn mutation_preflight_prepared(
+        &self,
+        snapshot: &ContextSnapshot,
+        action: &PreparedAction,
+    ) -> Option<ToolResult> {
+        if !matches!(action.classification, ActionClassification::Mutation) {
+            return None;
+        }
+        self.mutation_preflight(
+            snapshot,
+            action.call_id.clone(),
+            &action.tool,
+            &action.normalized_input,
+        )
+    }
+
     fn update_evidence(
         &self,
         engine: &mut ContextEngine,
@@ -489,6 +579,16 @@ impl AutonomousCodingPolicy {
                 decision.record_modified_scope(path);
             }
         }
+    }
+
+    fn update_evidence_prepared(
+        &self,
+        engine: &mut ContextEngine,
+        action: &PreparedAction,
+        result: &ToolResult,
+        executed: bool,
+    ) {
+        self.update_evidence(engine, &action.tool, &action.normalized_input, result, executed);
     }
 
     fn update_next_action(&self, engine: &mut ContextEngine) {

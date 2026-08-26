@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aether_core::tools::ToolFuture;
 use aether_core::{
-    BoundedText, PermissionClass, PermissionEngine, PermissionRequest, ToolDefinition, ToolEffect,
-    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
-    WorkspacePath, analyze_command,
+    ActionClassification, ActionRequirements, BoundedText, PermissionClass, PermissionEngine,
+    PermissionRequest, PreparedAction, ToolDefinition, ToolEffect, ToolExecutionContext,
+    ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult, WorkspacePath,
+    analyze_command,
 };
 use serde_json::json;
 
@@ -15,7 +16,20 @@ pub const TOOL_NAMES: [&str; 9] =
 
 pub struct ToolRegistry {
     workspace: Arc<Workspace>,
-    definitions: Vec<ToolDefinition>,
+    definitions: &'static [ToolDefinition],
+}
+
+#[derive(Clone)]
+enum PreparedToolInput {
+    Read(crate::ReadInput),
+    List(crate::ListInput),
+    Find(crate::FindInput),
+    Search(crate::SearchInput),
+    Write(crate::WriteInput),
+    Patch(crate::PatchInput),
+    Shell(crate::ShellInput),
+    Process(crate::ProcessInput),
+    Git(crate::GitInput),
 }
 
 impl ToolRegistry {
@@ -42,7 +56,47 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
-        &self.definitions
+        self.definitions
+    }
+
+    /// Parse and classify a model call exactly once at the tool boundary.
+    pub fn prepare_action(&self, invocation: ToolInvocation) -> PreparedAction {
+        let permission = self.definition_permission(&invocation.name);
+        let mut action = PreparedAction::fallback(invocation, permission);
+        let parsed = parse_prepared_input(&action.tool, &action.normalized_input);
+        if let Some(parsed) = parsed {
+            let command_effects = command_effects_for_input(&parsed);
+            action.permission_request =
+                permission_request_for_input(&action.call_id, &action.tool, permission, &parsed);
+            let classification = command_effects
+                .as_ref()
+                .map_or_else(|| classification_for_input(&parsed), classification_for_command);
+            action.command_effects = command_effects;
+            action.effects = action.command_effects.as_ref().map_or_else(
+                || footprint_for_input(&parsed),
+                aether_core::CommandEffects::footprint,
+            );
+            action.paths = action.command_effects.as_ref().map_or_else(
+                || paths_for_input(&parsed),
+                |effects| effects.paths.iter().chain(effects.manifests.iter()).cloned().collect(),
+            );
+            action.classification = classification;
+            action.requirements = ActionRequirements {
+                permission,
+                user_authorization: action.permission_request.is_some(),
+                current_workspace_evidence: classification == ActionClassification::Mutation,
+            };
+            return action.with_typed_input(parsed);
+        }
+
+        // Invalid input remains conservative and gets the old bounded diagnostic path.
+        action.permission_request = self.permission_request(&ToolInvocation {
+            call_id: action.call_id.clone(),
+            name: action.tool.clone(),
+            input: action.normalized_input.clone(),
+        });
+        action.requirements.user_authorization = action.permission_request.is_some();
+        action
     }
 
     pub async fn dispatch(&self, invocation: ToolInvocation) -> ToolResult {
@@ -80,6 +134,58 @@ impl ToolRegistry {
                 self.workspace.max_output_bytes(),
             ),
         }
+    }
+
+    async fn dispatch_prepared(
+        &self,
+        action: PreparedAction,
+        context: ToolExecutionContext,
+    ) -> ToolResult {
+        let call_id = action.call_id.clone();
+        let fallback = ToolInvocation {
+            call_id: action.call_id.clone(),
+            name: action.tool.clone(),
+            input: action.normalized_input.clone(),
+        };
+        let Some(parsed) = action.into_typed_input::<PreparedToolInput>() else {
+            return self.dispatch_with_context(fallback, context).await;
+        };
+        match parsed {
+            PreparedToolInput::Read(input) => {
+                read::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::List(input) => {
+                list::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Find(input) => {
+                find::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Search(input) => {
+                search::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Write(input) => {
+                write::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Patch(input) => {
+                patch::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Shell(input) => {
+                shell::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Process(input) => {
+                process::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+            PreparedToolInput::Git(input) => {
+                git::execute_parsed(&self.workspace, call_id, input, context).await
+            }
+        }
+    }
+
+    fn definition_permission(&self, name: &str) -> PermissionClass {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .map_or(PermissionClass::ReadOnly, |definition| definition.permission)
     }
 
     fn context_for(
@@ -166,6 +272,196 @@ impl ToolRegistry {
     }
 }
 
+fn parse_prepared_input(tool: &str, input: &serde_json::Value) -> Option<PreparedToolInput> {
+    match tool {
+        "read" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Read),
+        "list" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::List),
+        "find" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Find),
+        "search" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Search),
+        "write" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Write),
+        "patch" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Patch),
+        "shell" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Shell),
+        "process" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Process),
+        "git" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Git),
+        _ => None,
+    }
+}
+
+fn permission_request_for_input(
+    call_id: &aether_core::ToolCallId,
+    tool: &str,
+    permission: PermissionClass,
+    input: &PreparedToolInput,
+) -> Option<PermissionRequest> {
+    if permission == PermissionClass::ReadOnly {
+        return None;
+    }
+    let details = match input {
+        PreparedToolInput::Write(input) => serde_json::json!({
+            "path": bounded_detail(&input.path),
+            "bytes": input.content.len(),
+            "create_only": input.create_only.unwrap_or(false),
+            "precondition_present": input.expected_hash.is_some()
+        }),
+        PreparedToolInput::Patch(input) => serde_json::json!({
+            "files": input.files.iter().map(|file| serde_json::json!({
+                "path": bounded_detail(&file.path),
+                "hunks": file.hunks.len(),
+                "precondition_present": file.expected_hash.is_some()
+            })).collect::<Vec<_>>(),
+            "dry_run": input.dry_run.unwrap_or(false)
+        }),
+        PreparedToolInput::Shell(input) => serde_json::json!({
+            "program": bounded_detail(&input.program),
+            "arguments": bounded_arguments(input.args.clone().unwrap_or_default()),
+            "cwd": bounded_detail(input.cwd.as_deref().unwrap_or("."))
+        }),
+        PreparedToolInput::Process(input) => serde_json::json!({
+            "operation": &input.operation,
+            "program": input.program.as_deref().map(bounded_detail),
+            "arguments": bounded_arguments(input.args.clone().unwrap_or_default()),
+            "cwd": input.cwd.as_deref().map(bounded_detail),
+            "process_id": input.process_id,
+            "bytes": input.data.as_ref().map_or(0, String::len)
+        }),
+        _ => serde_json::json!({"input": "structured details unavailable"}),
+    };
+    Some(PermissionRequest {
+        call_id: call_id.clone(),
+        tool: tool.to_owned(),
+        class: permission,
+        operation: tool.to_owned(),
+        target: details.get("path").and_then(serde_json::Value::as_str).map(str::to_owned),
+        details,
+    })
+}
+
+fn classification_for_input(input: &PreparedToolInput) -> ActionClassification {
+    match input {
+        PreparedToolInput::Read(_)
+        | PreparedToolInput::List(_)
+        | PreparedToolInput::Find(_)
+        | PreparedToolInput::Search(_)
+        | PreparedToolInput::Git(_) => ActionClassification::Read,
+        PreparedToolInput::Write(_) | PreparedToolInput::Patch(_) => ActionClassification::Mutation,
+        PreparedToolInput::Shell(input) => classification_for_command(&analyze_command(
+            &input.program,
+            input.args.as_deref().unwrap_or(&[]),
+            input.cwd.as_deref().unwrap_or(""),
+        )),
+        PreparedToolInput::Process(input) => match &input.operation {
+            crate::ProcessOperation::Read | crate::ProcessOperation::Status => {
+                ActionClassification::Read
+            }
+            crate::ProcessOperation::Start => classification_for_command(&analyze_command(
+                input.program.as_deref().unwrap_or(""),
+                input.args.as_deref().unwrap_or(&[]),
+                input.cwd.as_deref().unwrap_or(""),
+            )),
+            crate::ProcessOperation::Write
+            | crate::ProcessOperation::Signal
+            | crate::ProcessOperation::Kill => ActionClassification::Mutation,
+        },
+    }
+}
+
+fn command_effects_for_input(input: &PreparedToolInput) -> Option<aether_core::CommandEffects> {
+    match input {
+        PreparedToolInput::Shell(input) => Some(analyze_command(
+            &input.program,
+            input.args.as_deref().unwrap_or(&[]),
+            input.cwd.as_deref().unwrap_or(""),
+        )),
+        PreparedToolInput::Process(input)
+            if matches!(&input.operation, crate::ProcessOperation::Start) =>
+        {
+            Some(analyze_command(
+                input.program.as_deref().unwrap_or(""),
+                input.args.as_deref().unwrap_or(&[]),
+                input.cwd.as_deref().unwrap_or(""),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn classification_for_command(effects: &aether_core::CommandEffects) -> ActionClassification {
+    if effects.class.is_verification() {
+        ActionClassification::Verification
+    } else if effects.mutates_workspace() {
+        ActionClassification::Mutation
+    } else if effects.class.is_read_only() {
+        ActionClassification::Read
+    } else {
+        ActionClassification::Other
+    }
+}
+
+fn paths_for_input(input: &PreparedToolInput) -> Vec<String> {
+    match input {
+        PreparedToolInput::Read(input) => {
+            input.files.iter().map(|file| file.path.clone()).collect()
+        }
+        PreparedToolInput::List(input) => input.path.clone().into_iter().collect(),
+        PreparedToolInput::Find(input) => input.path.clone().into_iter().collect(),
+        PreparedToolInput::Search(input) => input.path.clone().into_iter().collect(),
+        PreparedToolInput::Write(input) => vec![input.path.clone()],
+        PreparedToolInput::Patch(input) => {
+            input.files.iter().map(|file| file.path.clone()).collect()
+        }
+        PreparedToolInput::Shell(input) => {
+            let effects = analyze_command(
+                &input.program,
+                input.args.as_deref().unwrap_or(&[]),
+                input.cwd.as_deref().unwrap_or(""),
+            );
+            effects.paths.into_iter().chain(effects.manifests).collect()
+        }
+        PreparedToolInput::Process(input) => match &input.operation {
+            crate::ProcessOperation::Start => {
+                analyze_command(
+                    input.program.as_deref().unwrap_or(""),
+                    input.args.as_deref().unwrap_or(&[]),
+                    input.cwd.as_deref().unwrap_or(""),
+                )
+                .paths
+            }
+            _ => Vec::new(),
+        },
+        PreparedToolInput::Git(input) => input.path.clone().into_iter().collect(),
+    }
+}
+
+fn footprint_for_input(input: &PreparedToolInput) -> ToolFootprint {
+    match input {
+        PreparedToolInput::Read(input) => {
+            workspace_read_footprint(input.files.iter().map(|file| file.path.clone()))
+        }
+        PreparedToolInput::List(input) => workspace_read_footprint(std::iter::once(
+            input.path.clone().unwrap_or_else(|| ".".to_owned()),
+        )),
+        PreparedToolInput::Find(input) => workspace_read_footprint(std::iter::once(
+            input.path.clone().unwrap_or_else(|| ".".to_owned()),
+        )),
+        PreparedToolInput::Search(input) => workspace_read_footprint(std::iter::once(
+            input.path.clone().unwrap_or_else(|| ".".to_owned()),
+        )),
+        PreparedToolInput::Git(input) => workspace_read_footprint(std::iter::once(
+            input.path.clone().unwrap_or_else(|| ".".to_owned()),
+        )),
+        PreparedToolInput::Write(_) | PreparedToolInput::Patch(_) => {
+            ToolFootprint::exclusive_workspace()
+        }
+        PreparedToolInput::Shell(input) => analyze_command(
+            &input.program,
+            input.args.as_deref().unwrap_or(&[]),
+            input.cwd.as_deref().unwrap_or(""),
+        )
+        .footprint(),
+        PreparedToolInput::Process(input) => process_footprint(input),
+    }
+}
+
 fn bounded_detail(value: &str) -> String {
     BoundedText::new(value, 512).into_string()
 }
@@ -185,7 +481,11 @@ fn bounded_arguments(arguments: Vec<String>) -> Vec<String> {
 
 impl ToolExecutor for ToolRegistry {
     fn definitions(&self) -> &[ToolDefinition] {
-        &self.definitions
+        self.definitions
+    }
+
+    fn prepare(&self, invocation: ToolInvocation) -> PreparedAction {
+        self.prepare_action(invocation)
     }
 
     fn permission_request(&self, invocation: &ToolInvocation) -> Option<PermissionRequest> {
@@ -252,6 +552,14 @@ impl ToolExecutor for ToolRegistry {
     ) -> ToolFuture<'a> {
         Box::pin(async move { self.dispatch_with_context(invocation, context).await })
     }
+
+    fn execute_prepared<'a>(
+        &'a self,
+        action: PreparedAction,
+        context: ToolExecutionContext,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move { self.dispatch_prepared(action, context).await })
+    }
 }
 
 fn workspace_read_footprint(paths: impl IntoIterator<Item = String>) -> ToolFootprint {
@@ -300,8 +608,11 @@ fn process_footprint(input: &crate::ProcessInput) -> ToolFootprint {
     }
 }
 
-fn definitions() -> Vec<ToolDefinition> {
-    vec![
+fn definitions() -> &'static [ToolDefinition] {
+    static DEFINITIONS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    DEFINITIONS
+        .get_or_init(|| {
+            vec![
         ToolDefinition {
             name: "read".to_owned(),
             description: "Read targeted workspace file ranges. Do not reread unchanged inspected files; prefer line ranges over whole files.".to_owned(),
@@ -478,7 +789,9 @@ fn definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
-    ]
+            ]
+        })
+        .as_slice()
 }
 
 #[cfg(test)]

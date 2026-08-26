@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-25 (2) - Single-pass action execution and real eval gates
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added a real offline Agent end-to-end evaluation path with filesystem fixtures, deterministic
+  model traces, before/after metrics, verification outcomes, and success@1 regression gates.
+- Added a single prepared-action contract carrying normalized input, binary identity, typed
+  effects, authority requirements, paths, provenance, and mutation/verification classification.
+- Added packed Git inventory storage for 100k-file repositories and a shared bounded
+  `ProcessRuntime` policy for finite commands and persistent stream reads.
+
+### Changed
+
+- Reused prepared typed inputs across policy, guardrails, scheduling, context observation, and
+  execution; planner observations now expose compact model text while retaining structured data.
+- Scheduler selection now continues past blocked conflicts so independent ready calls can run.
+- Runtime eval accounting now reports model requests, requested/executed/prevented calls, bytes,
+  process spawns, verification attempts, wall/CPU time, RSS, allocation probes, and token usage.
+
+### Security
+
+- Mutation admission remains bound to current inspected evidence and expected content hashes;
+  action provenance is model-scoped and cannot convert tool output into user authorization.
+
 ## Unreleased - 2026-08-25 (1) - Evidence-gated adaptive coding loop
 
 > Status: unreleased work. No artifact has been published.

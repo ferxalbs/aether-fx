@@ -23,6 +23,13 @@ terminal input → aether-agent → ModelBackend → aether-rainy → Rainy SDK 
 agent events ───────────────────────────────────────→ aether-terminal
 ```
 
+Every model tool event becomes one `PreparedAction` at the registry boundary. It carries the
+normalized typed input, stable binary fingerprint, bounded resource footprint, action class,
+permission/authority requirements, normalized paths, command effects, and model provenance. Policy,
+guardrails, scheduling, mutation admission, context observation, and execution consume that same
+record; typed registry dispatch reuses its parsed input instead of deserializing it again. Invalid
+inputs remain conservative and use the compatibility path.
+
 The live interactive shape is:
 
 ```text
@@ -43,6 +50,7 @@ blocking filesystem pool
   ├── write/patch preparation and staged replacement
   └── weak per-destination mutation locks
 process subsystem
+  ├── shared ProcessRuntime output/deadline bounds for finite and persistent modes
   ├── short registry lookup lock
   ├── independent stdin/stdout/stderr state
   ├── bounded continuously-drained output buffers
@@ -57,7 +65,11 @@ Rainy adapter
 
 `aether-rainy` is the only crate that imports `rainy_sdk`. It maps the SDK's dynamic Responses stream values into AETHER `ModelEvent` values and treats provider reasoning metadata as opaque continuation data. A successful `ModelEvent::Done` requires a verified `response.completed` event and a response identity; failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No provider endpoint, model catalog, or key appears elsewhere.
 
-`aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Process handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
+`aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
+
+Repository inventory discovery packs all Git paths into one UTF-8 slab with 32-bit ranges. Only
+bounded selected metadata is promoted to `PathBuf`s, so a 100k-file repository does not create
+100k transient path allocations and the model-facing map remains capped by `RepoMapLimits`.
 
 `aether-terminal` owns raw input, restoration, ANSI/VT presentation, incremental buffer rendering, and platform modules. Tools and agent code never write ANSI.
 

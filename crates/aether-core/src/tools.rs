@@ -1,12 +1,235 @@
-use std::future::Future;
-use std::pin::Pin;
+use std::{any::Any, fmt, future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BoundedText, CancellationFlag, CoreError, CoreResult, PermissionClass, ToolCallId};
+use crate::{
+    BoundedText, CancellationFlag, CommandEffects, CoreError, CoreResult, PermissionClass,
+    PermissionRequest, ToolCallId,
+};
 
 /// Maximum number of explicitly tracked resources in one tool footprint.
 pub const MAX_TOOL_FOOTPRINT_RESOURCES: usize = 64;
+
+/// The bounded semantic class shared by policy, scheduling, and loop guardrails.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActionClassification {
+    /// A read-only observation of the workspace or a process.
+    Read,
+    /// A workspace or process mutation.
+    Mutation,
+    /// A command whose result is used as verification evidence.
+    Verification,
+    /// An action whose effect cannot be classified more narrowly.
+    #[default]
+    Other,
+}
+
+/// The authority boundary required before a prepared action may execute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionRequirements {
+    /// Typed permission class required by the tool implementation.
+    pub permission: PermissionClass,
+    /// Whether an external/user permission decision is required.
+    pub user_authorization: bool,
+    /// Whether current workspace evidence and an exact precondition are required.
+    pub current_workspace_evidence: bool,
+}
+
+/// Provenance of information used to produce a prepared action or observation.
+///
+/// Model-originated actions remain model-originated even when their arguments quote tool,
+/// repository, or network output. Only an explicit user decision can satisfy user authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvidenceProvenance {
+    User,
+    Repository,
+    ToolOutput,
+    Network,
+    #[default]
+    Model,
+}
+
+/// One model tool call normalized once for all local decision and execution paths.
+///
+/// `normalized_input` is retained as the one structured representation crossing the generic
+/// agent boundary. Tool implementations may attach their typed parse through `with_typed_input`
+/// so execution does not deserialize the same JSON a second time.
+pub struct PreparedAction {
+    pub call_id: ToolCallId,
+    pub tool: String,
+    pub normalized_input: serde_json::Value,
+    pub fingerprint: [u8; 16],
+    pub effects: ToolFootprint,
+    pub requirements: ActionRequirements,
+    pub paths: Vec<String>,
+    pub classification: ActionClassification,
+    pub provenance: EvidenceProvenance,
+    pub permission_request: Option<PermissionRequest>,
+    pub command_effects: Option<CommandEffects>,
+    typed_input: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for PreparedAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAction")
+            .field("call_id", &self.call_id)
+            .field("tool", &self.tool)
+            .field("normalized_input", &self.normalized_input)
+            .field("fingerprint", &self.fingerprint)
+            .field("effects", &self.effects)
+            .field("requirements", &self.requirements)
+            .field("paths", &self.paths)
+            .field("classification", &self.classification)
+            .field("provenance", &self.provenance)
+            .field("permission_request", &self.permission_request)
+            .field("command_effects", &self.command_effects)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for PreparedAction {
+    fn clone(&self) -> Self {
+        Self {
+            call_id: self.call_id.clone(),
+            tool: self.tool.clone(),
+            normalized_input: self.normalized_input.clone(),
+            fingerprint: self.fingerprint,
+            effects: self.effects.clone(),
+            requirements: self.requirements,
+            paths: self.paths.clone(),
+            classification: self.classification,
+            provenance: self.provenance,
+            permission_request: self.permission_request.clone(),
+            command_effects: self.command_effects.clone(),
+            typed_input: self.typed_input.clone(),
+        }
+    }
+}
+
+impl PreparedAction {
+    /// Construct a conservative action when a tool does not provide typed preparation.
+    pub fn fallback(invocation: ToolInvocation, permission: PermissionClass) -> Self {
+        let fingerprint = fingerprint(&invocation.name, &invocation.input);
+        let classification = match permission {
+            PermissionClass::ReadOnly => ActionClassification::Read,
+            _ => ActionClassification::Mutation,
+        };
+        let paths = fallback_paths(&invocation.input);
+        Self {
+            call_id: invocation.call_id,
+            tool: invocation.name,
+            normalized_input: invocation.input,
+            fingerprint,
+            effects: ToolFootprint::unknown(),
+            requirements: ActionRequirements {
+                permission,
+                user_authorization: permission != PermissionClass::ReadOnly,
+                current_workspace_evidence: classification == ActionClassification::Mutation,
+            },
+            paths,
+            classification,
+            provenance: EvidenceProvenance::Model,
+            permission_request: None,
+            command_effects: None,
+            typed_input: None,
+        }
+    }
+
+    /// Attach a provider-owned typed input without adding another structured serialization.
+    pub fn with_typed_input<T: Any + Send + Sync>(mut self, input: T) -> Self {
+        self.typed_input = Some(Arc::new(input));
+        self
+    }
+
+    /// Borrow the typed input attached by a tool registry.
+    pub fn typed_input<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.typed_input.as_ref()?.downcast_ref()
+    }
+
+    /// Reuse the registry-owned typed input for execution, moving it when uniquely owned and
+    /// otherwise cloning only the already-parsed representation.
+    pub fn into_typed_input<T: Any + Send + Sync + Clone>(self) -> Option<T> {
+        let typed = self.typed_input?;
+        Arc::downcast::<T>(typed)
+            .ok()
+            .map(|typed| Arc::try_unwrap(typed).unwrap_or_else(|typed| (*typed).clone()))
+    }
+
+    /// Convert the prepared action back to the compatibility invocation boundary.
+    pub fn into_invocation(self) -> ToolInvocation {
+        ToolInvocation { call_id: self.call_id, name: self.tool, input: self.normalized_input }
+    }
+}
+
+fn fingerprint(tool: &str, value: &serde_json::Value) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(tool.as_bytes());
+    hash_value(&mut hasher, value);
+    let hash = hasher.finalize();
+    let mut result = [0; 16];
+    result.copy_from_slice(&hash.as_bytes()[..16]);
+    result
+}
+
+fn fallback_paths(value: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = value.get("path").and_then(serde_json::Value::as_str) {
+        paths.push(path.to_owned());
+    }
+    if let Some(files) = value.get("files").and_then(serde_json::Value::as_array) {
+        for path in
+            files.iter().filter_map(|file| file.get("path")).filter_map(|path| path.as_str())
+        {
+            if paths.len() == MAX_TOOL_FOOTPRINT_RESOURCES {
+                break;
+            }
+            paths.push(path.to_owned());
+        }
+    }
+    paths
+}
+
+fn hash_value(hasher: &mut blake3::Hasher, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => {
+            hasher.update(b"null");
+        }
+        serde_json::Value::Bool(value) => {
+            hasher.update(if *value { b"true" } else { b"false" });
+        }
+        serde_json::Value::Number(value) => {
+            hasher.update(b"number");
+            hash_bytes(hasher, value.to_string().as_bytes());
+        }
+        serde_json::Value::String(value) => {
+            hasher.update(b"string");
+            hash_bytes(hasher, value.as_bytes());
+        }
+        serde_json::Value::Array(values) => {
+            hasher.update(b"array");
+            hasher.update(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                hash_value(hasher, value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            hasher.update(b"object");
+            hasher.update(&(values.len() as u64).to_le_bytes());
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                hash_bytes(hasher, key.as_bytes());
+                hash_value(hasher, &values[key]);
+            }
+        }
+    }
+}
+
+fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
 
 /// A resource that a tool may inspect or mutate.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -304,6 +527,25 @@ pub trait ToolExecutor: Send + Sync {
     /// Return the exact model-visible registry.
     fn definitions(&self) -> &[ToolDefinition];
 
+    /// Normalize one model call once before policy, scheduling, or execution.
+    fn prepare(&self, invocation: ToolInvocation) -> PreparedAction {
+        let permission = self
+            .definitions()
+            .iter()
+            .find(|definition| definition.name == invocation.name)
+            .map_or(PermissionClass::ReadOnly, |definition| definition.permission);
+        let effects = self.footprint(&invocation);
+        let mut action = PreparedAction::fallback(invocation, permission);
+        action.effects = effects;
+        action.permission_request = self.permission_request(&ToolInvocation {
+            call_id: action.call_id.clone(),
+            name: action.tool.clone(),
+            input: action.normalized_input.clone(),
+        });
+        action.requirements.user_authorization = action.permission_request.is_some();
+        action
+    }
+
     /// Build a structured permission request for calls that are not read-only.
     fn permission_request(&self, invocation: &ToolInvocation) -> Option<crate::PermissionRequest>;
 
@@ -321,6 +563,23 @@ pub trait ToolExecutor: Send + Sync {
         invocation: ToolInvocation,
         context: ToolExecutionContext,
     ) -> ToolFuture<'a>;
+
+    /// Execute a prepared action. Registries with typed preparation can override this to avoid
+    /// deserializing `normalized_input` again; the default preserves the old executor contract.
+    fn execute_prepared<'a>(
+        &'a self,
+        action: PreparedAction,
+        context: ToolExecutionContext,
+    ) -> ToolFuture<'a> {
+        self.execute(
+            ToolInvocation {
+                call_id: action.call_id.clone(),
+                name: action.tool.clone(),
+                input: action.normalized_input.clone(),
+            },
+            context,
+        )
+    }
 }
 
 #[cfg(test)]

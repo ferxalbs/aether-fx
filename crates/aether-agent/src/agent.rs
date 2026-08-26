@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::context::{ContextEngine, capture_git_snapshot};
 use crate::planner::RepositoryActionPlan;
-use crate::scheduler::{ScheduledToolResult, ToolCallGate, execute_tool_calls_with_gate};
+use crate::scheduler::{ScheduledToolResult, ToolCallGate};
 use crate::{
     AutonomousCodingPolicy, BackendError, CancellationToken, ModelBackend, NoPermissionBroker,
     PermissionBroker,
@@ -44,6 +44,13 @@ pub struct AgentRequest {
     /// Collect structured execution metrics for this turn.
     #[serde(default)]
     pub metrics: bool,
+    /// Enable deterministic local planning and redundant-observation suppression.
+    #[serde(default = "default_true")]
+    pub optimize: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl AgentRequest {
@@ -59,6 +66,7 @@ impl AgentRequest {
             workspace_root: None,
             context_seed: None,
             metrics: false,
+            optimize: true,
         }
     }
 }
@@ -85,6 +93,7 @@ pub struct AgentRunResult {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentMetrics {
     pub model_steps: u64,
+    pub model_requests: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -92,6 +101,7 @@ pub struct AgentMetrics {
     pub executed_tool_calls: u64,
     pub prevented_calls: u64,
     pub context_bytes: u64,
+    pub bytes_shown_to_model: u64,
     pub bytes_read: u64,
     pub verification_attempts: u64,
     /// Smallest verification scope selected by the deterministic policy, when known.
@@ -103,6 +113,12 @@ pub struct AgentMetrics {
     pub planner_aborted_ambiguity: u64,
     pub planner_actions: u64,
     pub planner_bytes_read: u64,
+    pub process_spawns: u64,
+    pub wall_time_ms: u64,
+    /// Platform-specific RSS/allocation probes are zero when unavailable.
+    pub peak_rss_bytes: u64,
+    pub allocation_count: u64,
+    pub cpu_time_ms: u64,
 }
 
 struct MetricsState {
@@ -124,6 +140,7 @@ impl MetricsState {
         self.value.provider_wait_ms = duration_ms(self.provider_wait);
         self.value.local_execution_ms =
             duration_ms(self.started.elapsed().saturating_sub(self.provider_wait));
+        self.value.wall_time_ms = duration_ms(self.started.elapsed());
         self.value
     }
 }
@@ -156,6 +173,7 @@ pub struct Agent<B, T> {
     backend: Arc<B>,
     tools: Arc<T>,
     tool_definitions: Arc<Vec<aether_core::ToolDefinition>>,
+    tool_definition_bytes: u64,
     context: Mutex<ContextEngine>,
 }
 
@@ -167,10 +185,13 @@ where
     /// Compose one backend and one tool executor.
     pub fn new(backend: B, tools: T) -> Self {
         let tool_definitions = Arc::new(tools.definitions().to_vec());
+        let tool_definition_bytes =
+            serde_json::to_vec(tool_definitions.as_ref()).map_or(0, |value| value.len() as u64);
         Self {
             backend: Arc::new(backend),
             tools: Arc::new(tools),
             tool_definitions,
+            tool_definition_bytes,
             context: Mutex::new(ContextEngine::new(String::new(), None)),
         }
     }
@@ -213,6 +234,7 @@ where
         }
         let mut continuation = request.continuation.clone();
         let mut policy = AutonomousCodingPolicy::new();
+        policy.set_optimizations_enabled(request.optimize);
         self.with_context(|engine| policy.refresh_candidates(engine));
         let mut input =
             assemble_user_input(&request.prompt, self.context_packet(continuation.is_some()));
@@ -230,6 +252,29 @@ where
                 return Err(AgentError::Cancelled);
             }
             if steps >= request.max_steps {
+                let diagnostic = self.with_context(|engine| {
+                    let workflow = &engine.snapshot().workflow;
+                    format!(
+                        "agent step limit: phase={} verification={} failures={:?} relevant={} modified={} steps={}",
+                        workflow.phase.as_str(),
+                        workflow.verification.as_str(),
+                        workflow
+                            .unresolved_failures
+                            .iter()
+                            .map(|failure| failure.key.as_str())
+                            .collect::<Vec<_>>(),
+                        workflow.relevant_files.len(),
+                        workflow.progress.mutations,
+                        workflow.progress.verifications,
+                    )
+                });
+                let _ = send_event(
+                    &events,
+                    AgentEvent::Error {
+                        message: BoundedText::new(diagnostic, DEFAULT_MAX_OUTPUT_BYTES),
+                    },
+                )
+                .await;
                 return Err(AgentError::StepLimit);
             }
             steps = steps.saturating_add(1);
@@ -246,9 +291,15 @@ where
             };
             if let Some(metrics) = &mut metrics {
                 metrics.value.model_steps = metrics.value.model_steps.saturating_add(1);
-                metrics.value.context_bytes = metrics.value.context_bytes.saturating_add(
-                    serde_json::to_vec(&model_request).map_or(u64::MAX, |value| value.len() as u64),
-                );
+                metrics.value.model_requests = metrics.value.model_requests.saturating_add(1);
+                let input_bytes =
+                    serde_json::to_vec(&input).map_or(u64::MAX, |value| value.len() as u64);
+                metrics.value.context_bytes =
+                    metrics.value.context_bytes.saturating_add(input_bytes);
+                metrics.value.bytes_shown_to_model = metrics
+                    .value
+                    .bytes_shown_to_model
+                    .saturating_add(input_bytes.saturating_add(self.tool_definition_bytes));
             }
             let provider_started = metrics.as_ref().map(|_| Instant::now());
             let backend_future = self.backend.stream_step(model_request);
@@ -352,7 +403,14 @@ where
                 }
             }
 
-            if tool_calls.is_empty() {
+            let prepared_calls = tool_calls
+                .into_iter()
+                .map(|(call_id, name, input)| {
+                    self.tools.prepare(ToolInvocation { call_id, name, input })
+                })
+                .collect::<Vec<_>>();
+
+            if prepared_calls.is_empty() {
                 let complete = self.with_context(|engine| {
                     engine.set_continuation(continuation.clone());
                     policy.finish_turn(engine)
@@ -395,21 +453,14 @@ where
             blocked_completions = 0;
 
             let snapshot = self.current_context();
-            let planner_plan = if tool_calls.iter().all(|(call_id, name, input)| {
-                self.tools
-                    .permission_request(&ToolInvocation {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
+            let planner_plan =
+                if prepared_calls.iter().all(|action| action.permission_request.is_none()) {
+                    self.with_context(|engine| {
+                        policy.repository_plan_for_actions(engine.snapshot(), &prepared_calls)
                     })
-                    .is_none()
-            }) {
-                self.with_context(|engine| {
-                    policy.repository_plan_for_calls(engine.snapshot(), &tool_calls)
-                })
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             if planner_plan.is_some()
                 && let Some(metrics) = &mut metrics
             {
@@ -426,14 +477,20 @@ where
             let completed = if planner_plan.as_ref().is_some_and(RepositoryActionPlan::is_usable) {
                 let plan = planner_plan.expect("usable planner plan is present");
                 match self
-                    .execute_repository_batch(&policy, plan, &tool_calls, &events, &cancellation)
+                    .execute_repository_batch(
+                        &policy,
+                        plan,
+                        &prepared_calls,
+                        &events,
+                        &cancellation,
+                    )
                     .await?
                 {
                     Some(planned) => planned,
                     None => {
-                        execute_tool_calls_with_gate(
+                        crate::scheduler::execute_prepared_tool_calls_with_gate(
                             self.tools.as_ref(),
-                            tool_calls,
+                            prepared_calls,
                             &events,
                             &cancellation,
                             broker,
@@ -443,9 +500,9 @@ where
                     }
                 }
             } else {
-                execute_tool_calls_with_gate(
+                crate::scheduler::execute_prepared_tool_calls_with_gate(
                     self.tools.as_ref(),
-                    tool_calls,
+                    prepared_calls,
                     &events,
                     &cancellation,
                     broker,
@@ -455,20 +512,31 @@ where
             };
             let mut outputs = Vec::with_capacity(completed.len());
             for completed in completed {
-                let name = completed.name;
-                let tool_input = completed.input;
+                let action = completed.action;
                 let result = completed.result;
-                let before_verifications =
-                    self.with_context(|engine| engine.snapshot().workflow.progress.verifications);
                 let feedback = self.with_context(|engine| {
-                    policy.observe(engine, &name, &tool_input, &result, completed.executed)
+                    policy.observe_prepared(engine, &action, &result, completed.executed)
                 });
-                let after_verifications =
-                    self.with_context(|engine| engine.snapshot().workflow.progress.verifications);
                 if let Some(metrics) = &mut metrics {
                     if completed.executed {
                         metrics.value.executed_tool_calls =
                             metrics.value.executed_tool_calls.saturating_add(1);
+                        if action.tool == "shell"
+                            || (action.tool == "process"
+                                && action
+                                    .normalized_input
+                                    .get("operation")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("start"))
+                        {
+                            metrics.value.process_spawns =
+                                metrics.value.process_spawns.saturating_add(1);
+                        }
+                        if action.classification == aether_core::ActionClassification::Verification
+                        {
+                            metrics.value.verification_attempts =
+                                metrics.value.verification_attempts.saturating_add(1);
+                        }
                     } else if !completed.planned {
                         metrics.value.prevented_calls =
                             metrics.value.prevented_calls.saturating_add(1);
@@ -488,12 +556,6 @@ where
                         .value
                         .bytes_read
                         .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
-                    if after_verifications > before_verifications {
-                        metrics.value.verification_attempts = metrics
-                            .value
-                            .verification_attempts
-                            .saturating_add(u64::from(after_verifications - before_verifications));
-                    }
                 }
                 outputs.push(json!({
                     "type": "function_call_output",
@@ -555,7 +617,7 @@ where
         &self,
         policy: &AutonomousCodingPolicy,
         plan: RepositoryActionPlan,
-        calls: &[(ToolCallId, String, serde_json::Value)],
+        calls: &[aether_core::PreparedAction],
         events: &mpsc::Sender<AgentEvent>,
         cancellation: &CancellationToken,
     ) -> Result<Option<Vec<ScheduledToolResult>>, AgentError> {
@@ -587,13 +649,13 @@ where
             }
         };
         let mut completed = Vec::with_capacity(calls.len());
-        let anchor_call_id = calls[0].0.as_str().to_owned();
+        let anchor_call_id = calls[0].call_id.as_str().to_owned();
         for (index, call) in calls.iter().enumerate() {
             let result = if index == 0 {
-                observation.clone().into_tool_result(call.0.clone())
+                observation.clone().into_tool_result(call.call_id.clone())
             } else {
                 ToolResult::success_text(
-                    call.0.clone(),
+                    call.call_id.clone(),
                     format!(
                         "repository planner: this read-only request was coalesced into the bounded observation returned for call {anchor_call_id}"
                     ),
@@ -603,24 +665,29 @@ where
             send_event(
                 events,
                 AgentEvent::ToolStarted {
-                    call_id: call.0.clone(),
-                    name: call.1.clone(),
+                    call_id: call.call_id.clone(),
+                    name: call.tool.clone(),
                     permission: "read_only".to_owned(),
-                    operation: call.1.clone(),
+                    operation: call.tool.clone(),
                     step_id: None,
                 },
             )
             .await?;
             send_event(
                 events,
-                AgentEvent::ToolOutput { call_id: call.0.clone(), output: result.output.clone() },
+                AgentEvent::ToolOutput {
+                    call_id: call.call_id.clone(),
+                    output: result.output.clone(),
+                },
             )
             .await?;
-            send_event(events, AgentEvent::ToolFinished { call_id: call.0.clone(), ok: result.ok })
-                .await?;
+            send_event(
+                events,
+                AgentEvent::ToolFinished { call_id: call.call_id.clone(), ok: result.ok },
+            )
+            .await?;
             completed.push(ScheduledToolResult {
-                name: call.1.clone(),
-                input: call.2.clone(),
+                action: call.clone(),
                 result,
                 executed: true,
                 planned: true,
@@ -676,27 +743,22 @@ struct AgentToolGate<'a> {
 }
 
 impl ToolCallGate for AgentToolGate<'_> {
-    fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult> {
+    fn preflight(&self, action: &aether_core::PreparedAction) -> Option<ToolResult> {
         self.policy
-            .preflight(
-                &self.workflow.snapshot,
-                invocation.call_id.clone(),
-                &invocation.name,
-                &invocation.input,
-            )
-            .or_else(|| self.workflow.preflight(invocation))
+            .preflight_prepared(&self.workflow.snapshot, action)
+            .or_else(|| self.workflow.preflight(action))
     }
 }
 
 impl ToolCallGate for WorkflowMutationGate {
-    fn preflight(&self, invocation: &ToolInvocation) -> Option<ToolResult> {
-        if !matches!(invocation.name.as_str(), "write" | "patch")
-            || mutation_targets_inspected(&self.snapshot, &invocation.name, &invocation.input)
+    fn preflight(&self, action: &aether_core::PreparedAction) -> Option<ToolResult> {
+        if !matches!(action.tool.as_str(), "write" | "patch")
+            || mutation_targets_inspected_prepared(&self.snapshot, action)
         {
             return None;
         }
         Some(ToolResult::failure(
-            invocation.call_id.clone(),
+            action.call_id.clone(),
             "inspection_required",
             "inspect the relevant workspace code before modifying it",
             true,
@@ -705,26 +767,33 @@ impl ToolCallGate for WorkflowMutationGate {
     }
 }
 
-fn mutation_targets_inspected(
+fn mutation_targets_inspected_prepared(
     snapshot: &ContextSnapshot,
-    name: &str,
-    input: &serde_json::Value,
+    action: &aether_core::PreparedAction,
 ) -> bool {
-    match name {
-        "write" => input.get("path").and_then(serde_json::Value::as_str).is_some_and(|path| {
-            target_is_currently_inspected(snapshot, path, input)
+    match action.tool.as_str() {
+        "write" => action.paths.first().is_some_and(|path| {
+            target_is_currently_inspected(snapshot, path, &action.normalized_input)
                 || (WorkspacePath::new(path).is_ok()
-                    && input.get("create_only").and_then(serde_json::Value::as_bool) == Some(true)
+                    && action
+                        .normalized_input
+                        .get("create_only")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
                     && new_target_has_discovered_parent(snapshot, path))
         }),
-        "patch" => input.get("files").and_then(serde_json::Value::as_array).is_some_and(|files| {
-            !files.is_empty()
-                && files.iter().all(|file| {
-                    file.get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|path| target_is_currently_inspected(snapshot, path, file))
-                })
-        }),
+        "patch" => {
+            action.normalized_input.get("files").and_then(serde_json::Value::as_array).is_some_and(
+                |files| {
+                    !files.is_empty()
+                        && files.iter().all(|file| {
+                            file.get("path").and_then(serde_json::Value::as_str).is_some_and(
+                                |path| target_is_currently_inspected(snapshot, path, file),
+                            )
+                        })
+                },
+            )
+        }
         _ => true,
     }
 }
@@ -876,8 +945,11 @@ mod tests {
             name: "write".to_owned(),
             input: json!({"path": "src/lib.rs", "expected_hash": "current"}),
         };
+        let mut action =
+            aether_core::PreparedAction::fallback(invocation, PermissionClass::WorkspaceWrite);
+        action.paths.push("src/lib.rs".to_owned());
         let gate = WorkflowMutationGate { snapshot: ContextSnapshot::new("/workspace", None) };
-        let blocked = gate.preflight(&invocation).expect("uninspected mutation must be blocked");
+        let blocked = gate.preflight(&action).expect("uninspected mutation must be blocked");
         assert_eq!(blocked.error.as_ref().unwrap().code, "inspection_required");
 
         let mut inspected = ContextSnapshot::new("/workspace", None);
@@ -890,7 +962,7 @@ mod tests {
         });
         inspected.workflow.record_relevant_file("src/lib.rs");
         let gate = WorkflowMutationGate { snapshot: inspected };
-        assert!(gate.preflight(&invocation).is_none());
+        assert!(gate.preflight(&action).is_none());
     }
 
     #[tokio::test]

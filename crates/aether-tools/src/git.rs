@@ -41,6 +41,15 @@ pub(crate) async fn execute(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
+    execute_parsed(workspace, call_id, parsed, context).await
+}
+
+pub(crate) async fn execute_parsed(
+    workspace: &Workspace,
+    call_id: ToolCallId,
+    parsed: GitInput,
+    context: ToolExecutionContext,
+) -> aether_core::ToolResult {
     if let Err(error) =
         workspace.require_permit(&context, &call_id, "git", PermissionClass::ReadOnly)
     {

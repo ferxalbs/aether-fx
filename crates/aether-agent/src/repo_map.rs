@@ -765,12 +765,50 @@ struct CacheEntry {
 }
 
 struct Inventory {
-    paths: Vec<PathBuf>,
+    paths: PackedPaths,
     special: Vec<SpecialFile>,
     index_path: PathBuf,
     index_stamp: Option<FileStamp>,
     special_stamps: Vec<SpecialStamp>,
     fingerprint: Fingerprint,
+}
+
+/// Compact path storage for the potentially very large Git inventory. Paths are normalized into
+/// one byte slab; only the bounded snapshot promotes selected paths to `PathBuf`s.
+#[derive(Debug, Default)]
+struct PackedPaths {
+    bytes: Vec<u8>,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl PackedPaths {
+    fn with_capacity(capacity: usize) -> Self {
+        Self { bytes: Vec::new(), ranges: Vec::with_capacity(capacity) }
+    }
+
+    fn push_git_bytes(&mut self, path: &[u8]) {
+        let normalized = String::from_utf8_lossy(path);
+        self.push_str(&normalized);
+    }
+
+    fn push_str(&mut self, path: &str) {
+        let start = u32::try_from(self.bytes.len()).unwrap_or(u32::MAX);
+        self.bytes.extend_from_slice(path.as_bytes());
+        let end = u32::try_from(self.bytes.len()).unwrap_or(u32::MAX);
+        self.ranges.push((start, end));
+    }
+
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Path> {
+        self.ranges.iter().map(move |(start, end)| {
+            let start = usize::try_from(*start).expect("packed path offset fits usize");
+            let end = usize::try_from(*end).expect("packed path offset fits usize");
+            Path::new(std::str::from_utf8(&self.bytes[start..end]).expect("packed paths are UTF-8"))
+        })
+    }
 }
 
 struct SpecialFile {
@@ -802,14 +840,14 @@ fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, Re
         Err(_) => (git_ls_files(root)?, file_stamp(&index_path)),
     };
     let mut tracked_hasher = Hasher::new();
-    for path in &paths {
+    for path in paths.iter() {
         hash_path(&mut tracked_hasher, path);
     }
 
     let mut special = Vec::new();
     let mut special_stamps = Vec::new();
     let mut special_hasher = Hasher::new();
-    for path in &paths {
+    for path in paths.iter() {
         if !is_special_file(path) || special.len() >= limits.max_special_files {
             continue;
         }
@@ -817,9 +855,9 @@ fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, Re
         hash_path(&mut special_hasher, path);
         let digest = special_digest(&file);
         special_hasher.update(&digest);
-        special_stamps.push(SpecialStamp { path: path.clone(), digest });
+        special_stamps.push(SpecialStamp { path: path.to_path_buf(), digest });
         special.push(SpecialFile {
-            path: path.clone(),
+            path: path.to_path_buf(),
             content: file.content,
             truncated: file.truncated,
             readable: file.readable,
@@ -839,7 +877,7 @@ fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, Re
     })
 }
 
-fn read_git_index(index_path: &Path) -> io::Result<(Vec<PathBuf>, Option<FileStamp>)> {
+fn read_git_index(index_path: &Path) -> io::Result<(PackedPaths, Option<FileStamp>)> {
     let mut file = File::open(index_path)?;
     let metadata = file.metadata().ok();
     let mut bytes = Vec::with_capacity(metadata.as_ref().map_or(0, fs::Metadata::len) as usize);
@@ -849,7 +887,7 @@ fn read_git_index(index_path: &Path) -> io::Result<(Vec<PathBuf>, Option<FileSta
     Ok((paths, stamp))
 }
 
-fn parse_git_index(bytes: &[u8]) -> io::Result<Vec<PathBuf>> {
+fn parse_git_index(bytes: &[u8]) -> io::Result<PackedPaths> {
     const HEADER_LEN: usize = 12;
     const ENTRY_LEN: usize = 62;
     const EXTENDED_FLAG: u16 = 0x4000;
@@ -864,7 +902,7 @@ fn parse_git_index(bytes: &[u8]) -> io::Result<Vec<PathBuf>> {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported git index version"));
     }
     let count = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed index count")) as usize;
-    let mut paths = Vec::with_capacity(count);
+    let mut paths = PackedPaths::with_capacity(count);
     let mut offset = HEADER_LEN;
     for _ in 0..count {
         let entry_start = offset;
@@ -896,7 +934,7 @@ fn parse_git_index(bytes: &[u8]) -> io::Result<Vec<PathBuf>> {
         if bytes[path_end] != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid git index path"));
         }
-        paths.push(PathBuf::from(String::from_utf8_lossy(&bytes[offset..path_end]).into_owned()));
+        paths.push_git_bytes(&bytes[offset..path_end]);
         offset = path_end + 1;
         let entry_len = offset - entry_start;
         offset += (8 - entry_len % 8) % 8;
@@ -918,7 +956,7 @@ fn parse_git_index(bytes: &[u8]) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn git_ls_files(root: &Path) -> Result<Vec<PathBuf>, RepoMapError> {
+fn git_ls_files(root: &Path) -> Result<PackedPaths, RepoMapError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -933,12 +971,12 @@ fn git_ls_files(root: &Path) -> Result<Vec<PathBuf>, RepoMapError> {
             stderr
         }));
     }
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
-        .collect())
+    let paths = output.stdout.split(|byte| *byte == 0).filter(|path| !path.is_empty());
+    let mut packed = PackedPaths::with_capacity(paths.size_hint().0);
+    for path in paths {
+        packed.push_git_bytes(path);
+    }
+    Ok(packed)
 }
 
 fn git_index_path(root: &Path) -> PathBuf {
@@ -1068,7 +1106,7 @@ fn build_snapshot(root: &Path, inventory: &Inventory, limits: RepoMapLimits) -> 
         .paths
         .iter()
         .take(limits.max_files)
-        .map(|path| RepoFile { path: path.clone(), kind: classify_file(path) })
+        .map(|path| RepoFile { path: path.to_path_buf(), kind: classify_file(path) })
         .collect::<Vec<_>>();
     tracked_files.sort_by(|left, right| left.path.cmp(&right.path));
 
@@ -1098,7 +1136,7 @@ fn build_snapshot(root: &Path, inventory: &Inventory, limits: RepoMapLimits) -> 
     }
     for path in inventory.paths.iter().filter(|path| is_markdown(path) && !is_readme(path)) {
         documentation.push(DocumentationFile {
-            path: path.clone(),
+            path: path.to_path_buf(),
             kind: DocumentationKind::Markdown,
             preview: None,
             truncated: false,
@@ -1164,12 +1202,12 @@ fn build_snapshot(root: &Path, inventory: &Inventory, limits: RepoMapLimits) -> 
 
     let mut source_roots = BTreeSet::new();
     let mut test_paths = Vec::new();
-    for path in &inventory.paths {
+    for path in inventory.paths.iter() {
         if is_source_file(path) && !is_test_path(path) {
             source_roots.insert(source_root(path));
         }
         if is_test_path(path) {
-            test_paths.push(path.clone());
+            test_paths.push(path.to_path_buf());
         }
     }
     let source_roots = source_roots.into_iter().take(limits.max_special_files).collect::<Vec<_>>();
@@ -1647,8 +1685,10 @@ fn push_section<'a>(output: &mut String, title: &str, lines: impl Iterator<Item 
 mod tests {
     use std::{
         fs,
+        io::Write,
         path::Path,
         process::Command,
+        process::Stdio,
         sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1823,6 +1863,45 @@ mod tests {
         let snapshot = RepoMap::with_limits(&repo.path, limits).snapshot().expect("map");
         assert_eq!(snapshot.tracked_file_count, 1_500);
         assert_eq!(snapshot.tracked_files.len(), 128);
+        assert!(snapshot.truncated);
+        assert!(snapshot.estimated_bytes() < 100_000);
+    }
+
+    #[test]
+    fn packed_inventory_keeps_hundred_thousand_paths_in_one_slab() {
+        let mut paths = PackedPaths::with_capacity(100_000);
+        for index in 0..100_000 {
+            paths.push_str(&format!("crates/generated/file-{index}.rs"));
+        }
+
+        assert_eq!(paths.len(), 100_000);
+        assert_eq!(paths.iter().next().unwrap(), Path::new("crates/generated/file-0.rs"));
+        assert_eq!(paths.iter().nth(99_999).unwrap(), Path::new("crates/generated/file-99999.rs"));
+        assert!(paths.bytes.len() < 4_000_000);
+        assert!(paths.ranges.len() * std::mem::size_of::<(u32, u32)>() < 1_000_000);
+    }
+
+    #[test]
+    fn indexed_hundred_thousand_file_monorepo_stays_bounded() {
+        let repo = TempRepo::new();
+        let mut command = Command::new("git");
+        command
+            .current_dir(&repo.path)
+            .args(["update-index", "--index-info"])
+            .stdin(Stdio::piped());
+        let mut child = command.spawn().expect("git update-index");
+        let mut stdin = child.stdin.take().expect("index stdin");
+        for index in 0..100_000 {
+            writeln!(stdin, "100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tcrates/pkg-{index:05}/src/lib.rs")
+                .expect("write index entry");
+        }
+        drop(stdin);
+        assert!(child.wait().expect("git index update").success());
+
+        let limits = RepoMapLimits { max_files: 64, ..RepoMapLimits::default() };
+        let snapshot = RepoMap::with_limits(&repo.path, limits).snapshot().expect("map");
+        assert_eq!(snapshot.tracked_file_count, 100_000);
+        assert_eq!(snapshot.tracked_files.len(), 64);
         assert!(snapshot.truncated);
         assert!(snapshot.estimated_bytes() < 100_000);
     }

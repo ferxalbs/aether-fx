@@ -11,7 +11,7 @@ use tokio::{
     process::Command,
 };
 
-use crate::common::{MAX_INPUT_BYTES, Workspace, bounded_limit, resolve_existing_blocking};
+use crate::common::{MAX_INPUT_BYTES, ProcessRuntime, Workspace, resolve_existing_blocking};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ShellInput {
@@ -78,6 +78,15 @@ pub(crate) async fn execute(
         Ok(value) => value,
         Err(error) => return workspace.result_error(call_id, error),
     };
+    execute_parsed(workspace, call_id, parsed, context).await
+}
+
+pub(crate) async fn execute_parsed(
+    workspace: &Workspace,
+    call_id: ToolCallId,
+    parsed: ShellInput,
+    context: ToolExecutionContext,
+) -> aether_core::ToolResult {
     if parsed.program.is_empty() {
         return workspace.result_error(
             call_id,
@@ -115,9 +124,9 @@ pub(crate) async fn execute(
         return workspace
             .result_error(call_id, crate::common::ToolInternalError::Core(CoreError::Cancelled));
     }
-    let limit = bounded_limit(parsed.max_output_bytes, workspace.max_output_bytes());
-    let timeout_duration =
-        Duration::from_millis(parsed.timeout_ms.unwrap_or(120_000).clamp(1, 600_000));
+    let runtime = ProcessRuntime::finite(workspace, parsed.max_output_bytes, parsed.timeout_ms);
+    let limit = runtime.output_limit;
+    let timeout_duration = runtime.timeout;
     let started = Instant::now();
     let mut command = Command::new(&parsed.program);
     command
