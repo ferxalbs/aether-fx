@@ -8,6 +8,9 @@ use aether_agent::RepositoryActionPlanner;
 use aether_core::ContextSnapshot;
 
 mod real;
+mod trajectory;
+
+pub use trajectory::{TrajectoryMetrics, TrajectoryPattern};
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -76,9 +79,17 @@ pub struct ExecutionMetrics {
     pub bytes_read: u64,
     pub context_bytes: u64,
     pub bytes_shown_to_model: u64,
+    pub static_prefix_bytes: u64,
+    pub tool_schema_bytes: u64,
+    pub context_payload_bytes: u64,
+    pub tool_result_bytes: u64,
+    pub policy_feedback_bytes: u64,
+    pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
     pub process_spawns: u32,
     pub wall_time_ms: u64,
+    pub provider_wait_ms: u64,
+    pub local_execution_ms: u64,
     pub cpu_time_ms: u64,
     pub peak_rss_bytes: u64,
     pub allocation_count: u64,
@@ -89,6 +100,7 @@ pub struct ExecutionMetrics {
     pub planner_aborted_ambiguity: u32,
     pub planner_actions: u32,
     pub planner_bytes_read: u64,
+    pub trajectory: TrajectoryMetrics,
 }
 
 impl ExecutionMetrics {
@@ -129,9 +141,17 @@ pub struct TaskResult {
     pub bytes_read: u64,
     pub context_bytes: u64,
     pub bytes_shown_to_model: u64,
+    pub static_prefix_bytes: u64,
+    pub tool_schema_bytes: u64,
+    pub context_payload_bytes: u64,
+    pub tool_result_bytes: u64,
+    pub policy_feedback_bytes: u64,
+    pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
     pub process_spawns: u32,
     pub agent_wall_time_ms: u64,
+    pub provider_wait_ms: u64,
+    pub local_execution_ms: u64,
     pub cpu_time_ms: u64,
     pub peak_rss_bytes: u64,
     pub allocation_count: u64,
@@ -139,6 +159,7 @@ pub struct TaskResult {
     pub verification_quality: String,
     pub final_test_status: String,
     pub failure: Option<String>,
+    pub trajectory: TrajectoryMetrics,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,9 +179,17 @@ pub struct AggregateMetrics {
     pub bytes_read: u64,
     pub context_bytes: u64,
     pub bytes_shown_to_model: u64,
+    pub static_prefix_bytes: u64,
+    pub tool_schema_bytes: u64,
+    pub context_payload_bytes: u64,
+    pub tool_result_bytes: u64,
+    pub policy_feedback_bytes: u64,
+    pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
     pub process_spawns: u32,
     pub agent_wall_time_ms: u64,
+    pub provider_wait_ms: u64,
+    pub local_execution_ms: u64,
     pub cpu_time_ms: u64,
     pub peak_rss_bytes: u64,
     pub allocation_count: u64,
@@ -183,6 +212,8 @@ pub struct AggregateMetrics {
     pub planner_aborted_ambiguity: u32,
     pub planner_actions: u32,
     pub planner_bytes_read: u64,
+    pub reused_observations: u32,
+    pub trajectory_patterns: Vec<TrajectoryPattern>,
 }
 
 #[derive(Debug, Serialize)]
@@ -295,7 +326,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
     for result in &suite.tasks {
         let mark = if result.success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} quality={} read={}B\n",
+            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} quality={} read={}B reuse={} patterns={}\n",
             result.task_id,
             result.model_steps,
             result.executed_tool_calls,
@@ -304,11 +335,13 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
             result.verification_attempts,
             result.verification_scope,
             result.verification_quality,
-            result.bytes_read
+            result.bytes_read,
+            result.after.trajectory.reused_observations,
+            result.before.trajectory.patterns.len()
         ));
     }
     output.push_str(&format!(
-        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) requests={}/{} steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} context={}B/{}B shown={}B/{}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B spawns={} wall={}ms overhead={}ms\n",
+        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) requests={}/{} steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} reuse={} context={}B/{}B shown={}B/{}B schema={}B result={}B policy={}B protocol={}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B spawns={} wall={}ms local={}ms overhead={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
@@ -324,10 +357,15 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         suite.aggregate.baseline_tool_calls,
         suite.aggregate.baseline_executed_tool_calls,
         suite.aggregate.prevented_redundant_calls,
+        suite.aggregate.reused_observations,
         suite.aggregate.context_bytes,
         suite.aggregate.baseline_context_bytes,
         suite.aggregate.bytes_shown_to_model,
         suite.aggregate.baseline_bytes_shown_to_model,
+        suite.aggregate.tool_schema_bytes,
+        suite.aggregate.tool_result_bytes,
+        suite.aggregate.policy_feedback_bytes,
+        suite.aggregate.protocol_envelope_bytes,
         suite.aggregate.planner_hits,
         suite.aggregate.planner_attempts,
         suite.aggregate.planner_hit_rate * 100.0,
@@ -336,6 +374,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         suite.aggregate.planner_bytes_read,
         suite.aggregate.process_spawns,
         suite.aggregate.wall_time_ms,
+        suite.aggregate.local_execution_ms,
         suite.aggregate.harness_overhead_ms
     ));
     output
@@ -392,9 +431,26 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
         bytes_read: results.iter().map(|result| result.bytes_read).sum(),
         context_bytes: results.iter().map(|result| result.context_bytes).sum(),
         bytes_shown_to_model: results.iter().map(|result| result.after.bytes_shown_to_model).sum(),
+        static_prefix_bytes: results.iter().map(|result| result.after.static_prefix_bytes).sum(),
+        tool_schema_bytes: results.iter().map(|result| result.after.tool_schema_bytes).sum(),
+        context_payload_bytes: results
+            .iter()
+            .map(|result| result.after.context_payload_bytes)
+            .sum(),
+        tool_result_bytes: results.iter().map(|result| result.after.tool_result_bytes).sum(),
+        policy_feedback_bytes: results
+            .iter()
+            .map(|result| result.after.policy_feedback_bytes)
+            .sum(),
+        protocol_envelope_bytes: results
+            .iter()
+            .map(|result| result.after.protocol_envelope_bytes)
+            .sum(),
         verification_attempts: results.iter().map(|result| result.verification_attempts).sum(),
         process_spawns: results.iter().map(|result| result.after.process_spawns).sum(),
         agent_wall_time_ms: results.iter().map(|result| result.after.wall_time_ms).sum(),
+        provider_wait_ms: results.iter().map(|result| result.after.provider_wait_ms).sum(),
+        local_execution_ms: results.iter().map(|result| result.after.local_execution_ms).sum(),
         cpu_time_ms: results.iter().map(|result| result.after.cpu_time_ms).sum(),
         peak_rss_bytes: results.iter().map(|result| result.after.peak_rss_bytes).max().unwrap_or(0),
         allocation_count: results.iter().map(|result| result.after.allocation_count).sum(),
@@ -438,7 +494,37 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .sum(),
         planner_actions: results.iter().map(|result| result.after.planner_actions).sum(),
         planner_bytes_read: results.iter().map(|result| result.after.planner_bytes_read).sum(),
+        reused_observations: results
+            .iter()
+            .map(|result| result.after.trajectory.reused_observations)
+            .sum(),
+        trajectory_patterns: merge_trajectory_patterns(
+            results.iter().map(|result| &result.before.trajectory),
+        ),
     }
+}
+
+fn merge_trajectory_patterns<'a>(
+    analyses: impl IntoIterator<Item = &'a TrajectoryMetrics>,
+) -> Vec<TrajectoryPattern> {
+    let mut merged = Vec::new();
+    for analysis in analyses {
+        for pattern in &analysis.patterns {
+            if let Some(existing) =
+                merged.iter_mut().find(|item: &&mut TrajectoryPattern| item.kind == pattern.kind)
+            {
+                existing.count = existing.count.saturating_add(pattern.count);
+                for example in &pattern.examples {
+                    if existing.examples.len() < 3 && !existing.examples.contains(example) {
+                        existing.examples.push(example.clone());
+                    }
+                }
+            } else {
+                merged.push(pattern.clone());
+            }
+        }
+    }
+    merged
 }
 
 const CARGO_TEST: &[&str] = &["cargo", "test", "--quiet", "--offline"];
@@ -681,13 +767,17 @@ mod tests {
         assert!(suite.success, "{}", compact_summary(&suite));
         assert_eq!(suite.aggregate.succeeded, 9);
         assert!(suite.aggregate.baseline_executed_tool_calls > suite.aggregate.executed_tool_calls);
+        assert!(suite.aggregate.baseline_model_requests > suite.aggregate.model_requests);
+        assert!(suite.aggregate.reused_observations >= 5);
         assert!(
             suite.aggregate.bytes_shown_to_model
                 < suite.tasks.iter().map(|task| task.before.bytes_shown_to_model).sum::<u64>()
         );
         assert_eq!(suite.tasks[5].after.prevented_redundant_calls, 1);
         assert_eq!(suite.tasks[4].verification_scope, "focused");
-        assert!(suite.aggregate.prevented_redundant_calls >= 3);
+        assert!(
+            suite.aggregate.prevented_redundant_calls + suite.aggregate.reused_observations >= 6
+        );
         assert_eq!(suite.tasks[2].verification_attempts, 2);
         assert_eq!(suite.tasks[4].verification_command, ["cargo", "test", "--quiet", "--offline"]);
         let shell_heavy = suite
@@ -697,6 +787,12 @@ mod tests {
             .expect("shell-heavy scenario");
         assert!(shell_heavy.before.executed_tool_calls > shell_heavy.after.executed_tool_calls);
         assert!(shell_heavy.before.process_spawns > shell_heavy.after.process_spawns);
+        assert!(shell_heavy.after.trajectory.reused_observations >= 3);
+        assert!(
+            shell_heavy.before.trajectory.patterns.iter().any(|pattern| {
+                pattern.kind == "repeated_search_or_shell" && pattern.count == 3
+            })
+        );
         assert_eq!(shell_heavy.verification_quality, "broad_pass");
         let planned = suite
             .tasks

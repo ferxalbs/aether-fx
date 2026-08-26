@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-26 (2) - Trajectory-guided interaction economy
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added bounded per-task trajectory analysis for repeated observations, search-to-read chains,
+  verification recovery, and mutation-before-inspection candidates.
+- Added lossless model-visible byte categories for static prefixes, tool schemas, context payloads,
+  tool results, policy feedback, and protocol envelopes, plus provider/local timing metrics.
+
+### Changed
+
+- Deterministic eval replay now reuses only exact read-only observations whose workspace state has
+  not been invalidated by a mutation or verification step.
+- Eval reports now retain baseline and optimized trajectories, reuse counts, and aggregate pattern
+  counts so interaction changes can be compared without provider calls.
+
 ## Unreleased - 2026-08-26 (1) - Leaner runtime measurement path
 
 > Status: unreleased work. No artifact has been published.

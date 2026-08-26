@@ -105,6 +105,18 @@ pub struct AgentMetrics {
     pub prevented_calls: u64,
     pub context_bytes: u64,
     pub bytes_shown_to_model: u64,
+    /// Bytes classified as a provider-level static prefix, when one is present in the input.
+    pub static_prefix_bytes: u64,
+    /// Serialized model-visible tool definition bytes sent with each request.
+    pub tool_schema_bytes: u64,
+    /// User/context content bytes in model request inputs.
+    pub context_payload_bytes: u64,
+    /// Tool output payload bytes sent back to the model.
+    pub tool_result_bytes: u64,
+    /// Policy/developer feedback payload bytes sent back to the model.
+    pub policy_feedback_bytes: u64,
+    /// JSON framing and unclassified request bytes.
+    pub protocol_envelope_bytes: u64,
     pub bytes_read: u64,
     pub verification_attempts: u64,
     /// Smallest verification scope selected by the deterministic policy, when known.
@@ -295,12 +307,36 @@ where
                 metrics.value.model_requests = metrics.value.model_requests.saturating_add(1);
                 let input_bytes =
                     serde_json::to_vec(&input).map_or(u64::MAX, |value| value.len() as u64);
+                let schema_bytes = self.tool_definition_bytes();
+                let input_breakdown = classify_model_input(&input, input_bytes);
                 metrics.value.context_bytes =
                     metrics.value.context_bytes.saturating_add(input_bytes);
                 metrics.value.bytes_shown_to_model = metrics
                     .value
                     .bytes_shown_to_model
-                    .saturating_add(input_bytes.saturating_add(self.tool_definition_bytes()));
+                    .saturating_add(input_bytes.saturating_add(schema_bytes));
+                metrics.value.static_prefix_bytes = metrics
+                    .value
+                    .static_prefix_bytes
+                    .saturating_add(input_breakdown.static_prefix_bytes);
+                metrics.value.tool_schema_bytes =
+                    metrics.value.tool_schema_bytes.saturating_add(schema_bytes);
+                metrics.value.context_payload_bytes = metrics
+                    .value
+                    .context_payload_bytes
+                    .saturating_add(input_breakdown.context_payload_bytes);
+                metrics.value.tool_result_bytes = metrics
+                    .value
+                    .tool_result_bytes
+                    .saturating_add(input_breakdown.tool_result_bytes);
+                metrics.value.policy_feedback_bytes = metrics
+                    .value
+                    .policy_feedback_bytes
+                    .saturating_add(input_breakdown.policy_feedback_bytes);
+                metrics.value.protocol_envelope_bytes = metrics
+                    .value
+                    .protocol_envelope_bytes
+                    .saturating_add(input_breakdown.protocol_envelope_bytes);
             }
             let provider_started = metrics.as_ref().map(|_| Instant::now());
             let backend_future = self.backend.stream_step(model_request);
@@ -728,6 +764,65 @@ fn add_usage(
     metrics.total_tokens = add_optional(metrics.total_tokens, total);
 }
 
+#[derive(Default)]
+struct ModelInputBreakdown {
+    static_prefix_bytes: u64,
+    context_payload_bytes: u64,
+    tool_result_bytes: u64,
+    policy_feedback_bytes: u64,
+    protocol_envelope_bytes: u64,
+}
+
+/// Partition the bounded request input into model-visible payload categories without retaining it.
+/// The protocol bucket keeps the accounting lossless while payload buckets remain useful for
+/// identifying the dominant source of context cost.
+fn classify_model_input(input: &serde_json::Value, input_bytes: u64) -> ModelInputBreakdown {
+    let mut breakdown = ModelInputBreakdown::default();
+    let Some(items) = input.as_array() else {
+        breakdown.protocol_envelope_bytes = input_bytes;
+        return breakdown;
+    };
+    let mut payload_bytes = 0_u64;
+    for item in items {
+        let Some(kind) = item.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let payload = match kind {
+            "function_call_output" => {
+                item.get("output").and_then(serde_json::Value::as_str).map_or(0, str::len) as u64
+            }
+            "message" => {
+                let content =
+                    item.get("content").and_then(serde_json::Value::as_str).map_or(0, str::len)
+                        as u64;
+                match item.get("role").and_then(serde_json::Value::as_str) {
+                    Some("system") => {
+                        breakdown.static_prefix_bytes =
+                            breakdown.static_prefix_bytes.saturating_add(content)
+                    }
+                    Some("user") => {
+                        breakdown.context_payload_bytes =
+                            breakdown.context_payload_bytes.saturating_add(content)
+                    }
+                    Some("developer") => {
+                        breakdown.policy_feedback_bytes =
+                            breakdown.policy_feedback_bytes.saturating_add(content)
+                    }
+                    _ => {}
+                }
+                content
+            }
+            _ => 0,
+        };
+        if kind == "function_call_output" {
+            breakdown.tool_result_bytes = breakdown.tool_result_bytes.saturating_add(payload);
+        }
+        payload_bytes = payload_bytes.saturating_add(payload);
+    }
+    breakdown.protocol_envelope_bytes = input_bytes.saturating_sub(payload_bytes);
+    breakdown
+}
+
 fn add_optional(current: Option<u64>, value: Option<u32>) -> Option<u64> {
     value.map(|value| current.unwrap_or(0).saturating_add(u64::from(value))).or(current)
 }
@@ -949,6 +1044,29 @@ mod tests {
         context.workflow.record_inspection();
         assert!(context.workflow.complete_if_ready(&[]));
         context
+    }
+
+    #[test]
+    fn model_byte_accounting_partitions_input_without_retaining_payloads() {
+        let input = json!([
+            {"type":"message","role":"user","content":"context"},
+            {"type":"function_call_output","call_id":"call-1","output":"tool result"},
+            {"type":"message","role":"developer","content":"policy feedback"}
+        ]);
+        let input_bytes = serde_json::to_vec(&input).unwrap().len() as u64;
+        let breakdown = classify_model_input(&input, input_bytes);
+
+        assert_eq!(breakdown.context_payload_bytes, 7);
+        assert_eq!(breakdown.tool_result_bytes, 11);
+        assert_eq!(breakdown.policy_feedback_bytes, 15);
+        assert_eq!(
+            breakdown.static_prefix_bytes
+                + breakdown.context_payload_bytes
+                + breakdown.tool_result_bytes
+                + breakdown.policy_feedback_bytes
+                + breakdown.protocol_envelope_bytes,
+            input_bytes
+        );
     }
 
     #[test]

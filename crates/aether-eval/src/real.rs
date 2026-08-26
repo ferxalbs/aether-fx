@@ -17,7 +17,7 @@ use aether_agent::{
 use aether_core::{AgentEvent, SessionId, TurnId, WorkflowVerification};
 use aether_tools::ToolRegistry;
 
-use super::{Action, ExecutionMetrics, Task, TaskResult};
+use super::{Action, ExecutionMetrics, Task, TaskResult, TrajectoryMetrics, trajectory};
 
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -29,7 +29,16 @@ pub(crate) fn run_task(
     let copy_started = Instant::now();
     let root = copy_fixture(task.fixture)?;
     let harness_overhead_ms = copy_started.elapsed().as_millis();
-    let steps = build_steps(task, &root, script, optimize)?;
+    let retained = trajectory::retained_indices(script, optimize);
+    let existing_write_targets = script
+        .iter()
+        .filter_map(|action| match action {
+            Action::Write { path, .. } if root.join(path).is_file() => Some((*path).to_owned()),
+            _ => None,
+        })
+        .collect();
+    let trajectory = TrajectoryMetrics::analyze(script, &retained, &existing_write_targets);
+    let steps = build_steps(task, &root, script, &retained, optimize)?;
     let backend = FakeBackend::new("deterministic trace replay").with_steps(steps);
     let registry = ToolRegistry::new(&root)?;
     let agent = Agent::new(backend, registry);
@@ -126,6 +135,7 @@ pub(crate) fn run_task(
         failure,
         run_wall_time_ms,
         harness_overhead_ms,
+        trajectory,
     );
     let _ = fs::remove_dir_all(&root);
     Ok(result)
@@ -135,23 +145,16 @@ fn build_steps(
     task: &Task,
     root: &Path,
     script: &[Action],
+    retained: &[usize],
     optimize: bool,
 ) -> Result<Vec<FakeStep>, String> {
     let mut hashes = HashMap::new();
     let mut inspected = std::collections::HashSet::new();
     let mut steps = Vec::with_capacity(script.len());
-    let mut planner_supplied_read = false;
-    for action in script {
-        // The optimized trace models the provider consuming the planner's exact read evidence
-        // instead of issuing the immediately redundant read round-trip. The baseline keeps the
-        // original trace so the comparison measures the production path end to end.
-        if optimize
-            && planner_supplied_read
-            && matches!(action, Action::Read { path } if inspected.contains(*path))
-        {
-            planner_supplied_read = false;
-            continue;
-        }
+    for &index in retained {
+        let action = script
+            .get(index)
+            .ok_or_else(|| "trajectory retained an invalid action index".to_owned())?;
         let tool_call = action_to_call(task, root, action, optimize, &hashes)?;
         if let Action::Write { path, contents } = action {
             let existing = root.join(path).exists();
@@ -174,7 +177,6 @@ fn build_steps(
             Some(tool_call) => FakeStep { text: None, tool_calls: vec![tool_call] },
             None => FakeStep { text: Some("completed".to_owned()), tool_calls: Vec::new() },
         });
-        planner_supplied_read = matches!(action, Action::Search { .. });
     }
     Ok(steps)
 }
@@ -269,12 +271,14 @@ impl TaskResult {
         failure: Option<String>,
         wall_time_ms: u128,
         harness_overhead_ms: u128,
+        trajectory: TrajectoryMetrics,
     ) -> Self {
         let after = ExecutionMetrics::from_agent(
             metrics,
             success,
             &verification_scope,
             &verification_quality,
+            trajectory,
         );
         Self {
             task_id: task.id.to_owned(),
@@ -310,9 +314,17 @@ impl TaskResult {
             bytes_read: after.bytes_read,
             context_bytes: after.context_bytes,
             bytes_shown_to_model: after.bytes_shown_to_model,
+            static_prefix_bytes: after.static_prefix_bytes,
+            tool_schema_bytes: after.tool_schema_bytes,
+            context_payload_bytes: after.context_payload_bytes,
+            tool_result_bytes: after.tool_result_bytes,
+            policy_feedback_bytes: after.policy_feedback_bytes,
+            protocol_envelope_bytes: after.protocol_envelope_bytes,
             verification_attempts: after.verification_attempts,
             process_spawns: after.process_spawns,
             agent_wall_time_ms: after.wall_time_ms,
+            provider_wait_ms: after.provider_wait_ms,
+            local_execution_ms: after.local_execution_ms,
             cpu_time_ms: after.cpu_time_ms,
             peak_rss_bytes: after.peak_rss_bytes,
             allocation_count: after.allocation_count,
@@ -320,12 +332,19 @@ impl TaskResult {
             verification_quality,
             final_test_status,
             failure,
+            trajectory: after.trajectory.clone(),
         }
     }
 }
 
 impl ExecutionMetrics {
-    fn from_agent(metrics: &AgentMetrics, success: bool, scope: &str, quality: &str) -> Self {
+    fn from_agent(
+        metrics: &AgentMetrics,
+        success: bool,
+        scope: &str,
+        quality: &str,
+        trajectory: TrajectoryMetrics,
+    ) -> Self {
         Self {
             success,
             model_steps: metrics.model_steps as u32,
@@ -340,9 +359,17 @@ impl ExecutionMetrics {
             bytes_read: metrics.bytes_read,
             context_bytes: metrics.context_bytes,
             bytes_shown_to_model: metrics.bytes_shown_to_model,
+            static_prefix_bytes: metrics.static_prefix_bytes,
+            tool_schema_bytes: metrics.tool_schema_bytes,
+            context_payload_bytes: metrics.context_payload_bytes,
+            tool_result_bytes: metrics.tool_result_bytes,
+            policy_feedback_bytes: metrics.policy_feedback_bytes,
+            protocol_envelope_bytes: metrics.protocol_envelope_bytes,
             verification_attempts: metrics.verification_attempts as u32,
             process_spawns: metrics.process_spawns as u32,
             wall_time_ms: metrics.wall_time_ms,
+            provider_wait_ms: metrics.provider_wait_ms,
+            local_execution_ms: metrics.local_execution_ms,
             cpu_time_ms: metrics.cpu_time_ms,
             peak_rss_bytes: metrics.peak_rss_bytes,
             allocation_count: metrics.allocation_count,
@@ -353,6 +380,7 @@ impl ExecutionMetrics {
             planner_aborted_ambiguity: metrics.planner_aborted_ambiguity as u32,
             planner_actions: metrics.planner_actions as u32,
             planner_bytes_read: metrics.planner_bytes_read,
+            trajectory,
         }
     }
 }

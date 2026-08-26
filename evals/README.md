@@ -22,8 +22,12 @@ backed evaluations should use a separate binary or feature so default CI remains
 reproducible.
 
 JSON output includes per-task correctness, model requests, tokens when the provider reports them,
-requested and executed calls, prevented calls, bytes read, bytes shown to the model, context bytes,
-process spawns, verification attempts, wall/CPU time, and platform probes for RSS and allocations.
+requested and executed calls, prevented/reused observations, bytes read, bytes shown to the model,
+context bytes, static-prefix/tool-schema/context/tool-result/policy-feedback/protocol byte
+categories, process spawns, verification attempts, wall/provider/local time, and platform probes
+for RSS and allocations. Each task also contains a bounded trajectory report that classifies
+repeated observations, search-to-read chains, verification recovery, and mutation-before-
+inspection candidates. The aggregate report merges those pattern counts for the baseline traces.
 The `relationship-heavy-exploration` scenario requires repeated search-to-read navigation in
 baseline mode and exercises the bounded planner in policy mode. Regression gates cover correctness,
 steps, executed calls, and context size; shell-heavy and planner scenarios report before/after

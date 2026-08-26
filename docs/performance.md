@@ -68,15 +68,19 @@ planner retains at most 8 candidates, 4 files/actions, 12 KiB of read bytes, 16 
 observation bytes, and 10 ms of execution time. Planning uses only indexed/context evidence, so
 the indexed-context path performs zero filesystem I/O.
 
-Deterministic production-loop evaluation on 2026-08-25 used 9 standalone offline Rust fixtures,
+Deterministic production-loop evaluation on 2026-08-26 used 9 standalone offline Rust fixtures,
 real tool execution, and a deterministic fake model trace. It achieved 9/9 success@1 in both
-baseline and optimized runs. The optimized run used 54 model requests versus 55 baseline, 39
-executed tool calls versus 45, prevented 6 redundant calls, reduced model-visible bytes from
-328,924 to 318,728 (3.10%), and reduced context bytes from 40,229 to 35,282 (12.29%). It spawned
-13 finite processes, attempted verification 10 times, and reported 15,765 ms aggregate agent wall
-time on this host. CPU time, RSS, and allocation counters are zero when no portable in-process
-probe is available; `evals/compare.py` records external wall/RSS measurements for fresh processes.
-The suite gates correctness, step count, executed calls, and context bytes; timing is diagnostic.
+baseline and optimized runs. The optimized run used 49 model requests versus 55 baseline
+(-10.91%), 40 requested tool calls versus 46 (-13.04%), and 39 executed tool calls versus 45
+(-13.33%). Six exact unchanged observations were reused locally and one mutation recovery call
+was still prevented by policy. Model-visible bytes fell from 328,926 to 289,236 (-12.07%), while
+context input bytes fell from 40,231 to 32,035 (-20.37%). The optimized model-visible byte
+breakdown was 257,201 tool-schema bytes, 11,338 tool-result bytes, 3,650 policy-feedback bytes,
+7,559 protocol-envelope bytes, and no separate static provider prefix. It spawned 13 finite
+processes and attempted verification 10 times; aggregate agent wall time was 15,792 ms on this
+host. CPU time, RSS, and allocation counters are zero when no portable in-process probe is
+available; `evals/compare.py` records external wall/RSS measurements for fresh processes. The
+suite gates correctness, step count, executed calls, and context bytes; timing is diagnostic.
 
 The full Criterion suite also completed on this host during the same verification pass. Selected
 medians were 105.45 µs for tool dispatch, 59.127 µs for blocking dispatch, 71.496 µs for a
