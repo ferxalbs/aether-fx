@@ -5,8 +5,8 @@ use aether_agent::{
     schedule_ready_calls,
 };
 use aether_core::{
-    ModelEvent, ModelRequest, PermissionClass, ToolDefinition, ToolExecutionContext, ToolExecutor,
-    ToolFootprint, ToolInvocation, ToolResult,
+    ContextSnapshot, ModelEvent, ModelRequest, PermissionClass, ToolDefinition,
+    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResult,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::json;
@@ -71,6 +71,14 @@ impl ModelBackend for BenchBackend {
 
 struct BenchTools;
 
+fn completed_context() -> ContextSnapshot {
+    let mut context = ContextSnapshot::new("", None);
+    context.workflow.record_relevant_file("file-0");
+    context.workflow.record_inspection();
+    context.workflow.complete_if_ready(&[]);
+    context
+}
+
 impl ToolExecutor for BenchTools {
     fn definitions(&self) -> &[ToolDefinition] {
         static DEFINITIONS: std::sync::OnceLock<Vec<ToolDefinition>> = std::sync::OnceLock::new();
@@ -126,6 +134,7 @@ fn benchmark_agent(c: &mut Criterion, calls: usize, name: &str, metrics: bool) {
                     "benchmark",
                 );
                 request.metrics = metrics;
+                request.context_seed = Some(completed_context());
                 let (sender, _receiver) = mpsc::channel(128);
                 agent.run(request, sender, CancellationToken::new()).await.unwrap();
             });

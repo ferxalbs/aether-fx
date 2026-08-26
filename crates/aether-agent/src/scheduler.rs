@@ -2,9 +2,8 @@ use std::{future::Future, pin::Pin, task::Poll};
 
 use aether_core::{
     AgentEvent, DEFAULT_MAX_OUTPUT_BYTES, ExecutionPermit, PermissionDecision, PreparedAction,
-    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolInvocation, ToolResult,
+    ToolExecutionContext, ToolExecutor, ToolFootprint, ToolResult,
 };
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::send_event;
@@ -42,15 +41,6 @@ pub(crate) trait ToolCallGate {
     fn preflight(&self, action: &PreparedAction) -> Option<ToolResult>;
 }
 
-#[allow(dead_code)]
-struct AllowAllToolCallGate;
-
-impl ToolCallGate for AllowAllToolCallGate {
-    fn preflight(&self, _: &PreparedAction) -> Option<ToolResult> {
-        None
-    }
-}
-
 /// Select a conservative prefix of ready calls without allocating or waiting.
 pub fn schedule_ready_calls(
     footprints: &[ToolFootprint],
@@ -70,34 +60,6 @@ pub fn schedule_ready_calls(
         count += 1;
     }
     count
-}
-
-/// Resolve permissions, schedule safe calls, and return deterministic model output.
-#[allow(dead_code)]
-pub async fn execute_tool_calls<T, P>(
-    tools: &T,
-    tool_calls: Vec<(aether_core::ToolCallId, String, Value)>,
-    events: &mpsc::Sender<AgentEvent>,
-    cancellation: &CancellationToken,
-    broker: &P,
-) -> Result<Vec<ScheduledToolResult>, AgentError>
-where
-    T: ToolExecutor,
-    P: PermissionBroker + ?Sized,
-{
-    let actions = tool_calls
-        .into_iter()
-        .map(|(call_id, name, input)| tools.prepare(ToolInvocation { call_id, name, input }))
-        .collect();
-    execute_prepared_tool_calls_with_gate(
-        tools,
-        actions,
-        events,
-        cancellation,
-        broker,
-        &AllowAllToolCallGate,
-    )
-    .await
 }
 
 pub(crate) async fn execute_prepared_tool_calls_with_gate<T, P, G>(
@@ -411,6 +373,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use aether_core::{PermissionClass, ToolDefinition, ToolExecutionContext, ToolInvocation};
+    use serde_json::Value;
     use serde_json::json;
 
     use super::*;
@@ -526,6 +489,14 @@ mod tests {
         }
     }
 
+    struct NoopGate;
+
+    impl ToolCallGate for NoopGate {
+        fn preflight(&self, _: &PreparedAction) -> Option<ToolResult> {
+            None
+        }
+    }
+
     fn call(
         id: usize,
         effect: &str,
@@ -558,9 +529,19 @@ mod tests {
     ) -> Result<Vec<ScheduledToolResult>, AgentError> {
         let tools = Arc::new(tools);
         let (sender, mut receiver) = mpsc::channel(128);
-        let result =
-            execute_tool_calls(tools.as_ref(), calls, &sender, cancellation, &NoPermissionBroker)
-                .await;
+        let actions = calls
+            .into_iter()
+            .map(|(call_id, name, input)| tools.prepare(ToolInvocation { call_id, name, input }))
+            .collect();
+        let result = execute_prepared_tool_calls_with_gate(
+            tools.as_ref(),
+            actions,
+            &sender,
+            cancellation,
+            &NoPermissionBroker,
+            &NoopGate,
+        )
+        .await;
         while receiver.try_recv().is_ok() {}
         result
     }
@@ -673,12 +654,17 @@ mod tests {
     async fn lifecycle_events_commit_in_call_order() {
         let tools = Arc::new(TestTools::new());
         let (sender, mut receiver) = mpsc::channel(32);
-        execute_tool_calls(
+        let actions = vec![call(1, "read", "one", 30), call(2, "read", "two", 1)]
+            .into_iter()
+            .map(|(call_id, name, input)| tools.prepare(ToolInvocation { call_id, name, input }))
+            .collect();
+        execute_prepared_tool_calls_with_gate(
             tools.as_ref(),
-            vec![call(1, "read", "one", 30), call(2, "read", "two", 1)],
+            actions,
             &sender,
             &CancellationToken::new(),
             &NoPermissionBroker,
+            &NoopGate,
         )
         .await
         .unwrap();

@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-26 (1) - Leaner runtime measurement path
+
+> Status: unreleased work. No artifact has been published.
+
+### Changed
+
+- Tool-schema byte accounting is now serialized lazily only when structured metrics are requested;
+  normal agent construction no longer performs metric-only schema serialization.
+- Removed the private scheduler compatibility wrapper so tests exercise the prepared-action
+  scheduler path directly.
+- Repaired the scheduler benchmark fixture to start from valid completed read-only workflow state,
+  keeping orchestration measurements meaningful without changing production behavior.
+
 ## Unreleased - 2026-08-25 (2) - Single-pass action execution and real eval gates
 
 > Status: unreleased work. No artifact has been published.

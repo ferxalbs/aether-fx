@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use aether_core::{
@@ -173,7 +176,7 @@ pub struct Agent<B, T> {
     backend: Arc<B>,
     tools: Arc<T>,
     tool_definitions: Arc<Vec<aether_core::ToolDefinition>>,
-    tool_definition_bytes: u64,
+    tool_definition_bytes: AtomicU64,
     context: Mutex<ContextEngine>,
 }
 
@@ -185,13 +188,11 @@ where
     /// Compose one backend and one tool executor.
     pub fn new(backend: B, tools: T) -> Self {
         let tool_definitions = Arc::new(tools.definitions().to_vec());
-        let tool_definition_bytes =
-            serde_json::to_vec(tool_definitions.as_ref()).map_or(0, |value| value.len() as u64);
         Self {
             backend: Arc::new(backend),
             tools: Arc::new(tools),
             tool_definitions,
-            tool_definition_bytes,
+            tool_definition_bytes: AtomicU64::new(0),
             context: Mutex::new(ContextEngine::new(String::new(), None)),
         }
     }
@@ -299,7 +300,7 @@ where
                 metrics.value.bytes_shown_to_model = metrics
                     .value
                     .bytes_shown_to_model
-                    .saturating_add(input_bytes.saturating_add(self.tool_definition_bytes));
+                    .saturating_add(input_bytes.saturating_add(self.tool_definition_bytes()));
             }
             let provider_started = metrics.as_ref().map(|_| Instant::now());
             let backend_future = self.backend.stream_step(model_request);
@@ -601,6 +602,24 @@ where
 
     fn current_context(&self) -> ContextSnapshot {
         self.with_context(|engine| engine.snapshot().clone())
+    }
+
+    fn tool_definition_bytes(&self) -> u64 {
+        let cached = self.tool_definition_bytes.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        let measured = serde_json::to_vec(self.tool_definitions.as_ref())
+            .map_or(0, |value| value.len() as u64);
+        if measured != 0 {
+            let _ = self.tool_definition_bytes.compare_exchange(
+                0,
+                measured,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        measured
     }
 
     fn render_context(&self, include_guidance: bool) -> String {
