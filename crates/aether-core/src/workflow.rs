@@ -213,8 +213,17 @@ impl WorkflowState {
         Self::default()
     }
 
-    /// Record one relevant workspace-relative path and enter inspection when discovering.
+    /// Record one repository-derived relevant path and enter inspection when discovering.
     pub fn record_relevant_file(&mut self, path: &str) {
+        self.record_relevant_file_with_provenance(crate::EvidenceProvenance::Repository, path);
+    }
+
+    /// Record a relevant path with its explicit evidence origin.
+    pub fn record_relevant_file_with_provenance(
+        &mut self,
+        provenance: crate::EvidenceProvenance,
+        path: &str,
+    ) {
         let path = BoundedText::new(path, MAX_WORKFLOW_FIELD_BYTES);
         if path.is_truncated() || path.as_str().is_empty() {
             return;
@@ -223,7 +232,8 @@ impl WorkflowState {
             return;
         }
         let path = path.into_string();
-        self.decision.record_evidence(
+        self.decision.record_evidence_with_provenance(
+            provenance,
             crate::DecisionEvidenceKind::Discovery,
             &path,
             "relevant path observed",
@@ -240,10 +250,16 @@ impl WorkflowState {
         }
     }
 
-    /// Record a successful targeted inspection.
+    /// Record a successful targeted repository inspection.
     pub fn record_inspection(&mut self) {
+        self.record_inspection_with_provenance(crate::EvidenceProvenance::Repository);
+    }
+
+    /// Record an inspection with its explicit evidence origin.
+    pub fn record_inspection_with_provenance(&mut self, provenance: crate::EvidenceProvenance) {
         self.progress.note_inspection();
-        self.decision.record_evidence(
+        self.decision.record_evidence_with_provenance(
+            provenance,
             crate::DecisionEvidenceKind::Inspection,
             "",
             "targeted inspection completed",

@@ -39,7 +39,8 @@ pub struct ActionRequirements {
 ///
 /// Model-originated actions remain model-originated even when their arguments quote tool,
 /// repository, or network output. Only an explicit user decision can satisfy user authority.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EvidenceProvenance {
     User,
     Repository,
@@ -63,7 +64,7 @@ pub struct PreparedAction {
     pub requirements: ActionRequirements,
     pub paths: Vec<String>,
     pub classification: ActionClassification,
-    pub provenance: EvidenceProvenance,
+    provenance: EvidenceProvenance,
     pub permission_request: Option<PermissionRequest>,
     pub command_effects: Option<CommandEffects>,
     typed_input: Option<Arc<dyn Any + Send + Sync>>,
@@ -145,6 +146,11 @@ impl PreparedAction {
     /// Borrow the typed input attached by a tool registry.
     pub fn typed_input<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.typed_input.as_ref()?.downcast_ref()
+    }
+
+    /// Return the origin of the action. Model-originated actions never carry user authority.
+    pub const fn provenance(&self) -> EvidenceProvenance {
+        self.provenance
     }
 
     /// Reuse the registry-owned typed input for execution, moving it when uniquely owned and

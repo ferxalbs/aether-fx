@@ -341,8 +341,15 @@ fn classification_for_input(input: &PreparedToolInput) -> ActionClassification {
         PreparedToolInput::Read(_)
         | PreparedToolInput::List(_)
         | PreparedToolInput::Find(_)
-        | PreparedToolInput::Search(_)
-        | PreparedToolInput::Git(_) => ActionClassification::Read,
+        | PreparedToolInput::Search(_) => ActionClassification::Read,
+        PreparedToolInput::Git(input) => match &input.operation {
+            crate::GitOperation::Status | crate::GitOperation::Diff => {
+                ActionClassification::Verification
+            }
+            crate::GitOperation::Show
+            | crate::GitOperation::Log
+            | crate::GitOperation::Branches => ActionClassification::Read,
+        },
         PreparedToolInput::Write(_) | PreparedToolInput::Patch(_) => ActionClassification::Mutation,
         PreparedToolInput::Shell(input) => classification_for_command(&analyze_command(
             &input.program,
@@ -386,7 +393,9 @@ fn command_effects_for_input(input: &PreparedToolInput) -> Option<aether_core::C
 }
 
 fn classification_for_command(effects: &aether_core::CommandEffects) -> ActionClassification {
-    if effects.class.is_verification() {
+    if effects.uncertain {
+        ActionClassification::Mutation
+    } else if effects.class.is_verification() {
         ActionClassification::Verification
     } else if effects.mutates_workspace() {
         ActionClassification::Mutation

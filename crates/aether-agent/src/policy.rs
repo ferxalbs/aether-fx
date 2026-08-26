@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use aether_core::{
     ActionClassification, CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind,
-    LineRange, ObservedFileState, PreparedAction, ToolCallId, ToolResult, WorkflowPhase,
-    WorkflowVerification, WorkspacePath, analyze_command,
+    EvidenceProvenance, LineRange, ObservedFileState, PreparedAction, ToolCallId, ToolResult,
+    WorkflowPhase, WorkflowVerification, WorkspacePath, analyze_command,
 };
 use serde_json::Value;
 
@@ -35,6 +35,16 @@ pub struct RankedAction {
     pub score: u16,
     pub target: Option<String>,
     pub reason: String,
+}
+
+struct ToolEvidenceUpdate {
+    executed: bool,
+    revision: u32,
+    paths: Vec<String>,
+    kind: DecisionEvidenceKind,
+    detail: String,
+    verification_scope: Option<String>,
+    mutation: bool,
 }
 
 /// The deterministic policy façade used by the live agent loop.
@@ -494,13 +504,7 @@ impl AutonomousCodingPolicy {
         } else {
             return None;
         }
-        Some(ToolResult::failure(
-            call_id,
-            "insufficient_evidence",
-            "inspect the exact target, preserve user-owned changes, and provide the current expected_hash before replacing it",
-            true,
-            aether_core::DEFAULT_MAX_OUTPUT_BYTES,
-        ))
+        Some(insufficient_evidence(call_id))
     }
 
     fn mutation_preflight_prepared(
@@ -508,15 +512,20 @@ impl AutonomousCodingPolicy {
         snapshot: &ContextSnapshot,
         action: &PreparedAction,
     ) -> Option<ToolResult> {
-        if !matches!(action.classification, ActionClassification::Mutation) {
+        if !action.requirements.current_workspace_evidence {
             return None;
         }
-        self.mutation_preflight(
-            snapshot,
-            action.call_id.clone(),
-            &action.tool,
-            &action.normalized_input,
-        )
+        let has_evidence = match action.tool.as_str() {
+            "write" => prepared_write_has_evidence(snapshot, action),
+            "patch" => prepared_patch_has_evidence(snapshot, action),
+            "shell" | "process" => action.command_effects.as_ref().is_some_and(|effects| {
+                !effects.uncertain
+                    && effects.class.is_mutation()
+                    && command_mutation_has_evidence(snapshot, effects)
+            }),
+            _ => false,
+        };
+        if has_evidence { None } else { Some(insufficient_evidence(action.call_id.clone())) }
     }
 
     fn update_evidence(
@@ -546,35 +555,60 @@ impl AutonomousCodingPolicy {
         } else {
             format!("{name} reused cached observation")
         };
+        let verification_scope = if is_verification(name, input) {
+            command_effects(input).and_then(|effects| effects.verification_scope)
+        } else {
+            None
+        };
+        self.record_tool_evidence(
+            engine,
+            ToolEvidenceUpdate {
+                executed,
+                revision,
+                paths,
+                kind,
+                detail,
+                verification_scope,
+                mutation: name == "write" || name == "patch",
+            },
+        );
+    }
+
+    fn record_tool_evidence(&self, engine: &mut ContextEngine, update: ToolEvidenceUpdate) {
         let modified_paths = engine.snapshot().modified.clone();
         let decision = &mut engine.snapshot_mut().workflow.decision;
-        if is_verification(name, input)
-            && let Some(scope) =
-                command_effects(input).and_then(|effects| effects.verification_scope)
-        {
+        if let Some(scope) = update.verification_scope {
             decision.verification_scope =
                 aether_core::BoundedText::new(scope, aether_core::MAX_DECISION_SCOPE);
         }
-        if paths.is_empty() {
-            decision.record_evidence(kind, "", detail, 20, revision);
+        if update.paths.is_empty() {
+            decision.record_evidence_with_provenance(
+                EvidenceProvenance::ToolOutput,
+                update.kind,
+                "",
+                update.detail,
+                20,
+                update.revision,
+            );
         } else {
-            for path in paths {
-                decision.record_evidence(
-                    kind,
+            for path in update.paths {
+                decision.record_evidence_with_provenance(
+                    EvidenceProvenance::ToolOutput,
+                    update.kind,
                     &path,
-                    &detail,
-                    if executed { 42 } else { 24 },
-                    revision,
+                    &update.detail,
+                    if update.executed { 42 } else { 24 },
+                    update.revision,
                 );
-                if matches!(kind, DecisionEvidenceKind::Inspection) {
+                if matches!(update.kind, DecisionEvidenceKind::Inspection) {
                     decision.clear_question(&format!("inspect:{path}"));
                 }
             }
         }
-        if matches!(kind, DecisionEvidenceKind::Verification) {
+        if matches!(update.kind, DecisionEvidenceKind::Verification) {
             decision.clear_question("verification");
         }
-        if name == "write" || name == "patch" {
+        if update.mutation {
             for path in &modified_paths {
                 decision.record_modified_scope(path);
             }
@@ -588,7 +622,42 @@ impl AutonomousCodingPolicy {
         result: &ToolResult,
         executed: bool,
     ) {
-        self.update_evidence(engine, &action.tool, &action.normalized_input, result, executed);
+        if !result.ok {
+            return;
+        }
+        let revision = engine.snapshot().workflow.workspace_revision;
+        let mut paths = result_paths(&action.tool, &action.normalized_input, result);
+        if paths.is_empty() {
+            paths.extend(action.paths.iter().cloned());
+        }
+        let kind = if action.classification == ActionClassification::Verification {
+            DecisionEvidenceKind::Verification
+        } else {
+            match action.tool.as_str() {
+                "read" => DecisionEvidenceKind::Inspection,
+                "write" | "patch" => DecisionEvidenceKind::Mutation,
+                _ => DecisionEvidenceKind::Discovery,
+            }
+        };
+        let detail = if executed {
+            format!("{} completed", action.tool)
+        } else {
+            format!("{} reused cached observation", action.tool)
+        };
+        let verification_scope =
+            action.command_effects.as_ref().and_then(|effects| effects.verification_scope.clone());
+        self.record_tool_evidence(
+            engine,
+            ToolEvidenceUpdate {
+                executed,
+                revision,
+                paths,
+                kind,
+                detail,
+                verification_scope,
+                mutation: matches!(action.tool.as_str(), "write" | "patch"),
+            },
+        );
     }
 
     fn update_next_action(&self, engine: &mut ContextEngine) {
@@ -793,24 +862,68 @@ fn command_mutation_has_evidence(snapshot: &ContextSnapshot, effects: &CommandEf
         effects.class,
         aether_core::CommandClass::DependencyManagement | aether_core::CommandClass::GitMutation
     );
-    let paths = effects
-        .paths
-        .iter()
-        .chain(include_manifests.then_some(effects.manifests.iter()).into_iter().flatten());
-    let paths = paths.collect::<Vec<_>>();
-    !paths.is_empty()
-        && paths.iter().all(|path| {
-            if snapshot.user_modified.iter().any(|user_path| user_path == *path) {
-                return false;
-            }
-            snapshot.workflow.relevant_files.iter().any(|relevant| relevant == *path)
-                && snapshot.inspected.iter().any(|file| {
-                    file.path == **path
-                        && file.last_state == ObservedFileState::Present
-                        && !file.stale
-                        && file.content_hash.is_some()
-                })
+    let has_paths = !effects.paths.is_empty() || include_manifests && !effects.manifests.is_empty();
+    has_paths
+        && effects.paths.iter().all(|path| command_target_has_evidence(snapshot, path))
+        && (!include_manifests
+            || effects.manifests.iter().all(|path| command_target_has_evidence(snapshot, path)))
+}
+
+fn command_target_has_evidence(snapshot: &ContextSnapshot, path: &str) -> bool {
+    if snapshot.user_modified.iter().any(|user_path| user_path == path) {
+        return false;
+    }
+    snapshot.workflow.relevant_files.iter().any(|relevant| relevant == path)
+        && snapshot.inspected.iter().any(|file| {
+            file.path == path
+                && file.last_state == ObservedFileState::Present
+                && !file.stale
+                && file.content_hash.is_some()
         })
+}
+
+fn prepared_write_has_evidence(snapshot: &ContextSnapshot, action: &PreparedAction) -> bool {
+    let Some(path) = action.paths.first() else { return false };
+    let create_only =
+        action.normalized_input.get("create_only").and_then(Value::as_bool) == Some(true);
+    if create_only
+        && WorkspacePath::new(path).is_ok()
+        && new_target_has_discovered_parent(snapshot, path)
+    {
+        return !snapshot.user_modified.iter().any(|existing| existing == path);
+    }
+    current_target_has_evidence(snapshot, path)
+        && expected_hash_matches(
+            snapshot,
+            path,
+            action.normalized_input.get("expected_hash").and_then(Value::as_str),
+        )
+}
+
+fn prepared_patch_has_evidence(snapshot: &ContextSnapshot, action: &PreparedAction) -> bool {
+    let Some(files) = action.normalized_input.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    !files.is_empty()
+        && files.iter().all(|file| {
+            let Some(path) = file.get("path").and_then(Value::as_str) else { return false };
+            current_target_has_evidence(snapshot, path)
+                && expected_hash_matches(
+                    snapshot,
+                    path,
+                    file.get("expected_hash").and_then(Value::as_str),
+                )
+        })
+}
+
+fn insufficient_evidence(call_id: ToolCallId) -> ToolResult {
+    ToolResult::failure(
+        call_id,
+        "insufficient_evidence",
+        "inspect the exact target, preserve user-owned changes, and provide the current expected_hash before replacing it",
+        true,
+        aether_core::DEFAULT_MAX_OUTPUT_BYTES,
+    )
 }
 
 fn mutation_has_evidence(snapshot: &ContextSnapshot, name: &str, input: &Value) -> bool {

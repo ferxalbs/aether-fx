@@ -69,7 +69,10 @@ Rainy adapter
 
 Repository inventory discovery packs all Git paths into one UTF-8 slab with 32-bit ranges. Only
 bounded selected metadata is promoted to `PathBuf`s, so a 100k-file repository does not create
-100k transient path allocations and the model-facing map remains capped by `RepoMapLimits`.
+100k transient path allocations and the model-facing map remains capped by `RepoMapLimits`. The
+Git index and fallback `git ls-files` stream are capped at 64 MiB, with stderr retained only up to
+4 KiB, so malformed or unusually large repository metadata cannot create unbounded inventory
+memory.
 
 `aether-terminal` owns raw input, restoration, ANSI/VT presentation, incremental buffer rendering, and platform modules. Tools and agent code never write ANSI.
 

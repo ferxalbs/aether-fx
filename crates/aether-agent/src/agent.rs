@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use aether_core::{
     AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelRequest,
-    ObservedFileState, OpaqueContinuation, SessionId, StepId, ToolCallId, ToolExecutor,
-    ToolInvocation, ToolResult, TurnId, WorkspacePath,
+    ObservedFileState, OpaqueContinuation, SessionId, StepId, ToolExecutor, ToolInvocation,
+    ToolResult, TurnId, WorkspacePath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -865,11 +865,6 @@ fn append_bounded(target: &mut String, value: &str, max_bytes: usize) {
     target.push_str(bounded.as_str());
 }
 
-#[allow(dead_code)]
-fn _tool_call_id_type_is_used(id: ToolCallId) -> String {
-    id.into_string()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -882,8 +877,8 @@ mod tests {
     use aether_core::tools::ToolFuture;
     use aether_core::{
         InspectedFile, ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass,
-        PermissionDecision, ToolDefinition, ToolExecutionContext, ToolInvocation, ToolResult,
-        WorkflowVerification,
+        PermissionDecision, ToolCallId, ToolDefinition, ToolExecutionContext, ToolInvocation,
+        ToolResult, WorkflowVerification,
     };
     use serde_json::json;
 

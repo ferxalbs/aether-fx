@@ -206,7 +206,9 @@ impl ContextEngine {
         if repository_observation && name != "read" {
             self.observe_read(result);
             if read_contains_files(result) {
-                self.snapshot.workflow.record_inspection();
+                self.snapshot
+                    .workflow
+                    .record_inspection_with_provenance(aether_core::EvidenceProvenance::ToolOutput);
             }
         }
         if result.ok {
@@ -263,7 +265,9 @@ impl ContextEngine {
             }
         }
         if name == "read" && result.ok && read_contains_files(result) {
-            self.snapshot.workflow.record_inspection();
+            self.snapshot
+                .workflow
+                .record_inspection_with_provenance(aether_core::EvidenceProvenance::ToolOutput);
         }
         if result.ok
             && matches!(name, "read" | "find" | "list" | "search" | "git" | "write" | "patch")
@@ -925,7 +929,10 @@ impl ContextEngine {
 
     fn record_relevant_path(&mut self, path: &str) {
         if path_is_workspace_relative(path) {
-            self.snapshot.workflow.record_relevant_file(path);
+            self.snapshot.workflow.record_relevant_file_with_provenance(
+                aether_core::EvidenceProvenance::ToolOutput,
+                path,
+            );
         }
     }
 

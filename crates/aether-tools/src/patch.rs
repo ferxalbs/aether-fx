@@ -380,11 +380,6 @@ pub fn apply_patch_text(source: &str, hunks: &[PatchHunk]) -> Result<String, Str
     Ok(result)
 }
 
-#[allow(dead_code)]
-fn _hash_file_is_available(path: &std::path::Path) -> bool {
-    hash_file(path, &CancellationFlag::new()).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

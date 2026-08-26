@@ -85,3 +85,21 @@ staged patch application, 75.541 µs for persistent-process buffer reads, 6.0157
 registry lookup, and 4.1667 ms for session replay. Process startup measured 48.749 ms and the
 fresh `rg` comparison measured 50.907 ms; both include process startup and are diagnostic rather
 than direct in-process comparisons.
+
+Final exact-tree acceptance measurements on 2026-08-25 used 100 Criterion samples. Selected
+medians were 49.144 ms for process startup, 73.074 µs for a small-file read, 1.7302 ms for a
+large-file read, 1.5262 ms for directory listing, 825.93 µs for content search, 110.30 µs for
+tool dispatch, 59.627 µs for blocking dispatch, 1.7901 ms for atomic writes, 1.9240 ms for staged
+patch application, 76.504 µs for persistent-process reads, 5.9977 µs for process lookup, and
+4.2554 ms for session replay. Fresh `rg` measured 51.894 ms. Criterion reported only small
+single-host run-to-run variations against its saved baseline; the changed prepared-action,
+provenance, and inventory code is not exercised by the affected legacy dispatch benchmarks, and
+no benchmark command failed.
+
+The final stripped release `aether` binary was 5,811,656 bytes. macOS fresh-process probes
+reported approximately 60 ms and peak RSS of 7,528,448 bytes for `--version`, 50 ms and
+7,491,584 bytes for `--help`, and 50 ms and 7,741,440 bytes for minimal no-model startup with
+an isolated temporary workspace. The minimal probe exits with the expected `no model selected`
+diagnostic; RSS is unavailable in the sandboxed probe but was captured with the approved native
+`/usr/bin/time -l` run. These are single-host local measurements; historical release-size and
+startup observations are retained above rather than presented as cross-machine claims.

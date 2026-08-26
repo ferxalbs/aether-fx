@@ -1,5 +1,3 @@
-use std::fs;
-
 use aether_core::{CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,13 +153,10 @@ fn revalidate_hash(
     }
 }
 
-#[allow(dead_code)]
-fn _metadata_is_file(path: &std::path::Path) -> bool {
-    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::common::{ToolInternalError, stage_replacement};
 

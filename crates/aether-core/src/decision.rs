@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::BoundedText;
+use crate::{BoundedText, EvidenceProvenance};
 
 /// Maximum retained evidence records for one coding task.
 pub const MAX_DECISION_EVIDENCE: usize = 32;
@@ -78,10 +78,17 @@ impl DecisionAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DecisionEvidence {
     pub kind: DecisionEvidenceKind,
+    /// Origin of the evidence. This is never treated as user authorization by itself.
+    #[serde(default = "default_evidence_provenance")]
+    pub provenance: EvidenceProvenance,
     pub path: BoundedText,
     pub detail: BoundedText,
     pub weight: u16,
     pub revision: u32,
+}
+
+fn default_evidence_provenance() -> EvidenceProvenance {
+    EvidenceProvenance::Repository
 }
 
 /// One unresolved, actionable question that prevents a stronger decision.
@@ -134,6 +141,27 @@ impl DecisionState {
         weight: u16,
         revision: u32,
     ) {
+        self.record_evidence_with_provenance(
+            EvidenceProvenance::Repository,
+            kind,
+            path,
+            detail,
+            weight,
+            revision,
+        );
+    }
+
+    /// Add evidence with an explicit origin. Provenance affects diagnostics and trust decisions;
+    /// it never grants user authorization without a separate permission decision.
+    pub fn record_evidence_with_provenance(
+        &mut self,
+        provenance: EvidenceProvenance,
+        kind: DecisionEvidenceKind,
+        path: impl AsRef<str>,
+        detail: impl AsRef<str>,
+        weight: u16,
+        revision: u32,
+    ) {
         let path = BoundedText::new(path, MAX_DECISION_FIELD_BYTES);
         let detail = BoundedText::new(detail, MAX_DECISION_FIELD_BYTES);
         if path.as_str().is_empty() && detail.as_str().is_empty() {
@@ -141,6 +169,7 @@ impl DecisionState {
         }
         if let Some(existing) = self.evidence.iter_mut().find(|existing| {
             existing.kind == kind
+                && existing.provenance == provenance
                 && existing.path == path
                 && existing.detail == detail
                 && existing.revision == revision
@@ -151,7 +180,7 @@ impl DecisionState {
         if self.evidence.len() == MAX_DECISION_EVIDENCE {
             self.evidence.remove(0);
         }
-        self.evidence.push(DecisionEvidence { kind, path, detail, weight, revision });
+        self.evidence.push(DecisionEvidence { kind, provenance, path, detail, weight, revision });
         self.progress_confidence =
             self.progress_confidence.saturating_add((weight.min(10)) as u8).min(100);
     }
@@ -308,5 +337,38 @@ impl DecisionState {
             right.score.cmp(&left.score).then_with(|| left.path.as_str().cmp(right.path.as_str()))
         });
         self.candidate_files.truncate(MAX_DECISION_CANDIDATES);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{PermissionClass, PreparedAction, ToolCallId, ToolInvocation};
+
+    use super::*;
+
+    #[test]
+    fn evidence_origin_is_retained_without_granting_user_authority() {
+        let mut state = DecisionState::new();
+        state.record_evidence_with_provenance(
+            EvidenceProvenance::ToolOutput,
+            DecisionEvidenceKind::Inspection,
+            "src/lib.rs",
+            "read completed",
+            42,
+            0,
+        );
+        assert_eq!(state.evidence[0].provenance, EvidenceProvenance::ToolOutput);
+
+        let action = PreparedAction::fallback(
+            ToolInvocation {
+                call_id: ToolCallId::new("model-write").expect("call id"),
+                name: "write".to_owned(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+            },
+            PermissionClass::WorkspaceWrite,
+        );
+        assert_eq!(action.provenance(), EvidenceProvenance::Model);
+        assert!(action.requirements.user_authorization);
+        assert!(action.requirements.current_workspace_evidence);
     }
 }

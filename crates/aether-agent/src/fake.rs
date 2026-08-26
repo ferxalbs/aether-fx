@@ -6,7 +6,7 @@ use aether_core::{ModelEvent, ModelRequest, ToolCallId};
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::{BackendError, BackendFuture, BackendStream, ModelBackend, ModelCatalogItem};
+use crate::{BackendError, BackendFuture, ModelBackend, ModelCatalogItem};
 
 /// A deterministic tool call used by tests and local development.
 #[derive(Clone, Debug)]
@@ -146,12 +146,4 @@ impl ModelBackend for FakeBackend {
             }])
         })
     }
-}
-
-/// Keep the compiler aware that the fake receiver is intentionally bounded.
-#[allow(dead_code)]
-fn _stream_type_is_send(
-    stream: BackendStream,
-) -> Pin<Box<dyn Future<Output = BackendStream> + Send>> {
-    Box::pin(async move { stream })
 }

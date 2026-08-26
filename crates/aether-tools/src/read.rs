@@ -1,7 +1,4 @@
-use std::{
-    fs::File,
-    io::{self, Read},
-};
+use std::{fs::File, io::Read};
 
 use aether_core::{
     BoundedText, CancellationFlag, PermissionClass, ToolCallId, ToolExecutionContext,
@@ -195,9 +192,6 @@ fn read_limited(
     }
     Ok((bytes, truncated))
 }
-
-#[allow(dead_code)]
-fn _read_error_is_io(_: io::Error) {}
 
 #[cfg(test)]
 mod tests {

@@ -7,9 +7,9 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, BufRead, BufReader, Read},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
@@ -31,6 +31,10 @@ pub const DEFAULT_MAX_REPO_INSTRUCTION_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_REPO_README_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_REPO_MAP_BYTES: usize = 12 * 1024;
 pub const DEFAULT_MAX_REPO_MAP_ITEMS: usize = 64;
+/// Maximum Git index or NUL-delimited path-list bytes consumed by one inventory refresh.
+pub const MAX_REPO_INDEX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REPO_ERROR_BYTES: usize = 4 * 1024;
+const MAX_REPO_INDEX_ENTRIES: usize = MAX_REPO_INDEX_BYTES / 62;
 
 /// Limits that keep both the retained map and metadata reads bounded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -879,11 +883,17 @@ fn collect_inventory(root: &Path, limits: RepoMapLimits) -> Result<Inventory, Re
 
 fn read_git_index(index_path: &Path) -> io::Result<(PackedPaths, Option<FileStamp>)> {
     let mut file = File::open(index_path)?;
-    let metadata = file.metadata().ok();
-    let mut bytes = Vec::with_capacity(metadata.as_ref().map_or(0, fs::Metadata::len) as usize);
-    file.read_to_end(&mut bytes)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_REPO_INDEX_BYTES as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "git index exceeds bounded limit"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref().take(MAX_REPO_INDEX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_REPO_INDEX_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "git index exceeds bounded limit"));
+    }
     let paths = parse_git_index(&bytes)?;
-    let stamp = metadata.as_ref().map(file_stamp_from_metadata);
+    let stamp = Some(file_stamp_from_metadata(&metadata));
     Ok((paths, stamp))
 }
 
@@ -902,6 +912,9 @@ fn parse_git_index(bytes: &[u8]) -> io::Result<PackedPaths> {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported git index version"));
     }
     let count = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed index count")) as usize;
+    if count > MAX_REPO_INDEX_ENTRIES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "git index has too many entries"));
+    }
     let mut paths = PackedPaths::with_capacity(count);
     let mut offset = HEADER_LEN;
     for _ in 0..count {
@@ -957,24 +970,89 @@ fn parse_git_index(bytes: &[u8]) -> io::Result<PackedPaths> {
 }
 
 fn git_ls_files(root: &Path) -> Result<PackedPaths, RepoMapError> {
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--cached", "-z"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(RepoMapError::Git)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RepoMapError::GitCommand(
+                "git ls-files produced no stdout pipe".to_owned(),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RepoMapError::GitCommand(
+                "git ls-files produced no stderr pipe".to_owned(),
+            ));
+        }
+    };
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(MAX_REPO_ERROR_BYTES as u64 + 1).read_to_end(&mut bytes);
+        bytes
+    });
+    let mut reader = BufReader::new(stdout);
+    let mut packed = PackedPaths::default();
+    let mut path = Vec::new();
+    let mut total_bytes = 0usize;
+    loop {
+        path.clear();
+        let read = match reader.read_until(0, &mut path) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(RepoMapError::Git(error));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read);
+        if total_bytes > MAX_REPO_INDEX_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(RepoMapError::GitCommand(
+                "git ls-files output exceeds bounded limit".to_owned(),
+            ));
+        }
+        if path.last() == Some(&0) {
+            path.pop();
+        }
+        if !path.is_empty() {
+            packed.push_git_bytes(&path);
+        }
+    }
+    drop(reader);
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stderr_reader.join();
+            return Err(RepoMapError::Git(error));
+        }
+    };
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
         return Err(RepoMapError::GitCommand(if stderr.is_empty() {
             "repository is not indexed by git".to_owned()
         } else {
             stderr
         }));
-    }
-    let paths = output.stdout.split(|byte| *byte == 0).filter(|path| !path.is_empty());
-    let mut packed = PackedPaths::with_capacity(paths.size_hint().0);
-    for path in paths {
-        packed.push_git_bytes(path);
     }
     Ok(packed)
 }

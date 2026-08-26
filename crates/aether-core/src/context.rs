@@ -43,6 +43,10 @@ pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
 pub const MAX_CONTEXT_RENDER_BYTES: usize = 24 * 1024;
 /// Maximum relevant paths listed in a search/find summary.
 pub const MAX_SUMMARY_PATHS: usize = 8;
+/// Maximum diagnostic records retained in a compact command summary.
+pub const MAX_DIAGNOSTIC_ITEMS: usize = 8;
+/// Maximum bytes retained for one compiler/test diagnostic detail.
+pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 256;
 
 /// Last observed existence of an inspected workspace file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -457,7 +461,9 @@ fn compact_command(data: &Value) -> Option<String> {
         text.push('\n');
         text.push_str(&tests);
     } else {
-        let preview = first_nonempty_lines(if stdout.is_empty() { stderr } else { stdout }, 4);
+        let preview = compact_diagnostics(stdout, stderr).unwrap_or_else(|| {
+            first_nonempty_lines(if stdout.is_empty() { stderr } else { stdout }, 4)
+        });
         if !preview.is_empty() {
             text.push('\n');
             text.push_str(&preview);
@@ -469,6 +475,9 @@ fn compact_command(data: &Value) -> Option<String> {
 fn compact_from_text(name: &str, ok: bool, output: &str) -> String {
     if let Some(tests) = compact_test_output(output, "") {
         return format!("{name} {}: {tests}", if ok { "ok" } else { "failed" });
+    }
+    if let Some(diagnostics) = compact_diagnostics(output, "") {
+        return format!("{name} {}: {diagnostics}", if ok { "ok" } else { "failed" });
     }
     let preview = first_nonempty_lines(output, 4);
     if preview.is_empty() {
@@ -491,7 +500,7 @@ fn compact_test_output(stdout: &str, stderr: &str) -> Option<String> {
         }
     }
     let failed_names = failed_test_names(&combined);
-    match (passed, failed) {
+    let mut text = match (passed, failed) {
         (Some(passed), Some(failed)) => {
             let mut text = format!("tests:\n{passed} passed\n{failed} failed");
             if !failed_names.is_empty() {
@@ -513,7 +522,112 @@ fn compact_test_output(stdout: &str, stderr: &str) -> Option<String> {
             Some(text)
         }
         _ => None,
+    }?;
+    if let Some(diagnostics) = compact_diagnostics(stdout, stderr) {
+        text.push('\n');
+        text.push_str(&diagnostics);
     }
+    Some(text)
+}
+
+fn compact_diagnostics(stdout: &str, stderr: &str) -> Option<String> {
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        let Some(location) = diagnostic_location(line) else { continue };
+        let symbol = diagnostic_symbol(line);
+        let code = diagnostic_code(line);
+        let detail = BoundedText::new(line.trim(), MAX_DIAGNOSTIC_DETAIL_BYTES);
+        let mut entry = location;
+        if let Some(code) = code {
+            entry.push_str(" code=");
+            entry.push_str(code);
+        }
+        if let Some(symbol) = symbol {
+            entry.push_str(" symbol=");
+            entry.push_str(symbol);
+        }
+        entry.push_str(" detail=");
+        entry.push_str(detail.as_str());
+        if seen.insert(entry.clone()) {
+            entries.push(entry);
+        }
+        if entries.len() == MAX_DIAGNOSTIC_ITEMS {
+            break;
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        let mut text = String::from("diagnostics:");
+        for entry in entries {
+            text.push_str("\n- ");
+            text.push_str(&entry);
+        }
+        Some(text)
+    }
+}
+
+fn diagnostic_location(line: &str) -> Option<String> {
+    for token in line.split_whitespace() {
+        let token = token.trim_matches(|ch: char| "`[](),;".contains(ch));
+        let mut parts = token.rsplitn(3, ':');
+        let Some(last) = parts.next() else { continue };
+        let Some(previous) = parts.next() else { continue };
+        if !last.chars().all(|ch| ch.is_ascii_digit())
+            || !previous.chars().all(|ch| ch.is_ascii_digit())
+        {
+            continue;
+        }
+        let Some(path) = parts.next() else { continue };
+        let line_number = previous;
+        let column = Some(last);
+        if line_number.is_empty()
+            || line_number.len() > 10
+            || line_number.parse::<usize>().is_err()
+            || (!path.contains('/') && !path.contains('.'))
+        {
+            continue;
+        }
+        let mut location = format!("{path}:{line_number}");
+        if let Some(column) = column {
+            location.push(':');
+            location.push_str(column);
+        }
+        return Some(location);
+    }
+    None
+}
+
+fn diagnostic_code(line: &str) -> Option<&str> {
+    let start = line.find("error[")? + "error[".len();
+    let end = line[start..].find(']')? + start;
+    let code = &line[start..end];
+    (!code.is_empty() && code.len() <= 16).then_some(code)
+}
+
+fn diagnostic_symbol(line: &str) -> Option<&str> {
+    if let Some(start) = line.find('`') {
+        let rest = &line[start + 1..];
+        let end = rest.find('`')?;
+        let symbol = &rest[..end];
+        if !symbol.is_empty() && symbol.len() <= 96 {
+            return Some(symbol);
+        }
+    }
+    for marker in ["test ", "fn ", "struct ", "enum "] {
+        if let Some(start) = line.find(marker) {
+            let start = start + marker.len();
+            let symbol = line[start..]
+                .split(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '<' | ':'))
+                .next()
+                .unwrap_or_default();
+            if !symbol.is_empty() && symbol.len() <= 96 {
+                return Some(symbol);
+            }
+        }
+    }
+    None
 }
 
 fn failed_test_names(output: &str) -> Vec<String> {
@@ -640,6 +754,27 @@ mod tests {
         assert!(summary.summary.as_str().contains("2 failed"));
         assert!(summary.summary.as_str().contains("context_restore"));
         assert!(summary.summary.as_str().contains("stale_hash"));
+    }
+
+    #[test]
+    fn compact_tool_result_extracts_bounded_actionable_diagnostics() {
+        let result = ToolResult::success_json(
+            ToolCallId::new("c3").unwrap(),
+            serde_json::json!({
+                "program": "cargo",
+                "args": ["check"],
+                "success": false,
+                "exit_code": 101,
+                "stdout": "error[E0308]: mismatched types\n --> src/lib.rs:12:5 in fn parse_value\n     | expected String, found usize",
+                "stderr": ""
+            }),
+            64 * 1024,
+        );
+        let summary = compact_tool_result("shell", &result);
+        assert!(summary.summary.as_str().contains("diagnostics:"));
+        assert!(summary.summary.as_str().contains("src/lib.rs:12:5"));
+        assert!(summary.summary.as_str().contains("symbol=parse_value"));
+        assert!(!summary.summary.as_str().contains("expected String, found usize"));
     }
 
     #[test]
