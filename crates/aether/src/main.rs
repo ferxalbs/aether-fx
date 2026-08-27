@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use aether_agent::{
     Agent, AgentError, AgentRequest, AgentRunResult, AllowAllPermissionBroker, CancellationToken,
-    ModelBackend, PermissionBroker, PersistTurn, SessionPermissionBroker, SessionStore,
-    SessionStoreError, persist_turn,
+    ModelBackend, PermissionBroker, PersistCheckpoint, PersistTurn, SessionPermissionBroker,
+    SessionStore, SessionStoreError, persist_checkpoint, persist_turn,
 };
 use aether_core::{
     AgentEvent, BoundedText, PermissionRequest, SessionId, SessionRecord, ToolExecutor, TurnId,
@@ -339,7 +339,7 @@ async fn run_interactive(
             request.workspace_root = Some(live_root.display().to_string());
             request.context_seed = context_seed.clone();
             request.metrics = json_output;
-            if let Some(result) = run_agent_turn(
+            let turn_result = run_agent_turn(
                 &agent,
                 request,
                 if yolo { &allow_all } else { &broker },
@@ -347,21 +347,33 @@ async fn run_interactive(
                 &mut renderer,
                 json_output,
             )
-            .await?
-            {
-                if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&serde_json::json!({
-                            "text": result.text.as_str(),
-                            "metrics": &result.metrics,
-                        }))
-                        .map_err(|error| AppError::Message(error.to_string()))?
-                    );
+            .await;
+            match turn_result {
+                Ok(Some(result)) => {
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "text": result.text.as_str(),
+                                "metrics": &result.metrics,
+                            }))
+                            .map_err(|error| AppError::Message(error.to_string()))?
+                        );
+                    }
+                    persist_completed_turn(&store, &turn_id, &result).await?;
+                    continuation = result.continuation;
+                    context_seed = Some(result.context);
                 }
-                persist_completed_turn(&store, &turn_id, &result).await?;
-                continuation = result.continuation;
-                context_seed = Some(result.context);
+                Ok(None) => {
+                    persist_incomplete_turn(&store, &turn_id, &agent, true).await?;
+                    context_seed = Some(agent.context_snapshot());
+                    continuation =
+                        context_seed.as_ref().and_then(|context| context.continuation.clone());
+                }
+                Err(error) => {
+                    persist_incomplete_turn(&store, &turn_id, &agent, false).await?;
+                    return Err(error);
+                }
             }
 
             if single_pass {
@@ -557,6 +569,37 @@ async fn persist_completed_turn(
         persist_turn(
             &mut store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             PersistTurn { turn_id: &turn_id, steps, cancelled, context: &context, continuation },
+        )
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("session worker failed: {error}")))??;
+    Ok(())
+}
+
+async fn persist_incomplete_turn<B, T>(
+    store: &Arc<Mutex<SessionStore>>,
+    turn_id: &TurnId,
+    agent: &Agent<B, T>,
+    cancelled: bool,
+) -> Result<(), AppError>
+where
+    B: ModelBackend + 'static,
+    T: ToolExecutor + 'static,
+{
+    let store = Arc::clone(store);
+    let turn_id = turn_id.clone();
+    let context = agent.context_snapshot();
+    let continuation = context.continuation.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_checkpoint(
+            &mut store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            PersistCheckpoint {
+                turn_id: &turn_id,
+                steps: 0,
+                cancelled,
+                context: &context,
+                continuation,
+            },
         )
     })
     .await

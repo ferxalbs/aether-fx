@@ -23,6 +23,16 @@ terminal input → aether-agent → ModelBackend → aether-rainy → Rainy SDK 
 agent events ───────────────────────────────────────→ aether-terminal
 ```
 
+The autonomous work loop is deliberately evidence-driven rather than a second planner:
+
+```text
+understand → acquire bounded repository evidence → decide → act → observe
+     ↑                                                        ↓
+     └──── recover from typed failure / stale evidence ← verify
+                              ↓
+                       update WorkState → continue or finish
+```
+
 Every model tool event becomes one `PreparedAction` at the registry boundary. It carries the
 normalized typed input, stable binary fingerprint, bounded resource footprint, action class,
 permission/authority requirements, normalized paths, command effects, and model provenance. Policy,
@@ -63,6 +73,10 @@ Rainy adapter
 
 `aether-agent` owns the backend-neutral turn loop, cancellation, permission handshake, continuation, bounded context engine, and local JSONL session store. Its `ModelBackend` contract uses bounded Tokio channels and does not expose Rainy types. Interactive turns reuse the agent, tool registry, process registry, permission grants, backend, and working context; cancellation returns control to the next prompt without destroying established session processes. A permission prompt reports terminal cancellation separately from an ordinary denial, so Ctrl+C cancels the whole turn and cannot become a model-visible denial. Session append/replay/compact run in `spawn_blocking` so the current-thread control task does not perform session I/O.
 
+For complex prompts, `aether-core::WorkState` adds a compact adaptive work ledger: normalized objective, explicit acceptance criteria, bounded path subgoals, dependencies, active status, evidence, mutations, verification records, and typed blockers. Simple prompts retain the simple path. The main model still chooses the decomposition and implementation strategy; the runtime records observable work and refuses completion when concrete mutated-path work or blockers remain. Failed verification output is reduced to bounded path/line/column/code/symbol diagnostics, so a later model step can form a new hypothesis without retaining raw command output. Restored contexts are re-hashed against the live workspace before any resumed action and again before completion.
+
+An interrupted or step-limited turn is appended as a `Checkpoint`, distinct from a completed `TurnSnapshot`. Checkpoints contain only the same minimized context and sanitized continuation allowed for normal session persistence. Resume therefore recovers the latest active work state, unresolved blockers, current workspace evidence, and completion status without relying on hidden conversation history. The runtime remains single-agent; the repository action planner is a bounded read-only optimization for high-confidence local evidence, not an additional model or project-management system.
+
 `aether-rainy` is the only crate that imports `rainy_sdk`. It maps the SDK's dynamic Responses stream values into AETHER `ModelEvent` values and treats provider reasoning metadata as opaque continuation data. A successful `ModelEvent::Done` requires a verified `response.completed` event and a response identity; failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No provider endpoint, model catalog, or key appears elsewhere.
 
 `aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
@@ -78,7 +92,7 @@ memory.
 
 There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in this bootstrap.
 
-Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json` plus `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 3 stores `Started`, committed `TurnSnapshot` records, and `Finished`. Each completed turn is one JSONL record containing turn metadata, minimized context (paths/hashes/ranges and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the last committed turn, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
+Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json` plus `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 5 stores `Started`, committed `TurnSnapshot` records, resumable `Checkpoint` records, and `Finished`. Each turn record contains only bounded metadata, minimized context (paths/hashes/ranges, structured work state, and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the latest committed turn or checkpoint, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
 
 Context bounds (also documented on the constants in `aether-core::context`):
 
@@ -96,3 +110,7 @@ Context bounds (also documented on the constants in `aether-core::context`):
 | Compact summary | 2 KiB |
 | Git snapshot | 4 KiB |
 | Context packet | 24 KiB |
+| Work objective | 512 B |
+| Work subgoals | 16 |
+| Work evidence / mutations / verifications | 32 / 24 / 24 |
+| Work blockers | 8 |

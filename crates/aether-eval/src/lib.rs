@@ -86,6 +86,11 @@ pub struct ExecutionMetrics {
     pub policy_feedback_bytes: u64,
     pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
+    pub verification_failures: u32,
+    pub recovery_attempts: u32,
+    pub recovery_successes: u32,
+    pub stale_evidence_violations: u32,
+    pub unresolved_work_at_finish: u32,
     pub process_spawns: u32,
     pub wall_time_ms: u64,
     pub provider_wait_ms: u64,
@@ -148,6 +153,11 @@ pub struct TaskResult {
     pub policy_feedback_bytes: u64,
     pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
+    pub verification_failures: u32,
+    pub recovery_attempts: u32,
+    pub recovery_successes: u32,
+    pub stale_evidence_violations: u32,
+    pub unresolved_work_at_finish: u32,
     pub process_spawns: u32,
     pub agent_wall_time_ms: u64,
     pub provider_wait_ms: u64,
@@ -160,6 +170,75 @@ pub struct TaskResult {
     pub final_test_status: String,
     pub failure: Option<String>,
     pub trajectory: TrajectoryMetrics,
+}
+
+/// Result for one difficult long-horizon task executed through a checkpoint/resume boundary.
+#[derive(Debug, Serialize)]
+pub struct CapabilityTaskResult {
+    pub task_id: String,
+    pub category: String,
+    pub baseline_success: bool,
+    pub resumed_success: bool,
+    pub success_at_1: bool,
+    pub trials: u32,
+    pub previously_unsolved: bool,
+    pub multi_file_correctness: bool,
+    pub checkpoint_captured: bool,
+    pub work_state_survived: bool,
+    pub recovery_observed: bool,
+    pub user_change_tested: bool,
+    pub user_change_corruption: bool,
+    pub stale_evidence_violations: u32,
+    pub model_requests: u32,
+    pub tool_executions: u32,
+    pub process_spawns: u32,
+    pub context_bytes: u64,
+    pub bytes_shown_to_model: u64,
+    pub wall_time_ms: u64,
+    pub verification_attempts: u32,
+    pub verification_failures: u32,
+    pub unresolved_work_at_finish: u32,
+    pub failure: Option<String>,
+}
+
+/// Aggregate capability metrics kept separate from the deterministic economy/regression gate.
+#[derive(Debug, Serialize)]
+pub struct CapabilityAggregate {
+    pub tasks: usize,
+    pub trials: u32,
+    pub succeeded: usize,
+    pub success_rate: f64,
+    pub success_at_1: usize,
+    pub baseline_succeeded: usize,
+    pub baseline_success_rate: f64,
+    pub previously_unsolved: usize,
+    pub multi_file_correct: usize,
+    pub checkpoint_resume_successes: usize,
+    pub recovery_successes: usize,
+    pub user_change_tests: usize,
+    pub user_change_corruptions: usize,
+    pub false_completion_count: usize,
+    pub stale_evidence_violations: u32,
+    pub model_requests: u32,
+    pub tool_executions: u32,
+    pub process_spawns: u32,
+    pub context_bytes: u64,
+    pub bytes_shown_to_model: u64,
+    pub wall_time_ms: u64,
+    pub verification_attempts: u32,
+    pub verification_failures: u32,
+    pub unresolved_work_at_finish: u32,
+}
+
+/// Separate hard-task suite. Its threshold requires a real gain over the interrupted baseline;
+/// it is never folded into the 9/9 deterministic regression suite.
+#[derive(Debug, Serialize)]
+pub struct CapabilitySuiteResult {
+    pub schema_version: u32,
+    pub backend: String,
+    pub success: bool,
+    pub aggregate: CapabilityAggregate,
+    pub tasks: Vec<CapabilityTaskResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +265,11 @@ pub struct AggregateMetrics {
     pub policy_feedback_bytes: u64,
     pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
+    pub verification_failures: u32,
+    pub recovery_attempts: u32,
+    pub recovery_successes: u32,
+    pub stale_evidence_violations: u32,
+    pub unresolved_work_at_finish: u32,
     pub process_spawns: u32,
     pub agent_wall_time_ms: u64,
     pub provider_wait_ms: u64,
@@ -303,6 +387,166 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
         fs::write(path, json).map_err(|error| format!("write {}: {error}", path.display()))?;
     }
     Ok(suite)
+}
+
+/// Run genuinely difficult capability scenarios independently from the 9/9 regression gate.
+pub fn run_capability_suite(output: Option<&Path>) -> Result<CapabilitySuiteResult, String> {
+    let cases = [
+        (
+            &MULTI_FILE,
+            LONG_HORIZON_PREFIX,
+            LONG_HORIZON_REMAINING,
+            "cross-module multi-file long horizon",
+            None,
+            None,
+        ),
+        (
+            &FAILED_FIRST,
+            COMPILER_RECOVERY_PREFIX,
+            COMPILER_RECOVERY_REMAINING,
+            "compiler-error-driven recovery",
+            None,
+            None,
+        ),
+        (
+            &WORKSPACE_TASK,
+            WORKSPACE_PREFIX,
+            WORKSPACE_REMAINING,
+            "cross-crate workspace migration",
+            None,
+            None,
+        ),
+        (
+            &STALE_OBSERVATION,
+            STALE_PREFIX,
+            STALE_REMAINING,
+            "stale observation recovery",
+            Some(("src/lib.rs", STALE_EXTERNAL)),
+            None,
+        ),
+        (
+            &DIRTY_WORKTREE,
+            DIRTY_PREFIX,
+            DIRTY_REMAINING,
+            "dirty-tree user-work preservation",
+            Some(("README.md", DIRTY_NOTE)),
+            Some("README.md"),
+        ),
+    ];
+    let tasks = cases
+        .into_iter()
+        .map(|(task, first, remaining, category, external_change, preserved_path)| {
+            real::run_resumable_task_with_change(
+                task,
+                first,
+                remaining,
+                category,
+                external_change,
+                preserved_path,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let succeeded = tasks.iter().filter(|task| task.resumed_success).count();
+    let baseline_succeeded = tasks.iter().filter(|task| task.baseline_success).count();
+    let checkpoint_resume_successes =
+        tasks.iter().filter(|task| task.checkpoint_captured && task.resumed_success).count();
+    let recovery_successes = tasks.iter().filter(|task| task.recovery_observed).count();
+    let false_completion_count = tasks
+        .iter()
+        .filter(|task| task.resumed_success && task.unresolved_work_at_finish > 0)
+        .count();
+    let aggregate = CapabilityAggregate {
+        tasks: tasks.len(),
+        trials: tasks.iter().map(|task| task.trials).sum(),
+        succeeded,
+        success_rate: ratio(succeeded, tasks.len()),
+        success_at_1: tasks.iter().filter(|task| task.success_at_1).count(),
+        baseline_succeeded,
+        baseline_success_rate: ratio(baseline_succeeded, tasks.len()),
+        previously_unsolved: tasks.iter().filter(|task| task.previously_unsolved).count(),
+        multi_file_correct: tasks.iter().filter(|task| task.multi_file_correctness).count(),
+        checkpoint_resume_successes,
+        recovery_successes,
+        user_change_tests: tasks.iter().filter(|task| task.user_change_tested).count(),
+        user_change_corruptions: tasks.iter().filter(|task| task.user_change_corruption).count(),
+        false_completion_count,
+        stale_evidence_violations: tasks.iter().map(|task| task.stale_evidence_violations).sum(),
+        model_requests: tasks.iter().map(|task| task.model_requests).sum(),
+        tool_executions: tasks.iter().map(|task| task.tool_executions).sum(),
+        process_spawns: tasks.iter().map(|task| task.process_spawns).sum(),
+        context_bytes: tasks.iter().map(|task| task.context_bytes).sum(),
+        bytes_shown_to_model: tasks.iter().map(|task| task.bytes_shown_to_model).sum(),
+        wall_time_ms: tasks.iter().map(|task| task.wall_time_ms).sum(),
+        verification_attempts: tasks.iter().map(|task| task.verification_attempts).sum(),
+        verification_failures: tasks.iter().map(|task| task.verification_failures).sum(),
+        unresolved_work_at_finish: tasks.iter().map(|task| task.unresolved_work_at_finish).sum(),
+    };
+    let success = aggregate.succeeded > aggregate.baseline_succeeded
+        && aggregate.checkpoint_resume_successes == aggregate.tasks
+        && aggregate.user_change_corruptions == 0
+        && aggregate.false_completion_count == 0;
+    let suite = CapabilitySuiteResult {
+        schema_version: 1,
+        backend: "deterministic-checkpoint-replay".to_owned(),
+        success,
+        aggregate,
+        tasks,
+    };
+    if let Some(path) = output {
+        let json = serde_json::to_vec_pretty(&suite).map_err(|error| error.to_string())?;
+        fs::write(path, json).map_err(|error| format!("write {}: {error}", path.display()))?;
+    }
+    Ok(suite)
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 }
+}
+
+/// Compact capability output suitable for CI logs without hiding per-task JSON evidence.
+pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
+    let mut output = String::new();
+    for task in &suite.tasks {
+        let mark = if task.resumed_success { "PASS" } else { "FAIL" };
+        output.push_str(&format!(
+            "{mark:4} {:28} baseline={} checkpoint={} work={} recovery={} user_change={} verify={}/{} stale={} unresolved={}\n",
+            task.task_id,
+            task.baseline_success,
+            task.checkpoint_captured,
+            task.work_state_survived,
+            task.recovery_observed,
+            task.user_change_tested && !task.user_change_corruption,
+            task.verification_attempts,
+            task.verification_failures,
+            task.stale_evidence_violations,
+            task.unresolved_work_at_finish,
+        ));
+    }
+    output.push_str(&format!(
+        "capability: {}/{} ({:.0}%) success_at_1={} baseline={}/{} ({:.0}%) newly_solved={} checkpoint_resume={} recovery={} user_change={}/{} corruptions={} false_completion={} stale={} unresolved={} requests={} tools={} context={}B shown={}B wall={}ms\n",
+        suite.aggregate.succeeded,
+        suite.aggregate.tasks,
+        suite.aggregate.success_rate * 100.0,
+        suite.aggregate.success_at_1,
+        suite.aggregate.baseline_succeeded,
+        suite.aggregate.tasks,
+        suite.aggregate.baseline_success_rate * 100.0,
+        suite.aggregate.previously_unsolved,
+        suite.aggregate.checkpoint_resume_successes,
+        suite.aggregate.recovery_successes,
+        suite.aggregate.user_change_tests - suite.aggregate.user_change_corruptions,
+        suite.aggregate.user_change_tests,
+        suite.aggregate.user_change_corruptions,
+        suite.aggregate.false_completion_count,
+        suite.aggregate.stale_evidence_violations,
+        suite.aggregate.unresolved_work_at_finish,
+        suite.aggregate.model_requests,
+        suite.aggregate.tool_executions,
+        suite.aggregate.context_bytes,
+        suite.aggregate.bytes_shown_to_model,
+        suite.aggregate.wall_time_ms,
+    ));
+    output
 }
 
 /// Built-in task definitions for provider comparison runners.
@@ -447,6 +691,20 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .map(|result| result.after.protocol_envelope_bytes)
             .sum(),
         verification_attempts: results.iter().map(|result| result.verification_attempts).sum(),
+        verification_failures: results
+            .iter()
+            .map(|result| result.after.verification_failures)
+            .sum(),
+        recovery_attempts: results.iter().map(|result| result.after.recovery_attempts).sum(),
+        recovery_successes: results.iter().map(|result| result.after.recovery_successes).sum(),
+        stale_evidence_violations: results
+            .iter()
+            .map(|result| result.after.stale_evidence_violations)
+            .sum(),
+        unresolved_work_at_finish: results
+            .iter()
+            .map(|result| result.after.unresolved_work_at_finish)
+            .sum(),
         process_spawns: results.iter().map(|result| result.after.process_spawns).sum(),
         agent_wall_time_ms: results.iter().map(|result| result.after.wall_time_ms).sum(),
         provider_wait_ms: results.iter().map(|result| result.after.provider_wait_ms).sum(),
@@ -577,6 +835,59 @@ const MULTI_FILE_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
+const LONG_HORIZON_PREFIX: &[Action] = &[
+    Action::List { path: "src" },
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/slug.rs", contents: MULTI_SLUG },
+    Action::Write { path: "src/lib.rs", contents: MULTI_LIB },
+];
+const LONG_HORIZON_REMAINING: &[Action] = &[Action::Verify, Action::Finish];
+
+const STALE_OBSERVATION: Task = Task {
+    id: "stale-observation-recovery",
+    prompt: "Repair the ambiguous indexing bug after the observed source changes externally, then verify the fresh implementation.",
+    fixture: "targeted-bug",
+    expected_outcomes: TARGETED_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 8,
+    max_tool_calls: 7,
+    max_verification_attempts: 1,
+};
+const STALE_EXTERNAL: &str =
+    "pub fn last_index(values: &[u8]) -> Option<usize> {\n    values.first().map(|_| 0)\n}\n";
+const STALE_PREFIX: &[Action] = &[Action::Read { path: "src/lib.rs" }];
+const STALE_REMAINING: &[Action] = &[
+    Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
+    Action::Verify,
+    Action::Finish,
+];
+
+const DIRTY_OUTCOMES: &[ExpectedOutcome] = &[
+    ExpectedOutcome { path: "src/lib.rs", contains: "values.len() - 1" },
+    ExpectedOutcome { path: "README.md", contains: "user-owned update" },
+];
+const DIRTY_WORKTREE: Task = Task {
+    id: "dirty-worktree-preservation",
+    prompt: "Fix the indexing bug while preserving unrelated user notes in this dirty worktree, then verify the code.",
+    fixture: "dirty-worktree",
+    expected_outcomes: DIRTY_OUTCOMES,
+    verification_command: CARGO_TEST,
+    focused_verification_command: None,
+    max_steps: 6,
+    max_tool_calls: 5,
+    max_verification_attempts: 1,
+};
+const DIRTY_NOTE: &str = "# Local notes\n\nuser-owned update that must survive the coding task.\n";
+const DIRTY_PREFIX: &[Action] = &[Action::List { path: "." }, Action::Read { path: "src/lib.rs" }];
+const DIRTY_REMAINING: &[Action] = &[
+    Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
+    Action::Verify,
+    Action::Finish,
+];
+
 const RECOVERY_OUTCOMES: &[ExpectedOutcome] =
     &[ExpectedOutcome { path: "src/lib.rs", contains: "parse::<u16>()" }];
 const FAILED_FIRST: Task = Task {
@@ -600,6 +911,49 @@ const FAILED_FIRST_SCRIPT: &[Action] = &[
     Action::Verify,
     Action::Finish,
 ];
+
+const COMPILER_RECOVERY_PREFIX: &[Action] = &[
+    Action::Read { path: "src/lib.rs" },
+    Action::Write { path: "src/lib.rs", contents: RECOVERY_WRONG },
+    Action::Verify,
+];
+const COMPILER_RECOVERY_REMAINING: &[Action] = &[
+    Action::Write { path: "src/lib.rs", contents: RECOVERY_FIXED },
+    Action::Verify,
+    Action::Finish,
+];
+
+const WORKSPACE_TEST: &[&str] = &["cargo", "test", "--workspace", "--quiet", "--offline"];
+const WORKSPACE_OUTCOMES: &[ExpectedOutcome] = &[
+    ExpectedOutcome { path: "crates/app/src/lib.rs", contains: "codec::normalize" },
+    ExpectedOutcome { path: "crates/codec/src/lib.rs", contains: "replace(' ', \"-\")" },
+];
+const WORKSPACE_TASK: Task = Task {
+    id: "workspace-aware-migration",
+    prompt: "Migrate the workspace API across the app and codec crates, then verify the callers and tests.",
+    fixture: "workspace-task",
+    expected_outcomes: WORKSPACE_OUTCOMES,
+    verification_command: WORKSPACE_TEST,
+    focused_verification_command: None,
+    max_steps: 8,
+    max_tool_calls: 8,
+    max_verification_attempts: 1,
+};
+const WORKSPACE_PREFIX: &[Action] = &[
+    Action::List { path: "." },
+    Action::Search { query: "normalize", path: "." },
+    Action::Read { path: "crates/app/src/lib.rs" },
+    Action::Read { path: "crates/codec/src/lib.rs" },
+    Action::Write {
+        path: "crates/codec/src/lib.rs",
+        contents: "pub fn normalize(input: &str) -> String {\n    input.trim().to_ascii_lowercase().replace(' ', \"-\")\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn normalize_uses_hyphens() {\n        assert_eq!(super::normalize(\"Hello World\"), \"hello-world\");\n    }\n}\n",
+    },
+    Action::Write {
+        path: "crates/app/src/lib.rs",
+        contents: "pub fn display_name(input: &str) -> String {\n    codec::normalize(input)\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn display_name_uses_codec_contract() {\n        assert_eq!(super::display_name(\"Hello World\"), \"hello-world\");\n    }\n}\n",
+    },
+];
+const WORKSPACE_REMAINING: &[Action] = &[Action::Verify, Action::Finish];
 
 const REDUNDANT_OUTCOMES: &[ExpectedOutcome] =
     &[ExpectedOutcome { path: "src/lib.rs", contains: "value.trim().is_empty()" }];
@@ -804,6 +1158,21 @@ mod tests {
         assert!(planned.after.planner_hits >= 1);
         assert!(planned.after.planner_hit_rate() > 0.5);
         assert!(suite.aggregate.planner_hit_rate > 0.0);
+    }
+
+    #[test]
+    fn capability_suite_demonstrates_checkpoint_and_recovery_gain() {
+        let suite = run_capability_suite(None).expect("capability suite runs");
+        assert!(suite.success, "{suite:?}");
+        assert!(suite.aggregate.succeeded > suite.aggregate.baseline_succeeded);
+        assert_eq!(suite.aggregate.checkpoint_resume_successes, suite.aggregate.tasks);
+        assert!(suite.aggregate.recovery_successes >= 1);
+        assert!(suite.aggregate.stale_evidence_violations >= 1);
+        assert_eq!(suite.aggregate.user_change_corruptions, 0);
+        assert_eq!(suite.aggregate.false_completion_count, 0);
+        assert_eq!(suite.aggregate.unresolved_work_at_finish, 0);
+        assert!(suite.tasks.iter().all(|task| task.work_state_survived));
+        assert!(suite.tasks.iter().all(|task| task.resumed_success));
     }
 
     #[test]

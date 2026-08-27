@@ -3,7 +3,10 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{BoundedText, OpaqueContinuation, ToolResult, WorkflowState};
+use crate::{
+    BoundedText, MAX_WORKFLOW_DIAGNOSTICS, MAX_WORKFLOW_FIELD_BYTES, OpaqueContinuation,
+    ToolResult, WorkflowDiagnostic, WorkflowState,
+};
 
 /// Maximum persisted session JSONL size, including all records.
 pub const MAX_SESSION_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -568,6 +571,96 @@ fn compact_diagnostics(stdout: &str, stderr: &str) -> Option<String> {
     }
 }
 
+/// Extract bounded, structured diagnostics from a completed tool result.
+///
+/// This deliberately recognizes common compiler/test location forms only. Unrecognized output
+/// remains available through the transient tool result, but is not promoted into durable work
+/// state as if it were a precise diagnostic.
+pub fn extract_diagnostics(result: &ToolResult) -> Vec<WorkflowDiagnostic> {
+    let (stdout, stderr) = result
+        .data
+        .as_ref()
+        .map(|data| {
+            (
+                data.get("stdout").and_then(Value::as_str).unwrap_or(""),
+                data.get("stderr").and_then(Value::as_str).unwrap_or(""),
+            )
+        })
+        .unwrap_or(("", ""));
+    let mut diagnostics = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending_code = "".to_owned();
+    let mut pending_symbol = "".to_owned();
+    for line in stdout.lines().chain(stderr.lines()).chain(std::iter::once(result.output.as_str()))
+    {
+        if let Some(code) = diagnostic_code(line) {
+            pending_code = code.to_owned();
+        }
+        if let Some(symbol) = diagnostic_symbol(line) {
+            pending_symbol = symbol.to_owned();
+        }
+        let Some((path, line_number, column)) = diagnostic_location_parts(line) else { continue };
+        let code = diagnostic_code(line).unwrap_or(&pending_code);
+        let symbol = diagnostic_symbol(line).unwrap_or(&pending_symbol);
+        let detail = redact_diagnostic_detail(line.trim());
+        let key = format!("{path}:{line_number}:{column:?}:{code}:{symbol}:{detail}");
+        if seen.insert(key) {
+            diagnostics.push(WorkflowDiagnostic {
+                path: BoundedText::new(path, MAX_WORKFLOW_FIELD_BYTES),
+                line: line_number,
+                column,
+                code: BoundedText::new(code, MAX_WORKFLOW_FIELD_BYTES),
+                symbol: BoundedText::new(symbol, MAX_WORKFLOW_FIELD_BYTES),
+                detail: BoundedText::new(detail, MAX_DIAGNOSTIC_DETAIL_BYTES),
+            });
+        }
+        if diagnostics.len() == MAX_WORKFLOW_DIAGNOSTICS {
+            break;
+        }
+        pending_code.clear();
+        pending_symbol.clear();
+    }
+    diagnostics
+}
+
+fn diagnostic_location_parts(line: &str) -> Option<(String, u32, Option<u32>)> {
+    for token in line.split_whitespace() {
+        let token = token.trim_matches(|ch: char| "`[](),;".contains(ch));
+        let mut parts = token.rsplitn(3, ':');
+        let Some(last) = parts.next() else { continue };
+        let Some(previous) = parts.next() else { continue };
+        let Some(path) = parts.next() else { continue };
+        if !last.chars().all(|ch| ch.is_ascii_digit())
+            || !previous.chars().all(|ch| ch.is_ascii_digit())
+            || (!path.contains('/') && !path.contains('.'))
+        {
+            continue;
+        }
+        let line_number = previous.parse::<u32>().ok()?;
+        let column = last.parse::<u32>().ok();
+        return Some((path.to_owned(), line_number, column));
+    }
+    None
+}
+
+fn redact_diagnostic_detail(detail: &str) -> String {
+    detail
+        .split_whitespace()
+        .map(|word| {
+            let lower = word.to_ascii_lowercase();
+            if ["token=", "password=", "secret=", "api_key=", "apikey="]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+            {
+                format!("{}<redacted>", word.split('=').next().unwrap_or("value"))
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn diagnostic_location(line: &str) -> Option<String> {
     for token in line.split_whitespace() {
         let token = token.trim_matches(|ch: char| "`[](),;".contains(ch));
@@ -775,6 +868,31 @@ mod tests {
         assert!(summary.summary.as_str().contains("src/lib.rs:12:5"));
         assert!(summary.summary.as_str().contains("symbol=parse_value"));
         assert!(!summary.summary.as_str().contains("expected String, found usize"));
+    }
+
+    #[test]
+    fn structured_diagnostics_keep_location_code_and_symbol_bounded() {
+        let result = ToolResult::success_json(
+            ToolCallId::new("diagnostic-structured").unwrap(),
+            serde_json::json!({
+                "program": "cargo",
+                "args": ["test"],
+                "success": false,
+                "stdout": "error[E0308]: mismatched types\n --> src/lib.rs:12:5 in `parse_value`\n     | token=do-not-store",
+                "stderr": ""
+            }),
+            4096,
+        );
+        let diagnostics = extract_diagnostics(&result);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.path.as_str() == "src/lib.rs")
+            .expect("source diagnostic");
+        assert_eq!(diagnostic.line, 12);
+        assert_eq!(diagnostic.column, Some(5));
+        assert_eq!(diagnostic.code.as_str(), "E0308");
+        assert_eq!(diagnostic.symbol.as_str(), "parse_value");
+        assert!(!diagnostics.iter().any(|item| item.detail.as_str().contains("do-not-store")));
     }
 
     #[test]

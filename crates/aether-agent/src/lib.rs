@@ -57,7 +57,8 @@ pub use repo_map::{
 };
 pub use scheduler::{DEFAULT_MAX_PARALLEL_TOOLS, schedule_ready_calls};
 pub use session::{
-    PersistTurn, ResumableSession, SessionStore, SessionStoreError, SessionSummary, persist_turn,
+    PersistCheckpoint, PersistTurn, ResumableSession, SessionStore, SessionStoreError,
+    SessionSummary, persist_checkpoint, persist_turn,
 };
 pub use symbol_index::{
     MAX_SYMBOL_FILES, MAX_SYMBOL_LOOKUP_RESULTS, MAX_SYMBOL_RELATIONSHIP_FANOUT,

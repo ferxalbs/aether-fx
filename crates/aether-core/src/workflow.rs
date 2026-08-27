@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BoundedText, DecisionState};
+use crate::{BoundedText, DecisionState, WorkState};
 
 /// Maximum number of workspace-relative paths retained as relevant workflow context.
 pub const MAX_WORKFLOW_RELEVANT_FILES: usize = 32;
@@ -10,6 +10,45 @@ pub const MAX_WORKFLOW_FAILURES: usize = 8;
 pub const MAX_WORKFLOW_FIELD_BYTES: usize = 256;
 /// Maximum number of focused verification commands retained.
 pub const MAX_WORKFLOW_VERIFICATIONS: usize = 16;
+/// Maximum structured diagnostics retained for one workflow failure.
+pub const MAX_WORKFLOW_DIAGNOSTICS: usize = 8;
+
+/// Stable category for a failure that may require a changed hypothesis or action.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFailureCategory {
+    #[default]
+    Tool,
+    Verification,
+    StaleEvidence,
+    Permission,
+    Environment,
+    Backend,
+}
+
+impl WorkflowFailureCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Verification => "verification",
+            Self::StaleEvidence => "stale_evidence",
+            Self::Permission => "permission",
+            Self::Environment => "environment",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+/// One bounded compiler/test diagnostic associated with a failed observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkflowDiagnostic {
+    pub path: BoundedText,
+    pub line: u32,
+    pub column: Option<u32>,
+    pub code: BoundedText,
+    pub symbol: BoundedText,
+    pub detail: BoundedText,
+}
 
 /// Result retained for one planned verification command.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -164,6 +203,18 @@ pub struct WorkflowFailure {
     pub code: BoundedText,
     /// Bounded actionable message.
     pub message: BoundedText,
+    /// Typed category used to choose recovery rather than blindly retrying.
+    #[serde(default)]
+    pub category: WorkflowFailureCategory,
+    /// Number of observations for this stable failure key.
+    #[serde(default)]
+    pub attempts: u16,
+    /// Workspace revision at which this failure was observed.
+    #[serde(default)]
+    pub revision: u32,
+    /// Bounded diagnostics extracted from compiler/test output.
+    #[serde(default)]
+    pub diagnostics: Vec<WorkflowDiagnostic>,
 }
 
 impl WorkflowFailure {
@@ -174,11 +225,36 @@ impl WorkflowFailure {
         code: impl AsRef<str>,
         message: impl AsRef<str>,
     ) -> Self {
+        Self::new_at_revision(
+            key,
+            tool,
+            code,
+            message,
+            WorkflowFailureCategory::Tool,
+            0,
+            Vec::new(),
+        )
+    }
+
+    /// Construct a failure with recovery category, revision, and structured diagnostics.
+    pub fn new_at_revision(
+        key: impl AsRef<str>,
+        tool: impl AsRef<str>,
+        code: impl AsRef<str>,
+        message: impl AsRef<str>,
+        category: WorkflowFailureCategory,
+        revision: u32,
+        diagnostics: Vec<WorkflowDiagnostic>,
+    ) -> Self {
         Self {
             key: BoundedText::new(key, MAX_WORKFLOW_FIELD_BYTES),
             tool: BoundedText::new(tool, MAX_WORKFLOW_FIELD_BYTES),
             code: BoundedText::new(code, MAX_WORKFLOW_FIELD_BYTES),
             message: BoundedText::new(message, MAX_WORKFLOW_FIELD_BYTES),
+            category,
+            attempts: 1,
+            revision,
+            diagnostics,
         }
     }
 }
@@ -190,6 +266,9 @@ pub struct WorkflowState {
     pub phase: WorkflowPhase,
     /// Paths identified as relevant by successful discovery or tool observations.
     pub relevant_files: Vec<String>,
+    /// Compact long-horizon objective, subgoals, evidence, and recovery state.
+    #[serde(default)]
+    pub work: WorkState,
     /// Verification state for successful mutations in this task.
     pub verification: WorkflowVerification,
     /// Failures that still block completion.
@@ -240,6 +319,12 @@ impl WorkflowState {
             24,
             self.workspace_revision,
         );
+        self.work.record_evidence(
+            "discovery",
+            &path,
+            "relevant path observed",
+            self.workspace_revision,
+        );
         self.relevant_files.push(path);
         if self.relevant_files.len() > MAX_WORKFLOW_RELEVANT_FILES {
             self.relevant_files.remove(0);
@@ -266,6 +351,12 @@ impl WorkflowState {
             36,
             self.workspace_revision,
         );
+        self.work.record_evidence(
+            "inspection",
+            "",
+            "targeted inspection completed",
+            self.workspace_revision,
+        );
         if !matches!(self.phase, WorkflowPhase::Verify) {
             self.phase = WorkflowPhase::Inspect;
         }
@@ -280,6 +371,11 @@ impl WorkflowState {
 
     /// Record a successful mutation and require focused verification.
     pub fn record_mutation(&mut self) {
+        self.record_mutation_scope("mutation", &[]);
+    }
+
+    /// Record a successful mutation and the exact affected paths.
+    pub fn record_mutation_scope(&mut self, operation: &str, paths: &[String]) {
         self.progress.note_mutation();
         self.workspace_revision = self.workspace_revision.saturating_add(1);
         for step in &mut self.verification_steps {
@@ -288,6 +384,7 @@ impl WorkflowState {
         self.phase = WorkflowPhase::Verify;
         self.verification = WorkflowVerification::Pending;
         self.decision.progress_confidence = self.decision.progress_confidence.min(80);
+        self.work.record_mutation(operation, paths, self.workspace_revision);
     }
 
     /// Add deterministic planning output, deduplicated within the current revision.
@@ -338,6 +435,17 @@ impl WorkflowState {
 
     /// Record the outcome of a focused verification attempt.
     pub fn record_verification(&mut self, passed: bool) {
+        self.record_verification_scope(passed, "", &[], Vec::new());
+    }
+
+    /// Record verification with the command scope and structured diagnostics.
+    pub fn record_verification_scope(
+        &mut self,
+        passed: bool,
+        command: &str,
+        affected_paths: &[String],
+        diagnostics: Vec<WorkflowDiagnostic>,
+    ) {
         if passed {
             self.progress.note_verification();
             self.verification = WorkflowVerification::Passed;
@@ -346,12 +454,84 @@ impl WorkflowState {
             self.verification = WorkflowVerification::Failed;
             self.phase = WorkflowPhase::Verify;
         }
+        self.work.record_verification(
+            command,
+            self.decision.verification_scope.as_str(),
+            passed,
+            self.workspace_revision,
+            &diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.detail.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            affected_paths,
+        );
+    }
+
+    /// Retain verification evidence without changing the aggregate verification gate. This is
+    /// used when one command in a multi-command plan passes while later commands remain pending.
+    pub fn record_work_verification(
+        &mut self,
+        passed: bool,
+        command: &str,
+        affected_paths: &[String],
+        diagnostics: Vec<WorkflowDiagnostic>,
+    ) {
+        self.work.record_verification(
+            command,
+            self.decision.verification_scope.as_str(),
+            passed,
+            self.workspace_revision,
+            &diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.detail.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            affected_paths,
+        );
     }
 
     /// Fold a bounded failure into the retryable failure set.
     pub fn record_failure(&mut self, failure: WorkflowFailure) {
-        self.unresolved_failures.retain(|existing| existing.key != failure.key);
-        self.unresolved_failures.push(failure);
+        if let Some(existing) =
+            self.unresolved_failures.iter_mut().find(|existing| existing.key == failure.key)
+        {
+            existing.tool = failure.tool;
+            existing.code = failure.code;
+            existing.message = failure.message;
+            existing.category = failure.category;
+            existing.revision = failure.revision;
+            existing.diagnostics = failure.diagnostics;
+            existing.attempts = existing.attempts.saturating_add(1);
+            self.work.record_blocker(
+                existing.key.as_str(),
+                existing.category.as_str(),
+                existing.message.as_str(),
+                existing.revision,
+            );
+            self.decision.record_question(
+                format!("failure:{}", existing.key.as_str()),
+                format!(
+                    "recover from {} failure: {}",
+                    existing.category.as_str(),
+                    existing.message.as_str()
+                ),
+            );
+        } else {
+            self.work.record_blocker(
+                failure.key.as_str(),
+                failure.category.as_str(),
+                failure.message.as_str(),
+                failure.revision,
+            );
+            self.decision.record_question(
+                format!("failure:{}", failure.key.as_str()),
+                format!(
+                    "recover from {} failure: {}",
+                    failure.category.as_str(),
+                    failure.message.as_str()
+                ),
+            );
+            self.unresolved_failures.push(failure);
+        }
         if self.unresolved_failures.len() > MAX_WORKFLOW_FAILURES {
             self.unresolved_failures.remove(0);
         }
@@ -363,6 +543,8 @@ impl WorkflowState {
     /// Clear the failure associated with a successful retry.
     pub fn clear_failure(&mut self, key: &str) {
         self.unresolved_failures.retain(|failure| failure.key.as_str() != key);
+        self.work.clear_blocker(key);
+        self.decision.clear_question(&format!("failure:{key}"));
     }
 
     /// Reset stale discovery and verification state after workspace drift.
@@ -374,6 +556,7 @@ impl WorkflowState {
             step.status = VerificationStatus::Stale;
         }
         self.decision.reset_for_workspace_change();
+        self.work.invalidate_for_workspace_change(self.workspace_revision);
     }
 
     /// Mark the workflow complete only when all bounded completion criteria hold.
@@ -391,6 +574,7 @@ impl WorkflowState {
                 .iter()
                 .filter(|step| step.required && step.revision == self.workspace_revision)
                 .all(|step| step.status == VerificationStatus::Passed)
+            && !self.work.blocks_completion()
             && (!verification_required || self.verification == WorkflowVerification::Passed);
         if ready {
             self.phase = WorkflowPhase::Complete;
@@ -434,8 +618,20 @@ impl WorkflowState {
             failure.tool = BoundedText::new(failure.tool.as_str(), MAX_WORKFLOW_FIELD_BYTES);
             failure.code = BoundedText::new(failure.code.as_str(), MAX_WORKFLOW_FIELD_BYTES);
             failure.message = BoundedText::new(failure.message.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+            failure.diagnostics.truncate(MAX_WORKFLOW_DIAGNOSTICS);
+            for diagnostic in &mut failure.diagnostics {
+                diagnostic.path =
+                    BoundedText::new(diagnostic.path.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+                diagnostic.code =
+                    BoundedText::new(diagnostic.code.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+                diagnostic.symbol =
+                    BoundedText::new(diagnostic.symbol.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+                diagnostic.detail =
+                    BoundedText::new(diagnostic.detail.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+            }
         }
         self.decision.enforce_bounds();
+        self.work.enforce_bounds();
     }
 }
 

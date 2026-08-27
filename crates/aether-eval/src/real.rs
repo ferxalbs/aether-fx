@@ -11,13 +11,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use aether_agent::{
-    Agent, AgentMetrics, AgentRequest, AllowAllPermissionBroker, CancellationToken, FakeBackend,
-    FakeStep, FakeToolCall,
+    Agent, AgentMetrics, AgentRequest, AgentRunResult, AllowAllPermissionBroker, CancellationToken,
+    FakeBackend, FakeStep, FakeToolCall,
 };
-use aether_core::{AgentEvent, SessionId, TurnId, WorkflowVerification};
+use aether_core::{AgentEvent, ContextSnapshot, SessionId, TurnId, WorkflowVerification};
 use aether_tools::ToolRegistry;
 
-use super::{Action, ExecutionMetrics, Task, TaskResult, TrajectoryMetrics, trajectory};
+use super::{
+    Action, CapabilityTaskResult, ExecutionMetrics, Task, TaskResult, TrajectoryMetrics, trajectory,
+};
 
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -139,6 +141,146 @@ pub(crate) fn run_task(
     );
     let _ = fs::remove_dir_all(&root);
     Ok(result)
+}
+
+/// Run a checkpointed task while applying one bounded external change between segments.
+/// `preserved_path` is used for dirty-tree cases where the changed path must survive untouched.
+pub(crate) fn run_resumable_task_with_change(
+    task: &Task,
+    first_script: &[Action],
+    remaining_script: &[Action],
+    category: &str,
+    external_change: Option<(&str, &str)>,
+    preserved_path: Option<&str>,
+) -> Result<CapabilityTaskResult, String> {
+    let baseline = run_task(task, first_script, true)?;
+    let root = copy_fixture(task.fixture)?;
+    let first = run_segment(task, &root, first_script, first_script.len() as u16, None)?;
+    let checkpoint_captured = first.result.is_none();
+    let persisted = first.context.persistable();
+    let encoded = serde_json::to_vec(&persisted).map_err(|error| error.to_string())?;
+    let seed: ContextSnapshot =
+        serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
+    let work_state_survived = !seed.workflow.work.objective.as_str().is_empty()
+        && (seed.workflow.work.is_structured() || !seed.workflow.work.mutations.is_empty());
+    if let Some((path, contents)) = external_change {
+        fs::write(root.join(path), contents)
+            .map_err(|error| format!("apply external capability change {path}: {error}"))?;
+    }
+    let second =
+        run_segment(task, &root, remaining_script, remaining_script.len() as u16, Some(seed))?;
+    let outcomes_ok = task.expected_outcomes.iter().all(|expected| {
+        fs::read_to_string(root.join(expected.path))
+            .is_ok_and(|contents| contents.contains(expected.contains))
+    });
+    let resumed_success = second.result.is_some()
+        && outcomes_ok
+        && second.result.as_ref().is_some_and(|result| {
+            result.context.workflow.verification == WorkflowVerification::Passed
+        });
+    let metrics = second.metrics.unwrap_or_default();
+    let user_change_tested = preserved_path.is_some();
+    let user_change_corruption = preserved_path.is_some_and(|path| {
+        fs::read_to_string(root.join(path)).map_or(true, |contents| {
+            external_change.is_some_and(|(changed_path, expected)| {
+                changed_path == path && contents != expected
+            })
+        })
+    });
+    let recovery_observed = metrics.recovery_successes > 0
+        || second.context.workflow.work.blockers.is_empty()
+            && !first.context.workflow.work.blockers.is_empty();
+    let failure = if resumed_success {
+        None
+    } else {
+        Some(format!(
+            "checkpoint task failed: first={} second={} outcomes_ok={outcomes_ok}",
+            first.error.as_deref().unwrap_or("completed"),
+            second.error.as_deref().unwrap_or("completed"),
+        ))
+    };
+    let result = CapabilityTaskResult {
+        task_id: task.id.to_owned(),
+        category: category.to_owned(),
+        baseline_success: baseline.success,
+        resumed_success,
+        success_at_1: resumed_success,
+        trials: 1,
+        previously_unsolved: !baseline.success && resumed_success,
+        multi_file_correctness: task.expected_outcomes.len() > 1 && outcomes_ok,
+        checkpoint_captured,
+        work_state_survived,
+        recovery_observed,
+        user_change_tested,
+        user_change_corruption,
+        stale_evidence_violations: metrics.stale_evidence_violations as u32,
+        model_requests: metrics.model_requests as u32,
+        tool_executions: metrics.executed_tool_calls as u32,
+        process_spawns: metrics.process_spawns as u32,
+        context_bytes: metrics.context_bytes,
+        bytes_shown_to_model: metrics.bytes_shown_to_model,
+        wall_time_ms: metrics.wall_time_ms,
+        verification_attempts: metrics.verification_attempts as u32,
+        verification_failures: metrics.verification_failures as u32,
+        unresolved_work_at_finish: metrics.unresolved_work_at_finish as u32,
+        failure,
+    };
+    let _ = fs::remove_dir_all(&root);
+    Ok(result)
+}
+
+struct SegmentResult {
+    result: Option<AgentRunResult>,
+    context: ContextSnapshot,
+    metrics: Option<AgentMetrics>,
+    error: Option<String>,
+}
+
+fn run_segment(
+    task: &Task,
+    root: &Path,
+    script: &[Action],
+    max_steps: u16,
+    context_seed: Option<ContextSnapshot>,
+) -> Result<SegmentResult, String> {
+    let retained = (0..script.len()).collect::<Vec<_>>();
+    let steps = build_steps(task, root, script, &retained, true)?;
+    let backend = FakeBackend::new("capability trace replay").with_steps(steps);
+    let registry = ToolRegistry::new(root)?;
+    let agent = Agent::new(backend, registry);
+    let session =
+        SessionId::new(format!("capability-{}", task.id)).map_err(|error| error.to_string())?;
+    let turn = TurnId::new(format!("capability-{}-{}", task.id, max_steps))
+        .map_err(|error| error.to_string())?;
+    let mut request = AgentRequest::new(session, turn, task.prompt);
+    request.max_steps = max_steps.max(1);
+    request.workspace_root = Some(root.display().to_string());
+    request.context_seed = context_seed;
+    request.metrics = true;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("build capability runtime: {error}"))?;
+    let result = runtime.block_on(async {
+        let result = agent
+            .run_with_broker(request, sender, CancellationToken::new(), &AllowAllPermissionBroker)
+            .await;
+        while receiver.recv().await.is_some() {}
+        result
+    });
+    let (result, metrics, error) = match result {
+        Ok(result) => {
+            let metrics = result.metrics.clone();
+            (Some(result), metrics, None)
+        }
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    let context = result
+        .as_ref()
+        .map(|result| result.context.clone())
+        .unwrap_or_else(|| agent.context_snapshot());
+    Ok(SegmentResult { result, context, metrics, error })
 }
 
 fn build_steps(
@@ -321,6 +463,11 @@ impl TaskResult {
             policy_feedback_bytes: after.policy_feedback_bytes,
             protocol_envelope_bytes: after.protocol_envelope_bytes,
             verification_attempts: after.verification_attempts,
+            verification_failures: after.verification_failures,
+            recovery_attempts: after.recovery_attempts,
+            recovery_successes: after.recovery_successes,
+            stale_evidence_violations: after.stale_evidence_violations,
+            unresolved_work_at_finish: after.unresolved_work_at_finish,
             process_spawns: after.process_spawns,
             agent_wall_time_ms: after.wall_time_ms,
             provider_wait_ms: after.provider_wait_ms,
@@ -366,6 +513,11 @@ impl ExecutionMetrics {
             policy_feedback_bytes: metrics.policy_feedback_bytes,
             protocol_envelope_bytes: metrics.protocol_envelope_bytes,
             verification_attempts: metrics.verification_attempts as u32,
+            verification_failures: metrics.verification_failures as u32,
+            recovery_attempts: metrics.recovery_attempts as u32,
+            recovery_successes: metrics.recovery_successes as u32,
+            stale_evidence_violations: metrics.stale_evidence_violations as u32,
+            unresolved_work_at_finish: metrics.unresolved_work_at_finish as u32,
             process_spawns: metrics.process_spawns as u32,
             wall_time_ms: metrics.wall_time_ms,
             provider_wait_ms: metrics.provider_wait_ms,

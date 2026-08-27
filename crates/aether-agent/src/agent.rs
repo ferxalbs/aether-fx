@@ -119,6 +119,15 @@ pub struct AgentMetrics {
     pub protocol_envelope_bytes: u64,
     pub bytes_read: u64,
     pub verification_attempts: u64,
+    /// Verification attempts that failed and therefore require repair.
+    pub verification_failures: u64,
+    /// Failed observations that the model later recovered from.
+    pub recovery_attempts: u64,
+    pub recovery_successes: u64,
+    /// Workspace-drift or stale-evidence completion rejections.
+    pub stale_evidence_violations: u64,
+    /// Work units still unresolved when the turn completed.
+    pub unresolved_work_at_finish: u64,
     /// Smallest verification scope selected by the deterministic policy, when known.
     pub verification_scope: Option<String>,
     pub provider_wait_ms: u64,
@@ -436,6 +445,7 @@ where
                     }
                     ModelEvent::Done { continuation: next } => {
                         continuation = next;
+                        self.with_context(|engine| engine.set_continuation(continuation.clone()));
                     }
                 }
             }
@@ -448,6 +458,15 @@ where
                 .collect::<Vec<_>>();
 
             if prepared_calls.is_empty() {
+                self.refresh_before_completion(&cancellation).await?;
+                if self.with_context(|engine| {
+                    engine.snapshot().workspace_changed
+                        || engine.snapshot().inspected.iter().any(|file| file.stale)
+                }) && let Some(metrics) = &mut metrics
+                {
+                    metrics.value.stale_evidence_violations =
+                        metrics.value.stale_evidence_violations.saturating_add(1);
+                }
                 let complete = self.with_context(|engine| {
                     engine.set_continuation(continuation.clone());
                     policy.finish_turn(engine)
@@ -475,6 +494,8 @@ where
                     if !scope.is_empty() {
                         value.verification_scope = Some(scope.to_owned());
                     }
+                    value.unresolved_work_at_finish =
+                        context.workflow.work.unresolved_count() as u64;
                     value
                 });
                 return Ok(AgentRunResult {
@@ -551,6 +572,18 @@ where
             for completed in completed {
                 let action = completed.action;
                 let result = completed.result;
+                let had_failure = self
+                    .with_context(|engine| engine.snapshot().workflow.has_unresolved_failures());
+                let verification_action =
+                    action.classification == aether_core::ActionClassification::Verification;
+                let verification_failed = verification_action
+                    && (!result.ok
+                        || result
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("success"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false));
                 let feedback = self.with_context(|engine| {
                     policy.observe_prepared(engine, &action, &result, completed.executed)
                 });
@@ -573,10 +606,35 @@ where
                         {
                             metrics.value.verification_attempts =
                                 metrics.value.verification_attempts.saturating_add(1);
+                            if verification_failed {
+                                metrics.value.verification_failures =
+                                    metrics.value.verification_failures.saturating_add(1);
+                            }
                         }
-                    } else if !completed.planned {
-                        metrics.value.prevented_calls =
-                            metrics.value.prevented_calls.saturating_add(1);
+                        if had_failure {
+                            metrics.value.recovery_successes =
+                                metrics.value.recovery_successes.saturating_add(1);
+                        }
+                    } else {
+                        if result.error.is_some() {
+                            metrics.value.recovery_attempts =
+                                metrics.value.recovery_attempts.saturating_add(1);
+                        }
+                        if result.error.as_ref().is_some_and(|error| {
+                            matches!(
+                                error.code.as_str(),
+                                "insufficient_evidence"
+                                    | "inspection_required"
+                                    | "concurrent_modification"
+                            )
+                        }) {
+                            metrics.value.stale_evidence_violations =
+                                metrics.value.stale_evidence_violations.saturating_add(1);
+                        }
+                        if !completed.planned {
+                            metrics.value.prevented_calls =
+                                metrics.value.prevented_calls.saturating_add(1);
+                        }
                     }
                     if completed.planned {
                         metrics.value.planner_hits = metrics.value.planner_hits.saturating_add(1);
@@ -638,6 +696,37 @@ where
 
     fn current_context(&self) -> ContextSnapshot {
         self.with_context(|engine| engine.snapshot().clone())
+    }
+
+    /// Return the latest bounded state even when a turn ended with a typed incomplete result.
+    /// Callers use this to persist a checkpoint without exposing transient tool output.
+    pub fn context_snapshot(&self) -> ContextSnapshot {
+        self.current_context()
+    }
+
+    async fn refresh_before_completion(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), AgentError> {
+        let snapshot = self.current_context();
+        if snapshot.workspace_root.is_empty() {
+            return Ok(());
+        }
+        let root = PathBuf::from(snapshot.workspace_root.clone());
+        if !root.is_dir() {
+            return Ok(());
+        }
+        let refreshed = tokio::task::spawn_blocking(move || {
+            let mut engine = ContextEngine::restore(snapshot);
+            engine.refresh_against_workspace(&root);
+            engine
+        });
+        let refreshed = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+            result = refreshed => result.map_err(|_| AgentError::Cancelled)?,
+        };
+        self.with_context(|engine| *engine = refreshed);
+        Ok(())
     }
 
     fn tool_definition_bytes(&self) -> u64 {

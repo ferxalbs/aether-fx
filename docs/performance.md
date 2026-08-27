@@ -46,7 +46,10 @@ Phase 1.1 verification run on 2026-08-22 used the same Criterion benchmark suite
 
 Phase 2 verification run on 2026-08-22 used the same Criterion suite (`sample-size 10`, 100 ms warmup, 200 ms measurement) on the same x86_64 macOS host. Selected current medians were: process startup 47.382 ms, small-file read 69.493 µs, blocking dispatch 60.242 µs, atomic write 1.9126 ms, staged patch application 1.9403 ms, session replay 32.246 µs, and process registry lookup 5.4360 µs. Criterion reported statistically significant regressions versus the saved baseline for small-file read (+28.5%), blocking dispatch (+25.3%), atomic write (+17.2%), session replay (+11.3%), event dispatch (+2.3%), and process registry lookup (+2.4%). The small-file-read increase is expected: `read` now computes a BLAKE3 content hash for stale-file tracking. Session replay now validates schema version 2, secret refusal, and truncated-tail recovery. Short-sample Criterion noise remains; these are observations for regression review, not cross-machine claims.
 
-Session-safety hardening uses schema version 3 committed `TurnSnapshot` records, Unix session modes, continuation invalidation on workspace drift, typed `InvalidContinuation` recovery, and no-follow session path containment. The earlier correctness pass took no new Criterion run; session replay now validates schema v3 rather than v2.
+Session-safety hardening uses schema version 5 committed `TurnSnapshot` and resumable `Checkpoint`
+records, compact structured work state, Unix session modes, continuation invalidation on workspace
+drift, typed `InvalidContinuation` recovery, and no-follow session path containment. The earlier
+correctness pass took no new Criterion run; session replay now validates schema v5 rather than v2.
 
 Private application-state verification run on 2026-08-22 used the new OS-state layout with
 the exact benchmark command, 100 Criterion samples, and the same local host. Measured
@@ -100,10 +103,10 @@ single-host run-to-run variations against its saved baseline; the changed prepar
 provenance, and inventory code is not exercised by the affected legacy dispatch benchmarks, and
 no benchmark command failed.
 
-The final stripped release `aether` binary was 5,811,656 bytes. macOS fresh-process probes
-reported approximately 60 ms and peak RSS of 7,528,448 bytes for `--version`, 50 ms and
-7,491,584 bytes for `--help`, and 50 ms and 7,741,440 bytes for minimal no-model startup with
-an isolated temporary workspace. The minimal probe exits with the expected `no model selected`
-diagnostic; RSS is unavailable in the sandboxed probe but was captured with the approved native
-`/usr/bin/time -l` run. These are single-host local measurements; historical release-size and
-startup observations are retained above rather than presented as cross-machine claims.
+The previous stripped release `aether` binary was 5,811,656 bytes. The post-checkpoint-work-state
+release build on 2026-08-26 is 5,963,440 bytes. Fresh local `/usr/bin/time -l` probes measured
+50 ms and 7,356,416 bytes peak RSS for `--version`, 50 ms and 7,356,416 bytes for `--help`, and
+150 ms and 7,626,752 bytes for EOF/minimal startup, which exits with the expected no-model
+configuration error. The 151,784-byte increase is the bounded long-horizon/checkpoint
+implementation; startup and idle RSS remain in the same local range. These are single-host
+diagnostics, not cross-platform or cross-machine guarantees.

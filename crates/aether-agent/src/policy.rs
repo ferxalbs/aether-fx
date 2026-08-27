@@ -679,8 +679,30 @@ impl AutonomousCodingPolicy {
     fn compact_feedback(&self, snapshot: &ContextSnapshot) -> String {
         let decision = &snapshot.workflow.decision;
         let target = decision.next_target.as_ref().map_or("-", |target| target.as_str());
+        let work = &snapshot.workflow.work;
+        let work_detail = if work.is_structured() {
+            let active = work.active_subgoal.as_ref().map_or("-", |active| active.as_str());
+            format!(
+                " work={} active={} pending={}",
+                work.mode.as_str(),
+                active,
+                work.unresolved_count()
+            )
+        } else {
+            String::new()
+        };
+        let failure = snapshot.workflow.unresolved_failures.last();
+        let failure_text = failure.map_or("-".to_owned(), |failure| {
+            format!(
+                "{}:{} attempts={} category={}",
+                failure.tool.as_str(),
+                failure.code.as_str(),
+                failure.attempts,
+                failure.category.as_str()
+            )
+        });
         format!(
-            "decision: action={} target={} confidence={} candidates={} questions={} scope={}",
+            "decision: action={} target={} confidence={} candidates={} questions={} scope={} blocker={}{}",
             decision.next_action.as_str(),
             target,
             decision.progress_confidence,
@@ -691,6 +713,8 @@ impl AutonomousCodingPolicy {
             } else {
                 decision.verification_scope.as_str()
             },
+            failure_text,
+            work_detail,
         )
     }
 }

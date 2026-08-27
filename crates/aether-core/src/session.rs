@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ContextSnapshot, OpaqueContinuation, SessionId, TurnId, persistable_continuation};
 
 /// Version of the append-friendly local JSONL schema.
-pub const SESSION_SCHEMA_VERSION: u32 = 4;
+pub const SESSION_SCHEMA_VERSION: u32 = 5;
 /// The immediately previous session schema remains readable after adding workflow defaults.
 pub const MIN_SUPPORTED_SESSION_SCHEMA_VERSION: u32 = 3;
 
@@ -45,6 +45,9 @@ pub enum SessionRecord {
     Started { workspace_root: String, model: Option<String> },
     /// One complete committed turn. Partial writes of this record are ignored on replay.
     TurnSnapshot { snapshot: Box<TurnSnapshot> },
+    /// A durable checkpoint for a cancelled or incomplete turn. It is resumable but not a claim
+    /// that the requested task completed.
+    Checkpoint { snapshot: Box<TurnSnapshot> },
     /// Explicitly closed session.
     Finished,
 }
@@ -52,10 +55,22 @@ pub enum SessionRecord {
 impl SessionRecord {
     /// Construct a committed turn after applying persistable-context minimization.
     pub fn turn_snapshot(snapshot: TurnSnapshot) -> Self {
-        let mut snapshot = snapshot;
+        Self::snapshot(snapshot, false)
+    }
+
+    /// Construct a resumable checkpoint after applying the same persistence minimization.
+    pub fn checkpoint(snapshot: TurnSnapshot) -> Self {
+        Self::snapshot(snapshot, true)
+    }
+
+    fn snapshot(mut snapshot: TurnSnapshot, checkpoint: bool) -> Self {
         snapshot.context = snapshot.context.persistable();
         snapshot.continuation = snapshot.continuation.as_ref().and_then(persistable_continuation);
-        Self::TurnSnapshot { snapshot: Box::new(snapshot) }
+        if checkpoint {
+            Self::Checkpoint { snapshot: Box::new(snapshot) }
+        } else {
+            Self::TurnSnapshot { snapshot: Box::new(snapshot) }
+        }
     }
 }
 

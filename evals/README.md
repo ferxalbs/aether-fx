@@ -6,6 +6,29 @@ Run the offline deterministic suite with:
 cargo run --release -p aether-eval -- target/aether-eval-results.json
 ```
 
+Run the separate hard-task capability suite with:
+
+```text
+cargo run --release -p aether-eval -- --capability target/aether-eval-capability-results.json
+```
+
+The regression suite is intentionally unchanged and remains the 9/9 non-regression gate. The
+capability suite measures autonomous progress across a serialized interruption boundary. Its five
+offline scenarios cover multi-file/new-module implementation, compiler-error-driven repair,
+cross-crate workspace migration, stale-observation recovery after an external change, and
+unrelated user-note preservation in a dirty worktree. Each first segment is deliberately capped
+before completion; the second segment receives only serialized, persistable context and the
+remaining deterministic model trace. The final check reads the fixture and verifies the real
+repository state, not just the event transcript.
+
+Capability output is separate from efficiency and regression output. It reports success@1,
+intentionally interrupted baseline success, newly solved tasks, checkpoint and WorkState survival,
+multi-file correctness, typed recovery, stale-evidence rejections, user-change corruption,
+verification attempts/failures, model requests, executed tools, process spawns, context and
+model-visible bytes, wall time, and unresolved work at finish. The offline suite uses one fixed
+deterministic trial per task; provider-backed repeated trials remain a separate integration concern
+behind `EvalBackend` and are not fabricated by the offline runner.
+
 Each task declares its prompt, file outcomes, exact verification command, model-step budget,
 tool-call budget, and verification-attempt budget in `crates/aether-eval/src/lib.rs`. The suite
 also includes a shell-heavy command-reuse scenario with repeated direct `rg`, `find`, and `cat`

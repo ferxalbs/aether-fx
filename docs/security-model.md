@@ -54,9 +54,21 @@ On Unix, the state root, `workspaces`, each workspace bucket, and `sessions` are
 
 There are two independent boundaries. Workspace tools remain contained by the canonical workspace root. Session storage is contained by the resolved AETHER state root: AETHER canonicalizes the workspace, derives a path-safe hash bucket, atomically creates or validates `workspace.json`, and creates/opens state directories, metadata, session JSONL, and compaction temps without following symbolic links or Windows reparse points. Existing state directories must be real directories and existing state files must be regular files; a link or reparse point is rejected. Unix uses `openat`/`mkdirat` with `O_NOFOLLOW` (and `O_EXCL` for metadata and temps). Windows inspects `FILE_ATTRIBUTE_REPARSE_POINT` and opens with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse name cannot redirect the write. Session IDs are validated before becoming file names, and workspace IDs are generated rather than accepted as paths. This is fail-closed containment, not a claim of perfect adversarial TOCTOU immunity: an external process can still mutate the namespace in the window after validation and before the OS create/open call. Session metadata and JSONL are never intentionally written inside a repository.
 
-Each completed turn is one JSONL record. A truncated final record is an uncommitted crash window and is ignored; the previous committed turn remains valid. Corrupt middle records fail replay. Compaction never overwrites a file after a failed replay.
+Schema version 5 also permits a `Checkpoint` record for a cancelled, step-limited, or otherwise
+incomplete turn. A checkpoint is resumable state, never a completion claim; it contains the same
+minimized context and sanitized continuation as a normal turn. Each completed turn is one JSONL
+record. A truncated final record is an uncommitted crash window and is ignored; the previous
+committed turn or checkpoint remains valid. Corrupt middle records fail replay. Compaction never
+overwrites a file after a failed replay. The persisted work objective is normalized to a bounded
+first-line summary and obvious secret assignments are redacted; raw prompts and reasoning are not
+stored.
 
-Resume re-hashes inspected files. If the live workspace root differs, or an inspected file is stale or missing, Rainy continuation is discarded and the next model turn reconstructs from bounded local context. Stale remote continuation never outranks the filesystem.
+Resume re-hashes inspected files before resumed actions and again before completion. If the live
+workspace root differs, or an inspected file is stale or missing, Rainy continuation is discarded,
+the structured work evidence is invalidated, and the next model turn reconstructs from bounded
+local context. Stale remote continuation never outranks the filesystem. Dirty paths detected from
+Git remain user-owned and are not silently overwritten; an attempted mutation still requires
+current inspection, a matching expected hash, and an independent permit.
 
 ## Dangerous operations
 

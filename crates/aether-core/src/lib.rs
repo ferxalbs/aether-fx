@@ -15,6 +15,7 @@ pub mod path;
 pub mod permissions;
 pub mod session;
 pub mod tools;
+pub mod work;
 pub mod workflow;
 
 pub use cancellation::CancellationFlag;
@@ -30,7 +31,8 @@ pub use context::{
     MAX_GIT_SNAPSHOT_BYTES, MAX_INSPECTED_FILES, MAX_PROMPT_BYTES, MAX_SESSION_FILE_BYTES,
     MAX_SESSION_LINE_BYTES, MAX_SESSION_LINES, MAX_STORED_TOOL_SUMMARIES, MAX_STORED_TURNS,
     MAX_SUMMARY_PATHS, MAX_TASK_BYTES, MAX_USER_MODIFIED_FILES, ObservedFileState,
-    compact_tool_result, merge_line_ranges, payload_contains_secrets, persistable_continuation,
+    compact_tool_result, extract_diagnostics, merge_line_ranges, payload_contains_secrets,
+    persistable_continuation,
 };
 pub use decision::{
     DecisionAction, DecisionCandidate, DecisionEvidence, DecisionEvidenceKind, DecisionQuestion,
@@ -55,8 +57,15 @@ pub use tools::{
     MAX_TOOL_FOOTPRINT_RESOURCES, PreparedAction, ToolDefinition, ToolEffect, ToolExecutionContext,
     ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
 };
+pub use work::{
+    MAX_WORK_ACCEPTANCE_CRITERIA, MAX_WORK_BLOCKERS, MAX_WORK_EVIDENCE, MAX_WORK_FIELD_BYTES,
+    MAX_WORK_MUTATIONS, MAX_WORK_OBJECTIVE_BYTES, MAX_WORK_RELATIONS, MAX_WORK_SUBGOALS,
+    MAX_WORK_VERIFICATIONS, WorkBlocker, WorkCriterion, WorkEvidence, WorkMode, WorkMutation,
+    WorkState, WorkStatus, WorkSubgoal, WorkVerification,
+};
 pub use workflow::{
-    MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES, MAX_WORKFLOW_RELEVANT_FILES,
-    MAX_WORKFLOW_VERIFICATIONS, VerificationStatus, VerificationStep, WorkflowFailure,
-    WorkflowPhase, WorkflowProgress, WorkflowState, WorkflowVerification,
+    MAX_WORKFLOW_DIAGNOSTICS, MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES,
+    MAX_WORKFLOW_RELEVANT_FILES, MAX_WORKFLOW_VERIFICATIONS, VerificationStatus, VerificationStep,
+    WorkflowDiagnostic, WorkflowFailure, WorkflowFailureCategory, WorkflowPhase, WorkflowProgress,
+    WorkflowState, WorkflowVerification,
 };

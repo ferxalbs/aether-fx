@@ -7,8 +7,8 @@ use aether_core::{
     MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES, MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES,
     MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS, MAX_TASK_BYTES, MAX_USER_MODIFIED_FILES,
     MAX_WORKFLOW_FIELD_BYTES, ObservedFileState, OpaqueContinuation, PreparedAction, ToolResult,
-    WorkflowFailure, WorkflowPhase, WorkflowVerification, WorkspacePath, analyze_command,
-    compact_tool_result, merge_line_ranges,
+    WorkflowFailure, WorkflowFailureCategory, WorkflowPhase, WorkflowVerification, WorkspacePath,
+    analyze_command, compact_tool_result, extract_diagnostics, merge_line_ranges,
 };
 use serde_json::Value;
 
@@ -97,6 +97,7 @@ impl ContextEngine {
     /// Record the latest user task.
     pub fn set_task(&mut self, prompt: &str) {
         self.snapshot.current_task = BoundedText::new(prompt, MAX_TASK_BYTES);
+        self.snapshot.workflow.work.initialize_from_prompt(prompt);
     }
 
     /// Store the latest opaque continuation after sanitizing identity keys.
@@ -223,6 +224,7 @@ impl ContextEngine {
             );
         }
         if mutation && mutation_applied(name, input, result, command_effects) {
+            let mutation_paths = mutation_paths(name, input, result, command_effects);
             if let Some(effects) = command_effects.as_ref() {
                 let include_manifests = matches!(
                     effects.class,
@@ -240,7 +242,7 @@ impl ContextEngine {
                 }
                 self.invalidate_command_effects(effects);
             }
-            self.snapshot.workflow.record_mutation();
+            self.snapshot.workflow.record_mutation_scope(name, &mutation_paths);
             self.refresh_verification_plan();
         }
         if focused_verification {
@@ -251,16 +253,31 @@ impl ContextEngine {
             if !planned && self.snapshot.workflow.verification_steps.is_empty() {
                 self.snapshot.workflow.record_verification(passed);
             }
+            let command =
+                shell_command_display(input).unwrap_or_else(|| format!("{name} verification"));
+            self.snapshot.workflow.record_work_verification(
+                passed,
+                &command,
+                &self.snapshot.modified,
+                extract_diagnostics(result),
+            );
             if passed {
                 if let Some(failure_key) = failure_key.as_deref() {
                     self.snapshot.workflow.clear_failure(failure_key);
                 }
             } else {
-                self.snapshot.workflow.record_failure(WorkflowFailure::new(
+                let diagnostics = extract_diagnostics(result);
+                for diagnostic in &diagnostics {
+                    self.record_relevant_path(diagnostic.path.as_str());
+                }
+                self.snapshot.workflow.record_failure(WorkflowFailure::new_at_revision(
                     failure_key.as_deref().unwrap_or("operation"),
                     name,
                     "verification_failed",
                     verification_message(result),
+                    WorkflowFailureCategory::Verification,
+                    self.snapshot.workflow.workspace_revision,
+                    diagnostics,
                 ));
             }
         }
@@ -314,6 +331,11 @@ impl ContextEngine {
                         file.stale = true;
                         file.content_hash = Some(hash);
                         stale_paths.push(file.path.clone());
+                    } else if file.stale {
+                        // A hash refresh only proves that the file is stable since the drift was
+                        // noticed. A fresh targeted read is still required before old excerpts
+                        // and workflow evidence become trustworthy again.
+                        file.last_state = ObservedFileState::Present;
                     } else if file.content_hash.is_none() {
                         file.content_hash = Some(hash);
                         file.stale = false;
@@ -740,6 +762,48 @@ impl ContextEngine {
         out.push('/');
         let _ = write!(out, "{}", workflow.progress.verifications);
         out.push('\n');
+        let work = &workflow.work;
+        if work.is_structured() {
+            out.push_str("work: mode=");
+            out.push_str(work.mode.as_str());
+            out.push_str(" objective=");
+            out.push_str(work.objective.as_str());
+            out.push_str(" subgoals=");
+            let _ = write!(out, "{}", work.subgoals.len());
+            out.push_str(" pending=");
+            let _ = write!(out, "{}", work.unresolved_count());
+            out.push_str(" revision=");
+            let _ = write!(out, "{}", work.revision);
+            out.push('\n');
+            if let Some(active) = &work.active_subgoal {
+                out.push_str("work_active: ");
+                out.push_str(active.as_str());
+                out.push('\n');
+            }
+            for subgoal in work
+                .subgoals
+                .iter()
+                .filter(|subgoal| !matches!(subgoal.status, aether_core::WorkStatus::Complete))
+                .take(4)
+            {
+                out.push_str("work_subgoal: ");
+                out.push_str(subgoal.status.as_str());
+                out.push(' ');
+                out.push_str(subgoal.id.as_str());
+                out.push_str(" — ");
+                out.push_str(subgoal.label.as_str());
+                out.push('\n');
+            }
+            if let Some(criterion) =
+                work.acceptance_criteria.iter().find(|criterion| !criterion.satisfied)
+            {
+                out.push_str("work_acceptance: ");
+                out.push_str(criterion.key.as_str());
+                out.push_str(" — ");
+                out.push_str(criterion.description.as_str());
+                out.push('\n');
+            }
+        }
         let decision = &workflow.decision;
         out.push_str("decision: action=");
         out.push_str(decision.next_action.as_str());
@@ -779,9 +843,32 @@ impl ContextEngine {
             out.push_str(failure.tool.as_str());
             out.push(' ');
             out.push_str(failure.code.as_str());
+            out.push_str(" category=");
+            out.push_str(failure.category.as_str());
+            out.push_str(" attempts=");
+            let _ = write!(out, "{}", failure.attempts);
             out.push_str(" — ");
             out.push_str(failure.message.as_str());
             out.push('\n');
+            for diagnostic in failure.diagnostics.iter().take(4) {
+                out.push_str("workflow_diagnostic: ");
+                out.push_str(diagnostic.path.as_str());
+                let _ = write!(out, ":{}", diagnostic.line);
+                if let Some(column) = diagnostic.column {
+                    let _ = write!(out, ":{}", column);
+                }
+                if !diagnostic.code.as_str().is_empty() {
+                    out.push_str(" code=");
+                    out.push_str(diagnostic.code.as_str());
+                }
+                if !diagnostic.symbol.as_str().is_empty() {
+                    out.push_str(" symbol=");
+                    out.push_str(diagnostic.symbol.as_str());
+                }
+                out.push_str(" — ");
+                out.push_str(diagnostic.detail.as_str());
+                out.push('\n');
+            }
         }
         render_workflow_paths(out, "workflow_relevant", &workflow.relevant_files);
         render_workflow_paths(out, "workflow_modified", &self.snapshot.modified);
@@ -938,11 +1025,19 @@ impl ContextEngine {
 
     fn record_workflow_failure(&mut self, key: &str, name: &str, result: &ToolResult) {
         let code = result.error.as_ref().map_or("tool_failed", |error| error.code.as_str());
-        self.snapshot.workflow.record_failure(WorkflowFailure::new(
+        let category = failure_category(code);
+        let diagnostics = extract_diagnostics(result);
+        for diagnostic in &diagnostics {
+            self.record_relevant_path(diagnostic.path.as_str());
+        }
+        self.snapshot.workflow.record_failure(WorkflowFailure::new_at_revision(
             key,
             name,
             code,
             result.error.as_ref().map_or(result.output.as_str(), |error| error.message.as_str()),
+            category,
+            self.snapshot.workflow.workspace_revision,
+            diagnostics,
         ));
     }
 
@@ -1192,6 +1287,59 @@ fn mutation_applied(
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty())
         || input.get("files").and_then(Value::as_array).is_some_and(|files| !files.is_empty())
+}
+
+fn mutation_paths(
+    name: &str,
+    input: &Value,
+    result: &ToolResult,
+    effects: Option<&CommandEffects>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut push = |path: &str| {
+        if path_is_workspace_relative(path)
+            && !paths.iter().any(|existing| existing == path)
+            && paths.len() < MAX_CONTEXT_ITEMS
+        {
+            paths.push(path.to_owned());
+        }
+    };
+    if name == "write" {
+        input.get("path").and_then(Value::as_str).into_iter().for_each(&mut push);
+        result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("path"))
+            .and_then(Value::as_str)
+            .into_iter()
+            .for_each(&mut push);
+    }
+    if name == "patch"
+        && let Some(files) = result.data.as_ref().and_then(|data| data.get("files"))
+        && let Some(files) = files.as_array()
+    {
+        for path in files.iter().filter_map(|file| file.get("path")).filter_map(Value::as_str) {
+            push(path);
+        }
+    }
+    if let Some(effects) = effects {
+        for path in effects.paths.iter().chain(effects.manifests.iter()) {
+            push(path);
+        }
+    }
+    paths
+}
+
+fn failure_category(code: &str) -> WorkflowFailureCategory {
+    match code {
+        "insufficient_evidence" | "inspection_required" | "concurrent_modification" => {
+            WorkflowFailureCategory::StaleEvidence
+        }
+        "permission_denied" | "permission_required" => WorkflowFailureCategory::Permission,
+        "cancelled" | "timeout" | "process_limit" => WorkflowFailureCategory::Environment,
+        "verification_failed" => WorkflowFailureCategory::Verification,
+        _ => WorkflowFailureCategory::Tool,
+    }
 }
 
 fn read_contains_files(result: &ToolResult) -> bool {

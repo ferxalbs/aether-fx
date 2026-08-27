@@ -171,7 +171,9 @@ impl SessionStore {
                 continue;
             }
             let line = Self::parse_summary_line(text.trim_end(), &session_id)?;
-            if let SessionRecord::TurnSnapshot { snapshot } = line.record {
+            if let SessionRecord::TurnSnapshot { snapshot }
+            | SessionRecord::Checkpoint { snapshot } = line.record
+            {
                 last_turn = Some(snapshot.turn_id);
                 latest_model = snapshot.context.model;
                 break;
@@ -391,7 +393,8 @@ impl SessionStore {
                     workspace_root = Some(stored.clone());
                     model.clone_from(stored_model);
                 }
-                SessionRecord::TurnSnapshot { snapshot } => {
+                SessionRecord::TurnSnapshot { snapshot }
+                | SessionRecord::Checkpoint { snapshot } => {
                     context = Some(snapshot.context.clone());
                     continuation =
                         snapshot.continuation.as_ref().and_then(persistable_continuation);
@@ -470,7 +473,7 @@ impl SessionStore {
         for line in lines {
             match &line.record {
                 SessionRecord::Started { .. } => started = Some(line),
-                SessionRecord::TurnSnapshot { .. } => {
+                SessionRecord::TurnSnapshot { .. } | SessionRecord::Checkpoint { .. } => {
                     turns.push(line);
                     if turns.len() > MAX_STORED_TURNS {
                         turns.remove(0);
@@ -513,6 +516,7 @@ fn supported_schema(version: u32) -> bool {
 fn sanitize_record(record: SessionRecord) -> Result<SessionRecord, SessionStoreError> {
     let record = match record {
         SessionRecord::TurnSnapshot { snapshot } => SessionRecord::turn_snapshot(*snapshot),
+        SessionRecord::Checkpoint { snapshot } => SessionRecord::checkpoint(*snapshot),
         other => other,
     };
     Ok(record)
@@ -545,6 +549,38 @@ pub fn persist_turn(
             cancelled: turn.cancelled,
             context: turn.context.clone(),
             continuation: turn.continuation,
+        }),
+    )?;
+    Ok(())
+}
+
+/// Inputs for a cancelled or incomplete turn checkpoint.
+pub struct PersistCheckpoint<'a> {
+    /// Turn identity.
+    pub turn_id: &'a TurnId,
+    /// Semantic model steps reached before the checkpoint.
+    pub steps: u16,
+    /// Whether cancellation caused the checkpoint.
+    pub cancelled: bool,
+    /// Working context after the latest safe observation.
+    pub context: &'a ContextSnapshot,
+    /// Sanitized provider continuation, if one is still usable.
+    pub continuation: Option<OpaqueContinuation>,
+}
+
+/// Persist resumable work state without presenting it as a completed turn.
+pub fn persist_checkpoint(
+    store: &mut SessionStore,
+    checkpoint: PersistCheckpoint<'_>,
+) -> Result<(), SessionStoreError> {
+    store.append(
+        Some(checkpoint.turn_id.clone()),
+        SessionRecord::checkpoint(TurnSnapshot {
+            turn_id: checkpoint.turn_id.clone(),
+            steps: checkpoint.steps,
+            cancelled: checkpoint.cancelled,
+            context: checkpoint.context.clone(),
+            continuation: checkpoint.continuation,
         }),
     )?;
     Ok(())
@@ -724,6 +760,47 @@ mod tests {
         assert_eq!(restored.context.workflow.phase, WorkflowPhase::Inspect);
         assert_eq!(restored.context.workflow.relevant_files, vec!["src.rs"]);
         assert_eq!(restored.context.workflow.progress.inspections, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_checkpoint_restores_work_state_without_claiming_completion() {
+        let (root, _path, session) = temp_session("checkpoint");
+        let mut context =
+            ContextSnapshot::new(root.display().to_string(), Some("model".to_owned()));
+        context.current_task = aether_core::BoundedText::new(
+            "refactor multiple modules and verify",
+            aether_core::MAX_TASK_BYTES,
+        );
+        context.workflow.work.initialize_from_prompt("refactor multiple modules and verify");
+        context.workflow.record_relevant_file("src/lib.rs");
+        context.workflow.record_inspection();
+        let turn_id = TurnId::new("turn-checkpoint").unwrap();
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
+        store
+            .append(
+                None,
+                SessionRecord::Started {
+                    workspace_root: root.display().to_string(),
+                    model: Some("model".to_owned()),
+                },
+            )
+            .unwrap();
+        persist_checkpoint(
+            &mut store,
+            PersistCheckpoint {
+                turn_id: &turn_id,
+                steps: 0,
+                cancelled: true,
+                context: &context,
+                continuation: None,
+            },
+        )
+        .unwrap();
+        let restored = SessionStore::restore(&root, session).unwrap();
+        assert_eq!(restored.context.workflow.work.mode, aether_core::WorkMode::Structured);
+        assert!(restored.context.workflow.work.objective.as_str().contains("refactor"));
+        assert_ne!(restored.context.workflow.phase, aether_core::WorkflowPhase::Complete);
         let _ = std::fs::remove_dir_all(root);
     }
 

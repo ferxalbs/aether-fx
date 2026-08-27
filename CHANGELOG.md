@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-26 (3) - Long-horizon checkpoint recovery
+
+> Status: unreleased work. No artifact has been published.
+
+### Added
+
+- Added compact adaptive `WorkState` for complex tasks, including bounded objectives, acceptance
+  criteria, path subgoals, dependencies, evidence, mutations, verification records, and blockers.
+- Added resumable `Checkpoint` session records for cancelled and incomplete turns, distinct from
+  completed turn snapshots.
+- Added a separate five-scenario capability suite covering long-horizon work, compiler recovery,
+  workspace migration, stale observations, and dirty-tree user-work preservation.
+- Added bounded compiler/test diagnostics with path, location, code, symbol, and recovery category
+  metadata, plus capability metrics for success@1, recovery, stale evidence, unresolved work, and
+  model-visible resource use.
+
+### Changed
+
+- Restored contexts are revalidated against the live workspace before resumed actions and before a
+  completion claim; stale evidence reopens the relevant work instead of being treated as progress.
+- Incomplete interactive turns now persist their latest minimized context and continuation so
+  `aether resume` can continue the active work without hidden conversational state.
+
+### Security
+
+- Persisted work objectives are bounded and redact obvious secret assignments; checkpoints retain
+  no raw prompt, assistant transcript, excerpt body, or command output.
+- Completion remains blocked by unresolved path work, typed failures, stale evidence, user-owned
+  changes, or unpassed verification.
+
 ## Unreleased - 2026-08-26 (2) - Trajectory-guided interaction economy
 
 > Status: unreleased work. No artifact has been published.
