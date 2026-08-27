@@ -41,7 +41,7 @@ pub(crate) fn resolve_state_root() -> Result<PathBuf, SessionStoreError> {
             }
             Some(_) | None => required_env_path("HOME")?.join(".local").join("state"),
         };
-        return Ok(base.join(STATE_ROOT_NAME));
+        Ok(base.join(STATE_ROOT_NAME))
     }
 
     #[cfg(not(any(unix, windows)))]
