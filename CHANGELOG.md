@@ -1,10 +1,28 @@
 # CHANGELOG
 
-## Unreleased - 2026-08-26 (3) - Long-horizon checkpoint recovery
+## v0.1.0-alpha-01 - 2026-08-27 (1) - First installable alpha prerelease
 
-> Status: unreleased work. No artifact has been published.
+### Release packaging and installation
 
-### Added
+#### Added
+
+- Added version-pinned macOS/Linux and Windows installers, six native GitHub Release archives,
+  aggregate SHA-256 verification, CycloneDX SBOMs, and build provenance attestations.
+
+#### Changed
+
+- Published the first installable alpha contract with `aether --version` reporting
+  `0.1.0-alpha-01`; Rainy SDK remains compiled into AETHER and is not a separate installation.
+
+#### Documentation
+
+- Documented the alpha install, configuration, model selection, manual archive installation,
+  checksum verification, supported platforms, and offline `aether doctor` setup diagnostics.
+
+### 2026-08-26 — Long-horizon checkpoint recovery
+
+
+#### Added
 
 - Added compact adaptive `WorkState` for complex tasks, including bounded objectives, acceptance
   criteria, path subgoals, dependencies, evidence, mutations, verification records, and blockers.
@@ -16,43 +34,41 @@
   metadata, plus capability metrics for success@1, recovery, stale evidence, unresolved work, and
   model-visible resource use.
 
-### Changed
+#### Changed
 
 - Restored contexts are revalidated against the live workspace before resumed actions and before a
   completion claim; stale evidence reopens the relevant work instead of being treated as progress.
 - Incomplete interactive turns now persist their latest minimized context and continuation so
   `aether resume` can continue the active work without hidden conversational state.
 
-### Security
+#### Security
 
 - Persisted work objectives are bounded and redact obvious secret assignments; checkpoints retain
   no raw prompt, assistant transcript, excerpt body, or command output.
 - Completion remains blocked by unresolved path work, typed failures, stale evidence, user-owned
   changes, or unpassed verification.
 
-## Unreleased - 2026-08-26 (2) - Trajectory-guided interaction economy
+### 2026-08-26 — Trajectory-guided interaction economy
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added bounded per-task trajectory analysis for repeated observations, search-to-read chains,
   verification recovery, and mutation-before-inspection candidates.
 - Added lossless model-visible byte categories for static prefixes, tool schemas, context payloads,
   tool results, policy feedback, and protocol envelopes, plus provider/local timing metrics.
 
-### Changed
+#### Changed
 
 - Deterministic eval replay now reuses only exact read-only observations whose workspace state has
   not been invalidated by a mutation or verification step.
 - Eval reports now retain baseline and optimized trajectories, reuse counts, and aggregate pattern
   counts so interaction changes can be compared without provider calls.
 
-## Unreleased - 2026-08-26 (1) - Leaner runtime measurement path
+### 2026-08-26 — Leaner runtime measurement path
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Tool-schema byte accounting is now serialized lazily only when structured metrics are requested;
   normal agent construction no longer performs metric-only schema serialization.
@@ -61,11 +77,10 @@
 - Repaired the scheduler benchmark fixture to start from valid completed read-only workflow state,
   keeping orchestration measurements meaningful without changing production behavior.
 
-## Unreleased - 2026-08-25 (2) - Single-pass action execution and real eval gates
+### 2026-08-25 — Single-pass action execution and real eval gates
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added a real offline Agent end-to-end evaluation path with filesystem fixtures, deterministic
   model traces, before/after metrics, verification outcomes, and success@1 regression gates.
@@ -74,7 +89,7 @@
 - Added packed Git inventory storage for 100k-file repositories and a shared bounded
   `ProcessRuntime` policy for finite commands and persistent stream reads.
 
-### Changed
+#### Changed
 
 - Reused prepared typed inputs across policy, guardrails, scheduling, context observation, and
   execution; planner observations now expose compact model text while retaining structured data.
@@ -82,88 +97,83 @@
 - Runtime eval accounting now reports model requests, requested/executed/prevented calls, bytes,
   process spawns, verification attempts, wall/CPU time, RSS, allocation probes, and token usage.
 
-### Security
+#### Security
 
 - Mutation admission remains bound to current inspected evidence and expected content hashes;
   action provenance is model-scoped and cannot convert tool output into user authorization.
 
-## Unreleased - 2026-08-25 (1) - Evidence-gated adaptive coding loop
+### 2026-08-25 — Evidence-gated adaptive coding loop
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added evidence-gated completion feedback, compatible multi-read planning, phase-aware delta
   context, dirty-worktree ownership tracking, scoped verification recovery, and bounded adversarial
   eval coverage.
 
-### Changed
+#### Changed
 
 - The loop now treats policy and workflow evidence as the completion control-plane, coalesces safe
   read-only discovery, and requires current expected hashes for replacing inspected files.
 
-### Security
+#### Security
 
 - Stale, user-owned, repeated-failure, and no-progress actions now fail closed or trip bounded
   circuit breakers without weakening workspace containment or permission gates.
 
-## Unreleased - 2026-08-24 (3) - Smaller production startup artifact
+### 2026-08-24 — Smaller production startup artifact
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Optimized release artifacts for size while retaining fat LTO, one codegen unit, aborting panic,
   stripped symbols, and portable CPU targeting.
 - Added a Linux-compatible fresh-process startup probe for `--version`, `--help`, and minimal agent
   startup, kept separate from in-process Criterion measurements.
 
-### Performance
+#### Performance
 
 - Reduced stripped production binary size from 8,402,256 to 5,737,800 bytes (2,664,456 bytes,
   31.71%) while keeping agent decision paths speed-optimized and preserving agent, policy,
   planner, context, verification, tool, security, and deterministic evaluation behavior.
 
-## Unreleased - 2026-08-24 (2) - Runtime allocation and state sharing
+### 2026-08-24 — Runtime allocation and state sharing
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Shared immutable model tool definitions and lazily indexed symbol metadata instead of copying
   them for each model step or repository observation.
 - Replaced full workflow/context clones, temporary path collections, and transient render strings
   with bounded projections, borrowed paths, and direct writes while preserving deterministic state.
 
-### Performance
+#### Performance
 
 - Release `aether` size is 8,402,264 bytes after the runtime changes; startup probes remained in
   the observed 0.05–0.06 second range on the local host.
 - Deterministic evaluation remains 9/9 successful with 53 model steps, 38 executed tool calls,
   6 prevented redundant calls, and 5,874 context bytes.
 
-## Unreleased - 2026-08-24 (1) - Bounded repository action planning
+### 2026-08-24 — Bounded repository action planning
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added a deterministic, read-only repository action planner that collapses high-confidence
   search, symbol/relationship lookup, and targeted reads into one bounded structured observation.
 - Added strict ambiguity aborts, current-excerpt/range deduplication, containment and cancellation
   bounds, planner execution metrics, a planner benchmark, and a difficult multi-round-trip eval.
 
-### Performance
+#### Performance
 
 - Planner planning is pure and bounded; when current indexed context answers the request it emits
   no filesystem reads. Evaluation output now reports planner hit-rate, ambiguity aborts, planned
   actions, bytes, context, correctness, and before/after model/tool efficiency.
 
-## Unreleased - 2026-08-23 (13) - Direct command intelligence
+### 2026-08-23 — Direct command intelligence
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added bounded direct-argv command classification and effect extraction for Rust, Git, Node,
   Python, and common Unix inspection/search commands, including paths, packages, manifests, and
@@ -171,16 +181,15 @@
 - Added command-aware scheduler footprints, workflow invalidation, policy evidence gates,
   guardrail caching, and shell-heavy deterministic evaluation coverage.
 
-### Performance
+#### Performance
 
 - Added classification and footprint Criterion benchmarks; the local Criterion run measured
   direct-command classification at 116.70 ns median and footprint extraction at 1.9169 µs median.
 
-## Unreleased - 2026-08-23 (12) - Bounded autonomous coding policy
+### 2026-08-23 — Bounded autonomous coding policy
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added one deterministic policy layer that combines repository candidates, symbol and relationship
   evidence, context reuse, mutation evidence gates, focused verification ranking, scheduler-safe
@@ -190,95 +199,89 @@
 - Added baseline-versus-policy evaluation metrics, incomplete-evidence and repeated-exploration
   scenarios, plus policy update and next-action Criterion benchmarks.
 
-### Performance
+#### Performance
 
 - Policy observations reuse cached context and retain fixed-size state; the final local benchmark
   median was 10.273 µs per completed observation and 241.28 ns per next-action ranking, below
   the 20 µs overhead target.
 
-## Unreleased - 2026-08-23 (11) - Cross-file symbol relationship ranking
+### 2026-08-23 — Cross-file symbol relationship ranking
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added bounded, lazy lexical relationships for Rust definitions, callers, implementations,
   imports, dependencies, modules, and source/test files with ambiguity flags and hash invalidation.
 - Added relationship-aware RepoMap and context selection ranking plus 10,000-symbol benchmarks.
 
-### Performance
+#### Performance
 
 - Relationship lookup and one-file update remain targeted to indexed participants; measured medians
   were 2.095 µs and 8.108 µs respectively on the local benchmark host.
 
-## Unreleased - 2026-08-23 (10) - Lightweight symbol-aware repository navigation
+### 2026-08-23 — Lightweight symbol-aware repository navigation
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added bounded, lazy Rust symbol extraction for functions, methods, types, modules, tests, and
   imports with targeted file lookup and in-memory content-hash invalidation.
 - Added symbol-aware repository selection and context ranking plus parsing and 1,000-symbol lookup
   benchmarks.
 
-### Known Limitations
+#### Known Limitations
 
 - Navigation is lexical and intentionally partial: it does not resolve macros, traits, generated
   code, cross-file references, or language semantics; TypeScript and Python are recognized for
   future parser extensions but are not yet extracted.
 
-## Unreleased - 2026-08-23 (9) - Structured execution metrics
+### 2026-08-23 — Structured execution metrics
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added opt-in JSON turn output with model, token, tool-call, context, read, verification, provider
   wait, and local execution metrics while preserving the default interactive renderer.
 - Added accounting coverage for retries, cached usage events, missing provider usage, prevented
   calls, verification, cancellation, and metrics-disabled execution.
 
-### Performance
+#### Performance
 
 - Added a Criterion case for the metrics-disabled agent path.
 
-## Unreleased - 2026-08-23 (8) - Deterministic coding-agent evaluations
+### 2026-08-23 — Deterministic coding-agent evaluations
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added five isolated Rust coding fixtures covering targeted repair, repository navigation,
   multi-file edits, failed-first recovery, redundant-read avoidance, and focused verification.
 - Added an offline deterministic evaluation runner with replaceable model integration, bounded
   step and tool budgets, clean workspace copies, machine-readable JSON, and compact summaries.
 
-### Performance
+#### Performance
 
 - CI regression gates now cover evaluation correctness, model steps, executed tool calls, and
   context bytes while reporting wall time and harness overhead without unstable timing gates.
 
-## Unreleased - 2026-08-23 (7) - Deterministic loop guardrails
+### 2026-08-23 — Deterministic loop guardrails
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Agent turns reuse bounded successful read, search, find, list, and verification observations
   within the same workspace revision and emit compact feedback for redundant or no-progress work.
 - Successful required verification with no unresolved failures emits a deterministic completion
   signal, while failures, changed arguments, and workspace revisions remain retryable.
 
-### Performance
+#### Performance
 
 - Added fingerprint lookup and progress-state update benchmarks for the loop guardrail hot path.
 
-## Unreleased - 2026-08-23 (6) - Focused verification planning
+### 2026-08-23 — Focused verification planning
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Modified Rust, Node.js, and Python packages now receive deterministic focused verification
   plans, ordered from targeted tests through package-scoped checks with a safe unsupported-repo
@@ -286,56 +289,53 @@
 - Bounded workflow state tracks required commands, affected scope, workspace revision, outcomes,
   and stale results; later mutations invalidate earlier verification.
 
-### Changed
+#### Changed
 
 - Direct process commands are conservatively classified as verification, mutation, or unknown,
   preventing ambiguous shell commands from satisfying workflow completion.
 
-### Performance
+#### Performance
 
 - Added benchmarks for verification planning and direct command classification.
 
-## Unreleased - 2026-08-23 (5) - Repository-aware coding workflow
+### 2026-08-23 — Repository-aware coding workflow
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Coding sessions now track bounded Discover, Inspect, Modify, Verify, and Complete phases,
   relevant files, mutation progress, verification status, and unresolved failures.
 - Workspace mutations require current relevant inspection and successful mutations move the
   session into focused verification before completion.
 
-### Changed
+#### Changed
 
 - Workflow state is persisted with session context, remains recoverable across resumed sessions,
   and is rendered to the model as compact actionable status.
 
-### Performance
+#### Performance
 
 - Added benchmarks for bounded workflow updates and workflow context rendering overhead.
 
-## Unreleased - 2026-08-23 (4) - Relevance-ranked model context
+### 2026-08-23 — Relevance-ranked model context
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Stored recovery context is now selected separately for each model turn using deterministic
   task, path, symbol, recency, modification, source/test, and freshness signals.
 - Model context is bounded by bytes and item count, deduplicates overlapping excerpts and
   repeated observations, and continues to invalidate stale file content on workspace drift.
 
-### Performance
+#### Performance
 
 - Context-selection benchmarks cover 100, 1,000, and 10,000 candidates with bounded hot-path
   allocations.
 
-## Unreleased - 2026-08-23 (3) - Lazy repository intelligence
+### 2026-08-23 — Lazy repository intelligence
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Coding-task context now has a lazy, bounded `RepoMap` for tracked workspace files,
   manifests, package structure, source roots, tests, documentation, and scoped repository
@@ -344,38 +344,35 @@
   ignoring source-content edits and ignored or untracked files; cold and cached 1k/10k-file
   benchmarks cover the behavior.
 
-### Performance
+#### Performance
 
 - Common Git index formats are discovered in-process, with fallback for indirect or unsupported
   indexes; benchmarks isolate repository-map work from external `git` process startup.
 
-## Unreleased - 2026-08-23 (2) - Low-overhead tool scheduling
+### 2026-08-23 — Low-overhead tool scheduling
 
-> Status: unreleased work. No artifact has been published.
 
-### Performance
+#### Performance
 
 - Ready-call selection uses caller-owned fixed buffers and active tool futures are
   polled directly, removing per-batch scheduler vectors, task spawning, and joins.
 - Scheduler benchmarks now distinguish pure selection from end-to-end agent execution
   and the 2 ms Tokio-backed fixture.
 
-## Unreleased - 2026-08-23 (1) - Dependency-aware tool execution
+### 2026-08-23 — Dependency-aware tool execution
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Independent read-only tool calls now execute concurrently through a bounded scheduler,
   while workspace mutations, process effects, and conflicting footprints remain ordered.
 - Typed tool-effect metadata, deterministic result ordering, cancellation coverage, and
   scheduler benchmarks were added.
 
-## Unreleased - 2026-08-22 (11) - State-root and metadata initialization hardening
+### 2026-08-22 — State-root and metadata initialization hardening
 
-> Status: unreleased work. No artifact has been published.
 
-### Security
+#### Security
 
 - State-root overrides now require an absolute, physically resolved path outside the canonical
   workspace before any AETHER state is created; traversal components and workspace-directed
@@ -384,11 +381,10 @@
   replacement, so concurrent initialization validates one binding and incomplete temps cannot
   become `workspace.json`.
 
-## Unreleased - 2026-08-22 (10) - Private application state and workspace isolation
+### 2026-08-22 — Private application state and workspace isolation
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Persistent AETHER Fx application and session state now lives in OS application-state
   storage, never in a user workspace.
@@ -397,7 +393,7 @@
 - `aether doctor` reports the canonical workspace, resolved state root, and resolved
   workspace session directory without exposing secrets.
 
-### Security
+#### Security
 
 - `AETHER_FX_STATE_DIR` is an explicit state-root override; default resolution follows
   platform application-state conventions and never falls back to the current directory.
@@ -406,83 +402,78 @@
 - Repository-local `.aether` and `.aether-fx` layouts are unsupported and ignored without
   migration, scanning, or fallback.
 
-### Documentation
+#### Documentation
 
 - Documented the separation between repository data and private AETHER Fx application state,
   including platform-specific state-root resolution and the two independent boundaries.
 
-## Unreleased - 2026-08-22 (9) - CLI state isolation and session reliability
+### 2026-08-22 — CLI state isolation and session reliability
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Persistent sessions use private OS application-state storage, while repository-local
   AETHER state is ignored completely.
 - Bounded session summaries discard partial UTF-8 boundary records before decoding,
   preserving discovery of the latest committed turn across tail and crash boundaries.
 
-### Security
+#### Security
 
 - Session containment and no-follow protections cover the private state root, including
   workspace metadata, session JSONL files, and compaction temporaries.
 
-## Unreleased - 2026-08-22 (8) - Contained session discovery and reliable resume
+### 2026-08-22 — Contained session discovery and reliable resume
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Session listing reads bounded header and tail metadata instead of replaying complete JSONL
   history, while preserving newest-first ordering.
 - `aether resume --latest` skips corrupt, empty, unsupported, or otherwise unrestorable sessions
   until it finds newest valid candidate.
 
-### Security
+#### Security
 
 - Session enumeration opens the selected workspace bucket, `sessions`, and JSONL entries
   through contained no-follow filesystem operations, rejecting links and reparse points.
 
-## Unreleased - 2026-08-22 (7) - CLI and session workflow improvements
+### 2026-08-22 — CLI and session workflow improvements
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added `aether sessions` and safe `aether resume --latest` discovery within the selected workspace.
 
-### Changed
+#### Changed
 
 - One-shot and interactive prompts now use the same session-backed agent runtime path.
 
-### Security
+#### Security
 
 - Session replay accepts only already-contained descriptors; missing sessions are handled with typed errors.
 
-All notable AETHER Fx changes are recorded here. The project remains
-unreleased, with changes grouped by public capability.
+All notable AETHER Fx changes are recorded here, organized by public capability
+within this release.
 
-## Unreleased - 2026-08-22 (6) - Session storage path hardening
+### 2026-08-22 — Session storage path hardening
 
-> Status: unreleased work. No artifact has been published.
 
-### Security
+#### Security
 
 - State directories and JSONL files are created and opened without following symbolic
   links or Windows reparse points, and must remain inside the private state root.
 - Compaction temps are created exclusively beside the selected OS-state session JSONL
   and cannot redirect writes through a planted symlink.
 
-### Documentation
+#### Documentation
 
 - Documented session-path containment, no-follow open/create semantics, and
   residual TOCTOU between validation and the final OS call.
 
-## Unreleased - 2026-08-22 (5) - Session and context safety hardening
+### 2026-08-22 — Session and context safety hardening
 
-> Status: unreleased work. No artifact has been published.
 
-### Changed
+#### Changed
 
 - Session JSONL is schema version 3. Each completed turn is one committed
   `TurnSnapshot` record. Truncated trailing records are ignored; previous
@@ -497,7 +488,7 @@ unreleased, with changes grouped by public capability.
 - Continuation recovery uses typed `BackendError::InvalidContinuation` instead
   of matching user-facing error strings.
 
-### Security
+#### Security
 
 - Unix session directories are mode `0700` and session JSONL/temp files are
   `0600`. `payload_contains_secrets` remains defense-in-depth after record
@@ -505,17 +496,16 @@ unreleased, with changes grouped by public capability.
 - Compaction refuses to rewrite a session after corrupt replay, leaving the
   original file untouched.
 
-### Documentation
+#### Documentation
 
 - Documented persisted versus omitted session fields, Unix session modes, turn
-  commit/recovery, continuation invalidation, and the Rainy SDK 0.6.14 mapping
+  commit/recovery, continuation invalidation, and the Rainy SDK 0.6.16 mapping
   limitation for continuation errors.
 
-## Unreleased - 2026-08-22 (4) - Context engine and session continuity
+### 2026-08-22 — Context engine and session continuity
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
 - Added a bounded workspace context engine that tracks the current task,
   inspected and modified files, targeted excerpts, compact tool summaries, git
@@ -528,31 +518,31 @@ unreleased, with changes grouped by public capability.
   reconstruction from bounded persisted state when Rainy `previous_response_id`
   is unusable.
 
-### Changed
+#### Changed
 
 - New-file `create_only` installation prefers native exclusive rename
   (Unix `renameat_with(NOREPLACE)`, Windows `MoveFileExW` without replace) and
   falls back to hard links only when exclusive rename is unavailable.
 
-### Security
+#### Security
 
 - Session persistence refuses secret-bearing records and stores only opaque
   continuation identity keys. `create_only` still refuses to replace an
   existing destination.
 
-### Performance
+#### Performance
 
 - Re-ran the existing Criterion suite. Small-file read and session replay
   are slower in this configuration because `read` now hashes content and
   session JSONL validates schema v2; remaining statistically flagged
   changes are recorded in `docs/performance.md`.
 
-### Documentation
+#### Documentation
 
 - Documented context/session bounds, resume behavior, and remaining
   filesystems that lack both exclusive rename and hard links.
 
-### Known limitations and constraints
+#### Known limitations and constraints
 
 - Filesystems without exclusive no-replace rename or hard links cannot
   atomically create-if-absent; AETHER fails closed rather than copying over an
@@ -560,11 +550,10 @@ unreleased, with changes grouped by public capability.
 - Git awareness remains read-only; working-tree mutation is still out of
   scope.
 
-## Unreleased - 2026-08-22 (3) - Runtime correctness and concurrency hardening
+### 2026-08-22 — Runtime correctness and concurrency hardening
 
-> Status: unreleased work. No artifact has been published.
 
-### Fixed
+#### Fixed
 
 - Closed same-path AETHER `write`/`patch` mutation races with weak-reference
   per-destination coordination and deterministic multi-file lock ordering.
@@ -577,42 +566,41 @@ unreleased, with changes grouped by public capability.
 - Rejected Rainy streams that end without a valid terminal response event and
   prevented truncated tool calls from executing.
 
-### Changed
+#### Changed
 
 - Updated the six-target CI matrix to execute native workspace tests in
   addition to centralized quality and policy gates.
 - Made process drain-task ownership and bounded five-second termination waits
   explicit in the runtime behavior.
 
-### Security
+#### Security
 
 - Strengthened mutation precondition handling and process-lifecycle failure
   reporting without claiming cross-process compare-and-swap guarantees.
 
-### Performance
+#### Performance
 
 - Re-ran the existing benchmark suite and recorded current local measurements
   and observed regression signals in `docs/performance.md`.
 
-### Documentation updates
+#### Documentation updates
 
 - Documented atomic replacement versus atomic create-if-absent, optimistic
   content preconditions, process cleanup aggregation, permission cancellation,
   native CI execution, and Rainy terminal-stream handling.
 
-### Known Limitations
+#### Known Limitations
 
 - An arbitrary external process can still mutate the filesystem namespace in
   the final window after AETHER revalidation and before the atomic OS call;
   same-path AETHER races are serialized and the limitation is documented.
 
-## Unreleased - 2026-08-22 (2) - Native runtime hardening and interactive agent
+### 2026-08-22 — Native runtime hardening and interactive agent
 
-> Status: unreleased work. No artifact has been published.
 
-### Added
+#### Added
 
-#### Cooperative runtime control
+##### Cooperative runtime control
 
 - Added the std-only `CancellationFlag` in `aether-core`, with agent-level
   notification support for interruptible async waits.
@@ -624,7 +612,7 @@ unreleased, with changes grouped by public capability.
 - Added a deterministic current-thread regression test proving blocking tool
   work does not monopolize the Tokio control plane.
 
-#### Safe filesystem replacement
+##### Safe filesystem replacement
 
 - Added a platform-aware atomic write path using same-directory temporary
   files, collision-resistant PID/counter names, exclusive creation, flush,
@@ -636,7 +624,7 @@ unreleased, with changes grouped by public capability.
 - Added staged, rollback-capable multi-file patch commits with explicit
   high-severity errors when rollback is incomplete.
 
-#### Persistent process runtime
+##### Persistent process runtime
 
 - Added a bounded process registry with a maximum of 16 session-owned
   persistent processes.
@@ -647,7 +635,7 @@ unreleased, with changes grouped by public capability.
 - Added session shutdown cleanup and cancellation-aware process start, read,
   write, signal, kill, and status behavior.
 
-#### Interactive permissions
+##### Interactive permissions
 
 - Added backend-neutral `PermissionRequested` and `PermissionResolved`
   events.
@@ -661,7 +649,7 @@ unreleased, with changes grouped by public capability.
 - Added fail-closed behavior for mutation when no interactive terminal is
   available.
 
-#### Multi-turn interactive session
+##### Multi-turn interactive session
 
 - Changed bare `aether` into a persistent prompt loop that reuses the agent,
   backend, tool registry, process registry, permission grants, and session
@@ -673,9 +661,9 @@ unreleased, with changes grouped by public capability.
 - Preserved local prompt display before backend construction or Rainy network
   activity.
 
-### Changed
+#### Changed
 
-#### Tool execution and bounds
+##### Tool execution and bounds
 
 - Moved potentially blocking filesystem, canonicalization, hashing, traversal,
   and search work to bounded `spawn_blocking` operations while retaining the
@@ -687,7 +675,7 @@ unreleased, with changes grouped by public capability.
 - Retained exactly nine model-visible tools: `read`, `list`, `find`, `search`,
   `write`, `patch`, `shell`, `process`, and `git`.
 
-#### Deterministic Rainy selection
+##### Deterministic Rainy selection
 
 - Changed model selection to `--model`, then `AETHER_MODEL`, then a clear
   configuration error.
@@ -696,7 +684,7 @@ unreleased, with changes grouped by public capability.
 - Kept `rainy-sdk 0.6.16`; no unpublished Git dependency or speculative SDK
   upgrade was introduced.
 
-### Tests
+#### Tests
 
 - Added coverage for atomic replacement, temporary cleanup, precondition
   mismatch, Unix executable permissions, staged patch rollback, typed
@@ -708,7 +696,7 @@ unreleased, with changes grouped by public capability.
   workspace bounds coverage.
 - Added a registry assertion that exactly nine model-visible tools exist.
 
-### Documentation
+#### Documentation
 
 - Updated architecture documentation for the blocking worker boundary,
   process subsystem, cancellation, permission broker, and nine-tool executor.
@@ -718,7 +706,7 @@ unreleased, with changes grouped by public capability.
 - Updated tool contracts with process buffer and truncation metadata.
 - Updated Rainy integration, toolchain baseline, and performance documentation.
 
-### Dependencies
+#### Dependencies
 
 - Enabled the existing `windows-sys 0.61.2` `Win32_Storage_FileSystem`
   feature for `ReplaceFileW`.
@@ -726,7 +714,7 @@ unreleased, with changes grouped by public capability.
   Windows-targeted `windows-sys` edge to `aether-tools`.
 - Added no new crate package and kept the existing Rust `1.98.0` toolchain.
 
-### Performance
+#### Performance
 
 - Added benchmarks for blocking dispatch, cancellation checks, permission
   decisions, multi-turn bookkeeping, atomic writes, staged patches, process
@@ -737,7 +725,7 @@ unreleased, with changes grouped by public capability.
 - No unsupported before/after speedup claim is made where no pre-Phase 1
   baseline was available.
 
-### Known Limitations
+#### Known Limitations
 
 - Native Windows execution and the complete six-target CI matrix remain
   pending external CI verification.
@@ -748,13 +736,12 @@ unreleased, with changes grouped by public capability.
 - PTY support, Git mutations, shell interpreter semantics, and live Rainy
   probing remain out of scope for this phase.
 
-## Unreleased - 2026-08-21 (1) - Foundational bootstrap and runtime hardening
+### 2026-08-21 — Foundational bootstrap and runtime hardening
 
-> Status: unreleased foundational work. No artifact has been published.
 
-### Added
+#### Added
 
-#### Workspace and repository foundation
+##### Workspace and repository foundation
 
 - Bootstrapped the Rust 2024 virtual workspace with exactly six crates:
   `aether`, `aether-core`, `aether-agent`, `aether-rainy`, `aether-tools`,
@@ -769,7 +756,7 @@ unreleased, with changes grouped by public capability.
 - Added local developer workflow skills and their lockfile, plus repository
   guidance for structure, testing, security, and release conventions.
 
-#### Runtime boundaries
+##### Runtime boundaries
 
 - Added domain primitives for IDs, events, typed errors, bounded output,
   workspace paths, permissions, sessions, model requests, and tool results.
@@ -783,7 +770,7 @@ unreleased, with changes grouped by public capability.
 - Added the shared cancellation flag and cancellation token used by agent,
   Rainy stream, tool, filesystem, and process work.
 
-#### Exact v0.1 tool surface
+##### Exact v0.1 tool surface
 
 - Added exactly nine model-visible tools: `read`, `list`, `find`, `search`,
   `write`, `patch`, `shell`, `process`, and `git`.
@@ -804,7 +791,7 @@ unreleased, with changes grouped by public capability.
 - Added structured read-oriented Git operations using the installed `git`
   executable without libgit2 or remote/destructive operations.
 
-#### Authorization and terminal interaction
+##### Authorization and terminal interaction
 
 - Added `ExecutionPermit` binding authorization to the exact tool call, tool
   name, and permission class.
@@ -819,7 +806,7 @@ unreleased, with changes grouped by public capability.
 - Added blocking-operation isolation so filesystem and CPU-heavy tool work
   runs through `spawn_blocking` instead of occupying Tokio control tasks.
 
-#### CLI and Rainy behavior
+##### CLI and Rainy behavior
 
 - Added `aether --version`, `--help`, `doctor`, `models`, prompt mode, and a
   minimal interactive shell.
@@ -831,7 +818,7 @@ unreleased, with changes grouped by public capability.
 - Added explicit unsupported responses for capabilities that are not yet
   implemented rather than placeholder behavior.
 
-#### Tests, benchmarks, and documentation
+##### Tests, benchmarks, and documentation
 
 - Added unit coverage for path containment, symlink escape, permissions,
   cancellation, continuation identity, tool schemas, bounded outputs,
@@ -844,7 +831,7 @@ unreleased, with changes grouped by public capability.
 - Added architecture, security, Rainy integration, tool contract,
   performance, and toolchain baseline documentation.
 
-### Changed
+#### Changed
 
 - Moved tool execution from an unqualified invocation to an explicit
   permission-and-cancellation context.
@@ -857,7 +844,7 @@ unreleased, with changes grouped by public capability.
 - Changed terminal startup and prompt presentation to use the native
   monochrome shell substrate without an alternate screen.
 
-### Security
+#### Security
 
 - Kept all filesystem operations rooted in canonical workspace containment,
   including symlink escape checks.
@@ -870,7 +857,7 @@ unreleased, with changes grouped by public capability.
 - Kept telemetry, crash uploaders, licensing gates, activation, and remote
   mutation out of the bootstrap.
 
-### Performance
+#### Performance
 
 - Kept tool output, search, process buffers, agent text, event queues, and
   session replay bounded.
@@ -879,9 +866,9 @@ unreleased, with changes grouped by public capability.
 - Recorded the current exploratory search benchmark in
   `docs/performance.md`; it is a measurement baseline, not a product claim.
 
-### Known Limitations
+#### Known Limitations
 
-- The verified Rainy SDK is `0.6.14`; the anticipated `6.5.x` generation was
+- The verified Rainy SDK is `0.6.16`; the anticipated `6.5.x` generation was
   not available and has not been fabricated.
 - Live Rainy integration tests remain opt-in and require `RAINY_API_KEY`.
 - `aether resume` remains explicitly unsupported in this bootstrap phase.

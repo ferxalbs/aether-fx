@@ -7,12 +7,99 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Verify tag and release sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_versions=$(cargo metadata --format-version 1 --all-features --locked --no-deps \
+            | jq -r '[.packages[] | select(.name == "aether") | .version] | if length == 1 then .[0] else error("expected one aether package") end')
+          expected_tag="v${package_versions}"
+          test "$GITHUB_REF_NAME" = "$expected_tag" || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo version $package_versions" >&2
+            exit 1
+          }
+          test -f LICENSE
+          test -f NOTICE
+          test -f THIRD_PARTY_NOTICES.md
+          test -f install.sh
+          test -f install.ps1
+          sh -n install.sh
+
+          if git ls-files | rg '(^|/)(target|dist|build|generated)(/|$)'; then
+            echo 'generated build material is tracked' >&2
+            exit 1
+          fi
+          if git grep -n -I -E '/Users/|/home/|[A-Za-z]:[\\/]Users[\\/]' -- \
+            ':!.github/workflows/release.yml' ':!docs/performance.md' ':!docs/binary-size.md'; then
+            echo 'developer-machine absolute path found in release material' >&2
+            exit 1
+          fi
+          if git grep -n -I -E 'gho_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY|sk-[A-Za-z0-9]{20,}|ra-[0-9]{14}[A-Za-z0-9]{10,}' --; then
+            echo 'credential-like material found in tracked files' >&2
+            exit 1
+          fi
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Locked metadata
+        run: cargo metadata --format-version 1 --all-features --locked --no-deps
+
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Deterministic coding-agent evaluations
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo run --locked -p aether-eval -- target/aether-eval-results.json
+
+      - name: Nextest
+        run: |
+          cargo install --locked --version 0.9.143 cargo-nextest
+          cargo nextest run --workspace --all-features --locked
+
+      - name: Dependency policy
+        run: |
+          cargo install --locked --version 0.20.2 cargo-deny
+          cargo deny check
+
+      - name: Security advisories
+        run: |
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo audit
+
+      - name: Coverage
+        run: |
+          cargo install --locked --version 0.9.0 cargo-llvm-cov
+          cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+
   build:
     name: Package ${{ matrix.name }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -20,27 +107,53 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             name: windows-x86_64
+            extension: zip
           - target: aarch64-pc-windows-msvc
             runner: windows-11-vs2026-arm
             name: windows-aarch64
+            extension: zip
           - target: x86_64-apple-darwin
             runner: macos-26-intel
             name: macos-x86_64
+            extension: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-26
             name: macos-aarch64
+            extension: tar.gz
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             name: linux-x86_64-gnu
+            extension: tar.gz
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             name: linux-aarch64-gnu
+            extension: tar.gz
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       # actions/checkout v6.0.2
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+
+      - name: Validate PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $pwd 'install.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
 
       - name: Add target
         run: rustup target add ${{ matrix.target }}
@@ -56,42 +169,212 @@ jobs:
           cargo install --locked --version 0.5.9 cargo-cyclonedx
           cargo cyclonedx --manifest-path crates/aether/Cargo.toml --format json --describe binaries --override-filename bom.json
 
+      - name: Native smoke tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          binary="target/${{ matrix.target }}/release/aether"
+          test -x "$binary"
+          test "$("$binary" --version)" = "$version"
+          "$binary" --help >/dev/null
+
+          smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/aether-smoke.XXXXXXXX")
+          trap 'rm -rf "$smoke_root"' EXIT
+          mkdir -p "$smoke_root/workspace"
+          doctor_output=$(env -u RAINY_API_KEY -u AETHER_MODEL \
+            AETHER_FX_STATE_DIR="$smoke_root/state" \
+            "$binary" --root "$smoke_root/workspace" doctor)
+          printf '%s\n' "$doctor_output" | grep -F 'RAINY_API_KEY: not configured'
+          printf '%s\n' "$doctor_output" | grep -F 'AETHER_MODEL: not configured'
+          printf '%s\n' "$doctor_output" | grep -F 'provider endpoint: SDK default HTTPS endpoint'
+
+      - name: Native smoke tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $binary = "target/${{ matrix.target }}/release/aether.exe"
+          if ((& $binary --version).Trim() -ne $version) { throw 'native --version check failed' }
+          & $binary --help | Out-Null
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP ("aether-smoke-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force -Path (Join-Path $smokeRoot 'workspace') | Out-Null
+          Remove-Item Env:RAINY_API_KEY -ErrorAction SilentlyContinue
+          Remove-Item Env:AETHER_MODEL -ErrorAction SilentlyContinue
+          $env:AETHER_FX_STATE_DIR = Join-Path $smokeRoot 'state'
+          $doctorOutput = & $binary --root (Join-Path $smokeRoot 'workspace') doctor | Out-String
+          if ($doctorOutput -notmatch 'RAINY_API_KEY: not configured') { throw 'doctor key status check failed' }
+          if ($doctorOutput -notmatch 'AETHER_MODEL: not configured') { throw 'doctor model status check failed' }
+          if ($doctorOutput -notmatch 'provider endpoint: SDK default HTTPS endpoint') { throw 'doctor endpoint check failed' }
+
       - name: Package Unix artifact
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME}"
-          artifact="aether-${version}-${{ matrix.name }}"
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/aether" "dist/${artifact}"
-          cp crates/aether/bom.json "dist/${artifact}.cdx.json"
-          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "dist/"
-          tar -C dist -czf "dist/${artifact}.tar.gz" "${artifact}" "${artifact}.cdx.json" LICENSE NOTICE THIRD_PARTY_NOTICES.md
-          sha256sum "dist/${artifact}.tar.gz" > "dist/${artifact}.tar.gz.sha256"
-          rm "dist/${artifact}" "dist/${artifact}.cdx.json" "dist/LICENSE" "dist/NOTICE" "dist/THIRD_PARTY_NOTICES.md"
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          archive="aether-${version}-${{ matrix.name }}.tar.gz"
+          rm -rf dist
+          mkdir -p dist/package
+          cp "target/${{ matrix.target }}/release/aether" dist/package/aether
+          cp crates/aether/bom.json dist/package/aether.cdx.json
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/package/
+          tar -C dist/package -czf "dist/${archive}" aether aether.cdx.json LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          (cd dist && sha256sum "$archive" > "${archive}.sha256")
+          expected=$(printf '%s\n' aether aether.cdx.json LICENSE NOTICE THIRD_PARTY_NOTICES.md | sort)
+          actual=$(tar -tzf "dist/${archive}" | sort)
+          test "$actual" = "$expected"
+          rm -rf dist/package
+          extracted=$(mktemp -d "${TMPDIR:-/tmp}/aether-package.XXXXXXXX")
+          trap 'rm -rf "$extracted"' EXIT
+          tar -xzf "dist/${archive}" -C "$extracted"
+          test "$("$extracted/aether" --version)" = "${GITHUB_REF_NAME#v}"
 
       - name: Package Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME
-          $artifact = "aether-$version-${{ matrix.name }}"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/aether.exe" "dist/$artifact.exe"
-          Copy-Item crates/aether/bom.json "dist/$artifact.cdx.json"
-          Copy-Item LICENSE, NOTICE, THIRD_PARTY_NOTICES.md -Destination dist/
-          Compress-Archive -Path "dist/$artifact.exe", "dist/$artifact.cdx.json", "dist/LICENSE", "dist/NOTICE", "dist/THIRD_PARTY_NOTICES.md" -DestinationPath "dist/$artifact.zip"
-          (Get-FileHash "dist/$artifact.zip" -Algorithm SHA256).Hash.ToLower() + "  $artifact.zip" | Set-Content "dist/$artifact.zip.sha256"
-          Remove-Item "dist/$artifact.exe", "dist/$artifact.cdx.json", "dist/LICENSE", "dist/NOTICE", "dist/THIRD_PARTY_NOTICES.md"
+          $ErrorActionPreference = 'Stop'
+          $archive = "aether-$env:GITHUB_REF_NAME-${{ matrix.name }}.zip"
+          $dist = Join-Path $pwd 'dist'
+          $package = Join-Path $dist 'package'
+          Remove-Item -LiteralPath $dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aether.exe" (Join-Path $package 'aether.exe')
+          Copy-Item crates/aether/bom.json (Join-Path $package 'aether.cdx.json')
+          Copy-Item LICENSE, NOTICE, THIRD_PARTY_NOTICES.md -Destination $package
+          Compress-Archive -Path (Join-Path $package 'aether.exe'), (Join-Path $package 'aether.cdx.json'), (Join-Path $package 'LICENSE'), (Join-Path $package 'NOTICE'), (Join-Path $package 'THIRD_PARTY_NOTICES.md') -DestinationPath (Join-Path $dist $archive)
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $dist $archive)).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii (Join-Path $dist "$archive.sha256")
+          $check = Join-Path $env:RUNNER_TEMP ("aether-package-" + [guid]::NewGuid().ToString('N'))
+          Expand-Archive -LiteralPath (Join-Path $dist $archive) -DestinationPath $check
+          $expected = @('aether.exe', 'aether.cdx.json', 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md') | Sort-Object
+          $actual = @(Get-ChildItem -LiteralPath $check -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if ((Compare-Object $expected $actual).Count -ne 0) { throw 'archive member validation failed' }
+          if ((& (Join-Path $check 'aether.exe') --version).Trim() -ne $env:GITHUB_REF_NAME.Substring(1)) { throw 'packaged --version check failed' }
+          Remove-Item -LiteralPath $check -Recurse -Force
+          Remove-Item -LiteralPath $package -Recurse -Force
 
       # actions/upload-artifact v7.0.1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ${{ matrix.name }}
+          name: package-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 
       # actions/attest-build-provenance v4.1.0; requires the permissions above.
       - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:
-          subject-path: dist/*
+          subject-path: dist/aether-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.extension }}
+
+  publish:
+    name: Publish GitHub prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      # actions/download-artifact v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: package-*
+          path: downloaded
+
+      - name: Validate and aggregate release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          platforms=(
+            windows-x86_64
+            windows-aarch64
+            macos-x86_64
+            macos-aarch64
+            linux-x86_64-gnu
+            linux-aarch64-gnu
+          )
+          expected_directories=$(printf 'package-%s\n' "${platforms[@]}" | sort)
+          actual_directories=$(find downloaded -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+          test "$actual_directories" = "$expected_directories"
+
+          rm -rf release-assets
+          mkdir -p release-assets
+          for platform in "${platforms[@]}"; do
+            case "$platform" in
+              windows-*) extension=zip ;;
+              *) extension=tar.gz ;;
+            esac
+            archive="aether-${GITHUB_REF_NAME}-${platform}.${extension}"
+            checksum="${archive}.sha256"
+            directory="downloaded/package-${platform}"
+            expected_files=$(printf '%s\n' "$archive" "$checksum" | sort)
+            actual_files=$(find "$directory" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+            test "$actual_files" = "$expected_files"
+            cp "$directory/$archive" release-assets/
+            expected_hash=$(awk '{print $1}' "$directory/$checksum")
+            actual_hash=$(sha256sum "release-assets/$archive" | awk '{print $1}')
+            test "$actual_hash" = "$expected_hash"
+          done
+
+          (
+            cd release-assets
+            sha256sum *.tar.gz *.zip | sort -k2 > SHA256SUMS
+          )
+          test "$(wc -l < release-assets/SHA256SUMS | tr -d ' ')" = 6
+          cp install.sh install.ps1 release-assets/
+
+          expected_assets=$(printf '%s\n' \
+            aether-${GITHUB_REF_NAME}-windows-x86_64.zip \
+            aether-${GITHUB_REF_NAME}-windows-aarch64.zip \
+            aether-${GITHUB_REF_NAME}-macos-x86_64.tar.gz \
+            aether-${GITHUB_REF_NAME}-macos-aarch64.tar.gz \
+            aether-${GITHUB_REF_NAME}-linux-x86_64-gnu.tar.gz \
+            aether-${GITHUB_REF_NAME}-linux-aarch64-gnu.tar.gz \
+            SHA256SUMS install.sh install.ps1 | sort)
+          actual_assets=$(find release-assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          test "$actual_assets" = "$expected_assets"
+
+      - name: Create GitHub prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          AETHER Fx ${GITHUB_REF_NAME} is an alpha preview and is not stable or production-ready software.
+
+          Install the version-pinned Unix installer with:
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/ferxalbs/aether-fx/${GITHUB_REF_NAME}/install.sh | sh -s -- --version ${GITHUB_REF_NAME}
+          \`\`\`
+
+          Configure RAINY_API_KEY and choose a model with \`aether models\` and \`AETHER_MODEL\`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --prerelease \
+            --latest=false \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            release-assets/*
+
+      - name: Verify published prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json=$(gh release view "$GITHUB_REF_NAME" --json name,tagName,isDraft,isPrerelease,assets,url)
+          printf '%s\n' "$release_json" | jq -e \
+            --arg tag "$GITHUB_REF_NAME" \
+            '.name == $tag and .tagName == $tag and .isDraft == false and .isPrerelease == true'
+          expected_assets=$(find release-assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          actual_assets=$(printf '%s\n' "$release_json" | jq -r '.assets[].name' | sort)
+          test "$actual_assets" = "$expected_assets"
+          printf '%s\n' "$release_json" | jq -r '.url'

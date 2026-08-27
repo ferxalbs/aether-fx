@@ -16,7 +16,9 @@ pub type BackendFuture<'a> =
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum BackendError {
     /// Credentials were absent without exposing their value.
-    #[error("Rainy credentials are unavailable")]
+    #[error(
+        "RAINY_API_KEY is not configured; set RAINY_API_KEY before running inference or aether models"
+    )]
     CredentialsUnavailable,
     /// A provider/network operation failed.
     #[error("backend operation failed: {message}")]

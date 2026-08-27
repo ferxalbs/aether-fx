@@ -106,7 +106,7 @@ fn select_model(requested: Option<String>) -> Result<String, BackendError> {
         return Ok(model);
     }
     Err(BackendError::FeatureUnavailable {
-        feature: "no model selected; pass --model or set AETHER_MODEL".to_owned(),
+        feature: "no model selected; pass --model <id> or set AETHER_MODEL".to_owned(),
     })
 }
 

@@ -31,6 +31,17 @@ fn run_with_state(root: &Path, arguments: &[&str], state_dir: &Path) -> std::pro
         .args(["--root", root.to_str().unwrap()])
         .env("AETHER_FX_STATE_DIR", state_dir)
         .env_remove("RAINY_API_KEY")
+        .env_remove("AETHER_MODEL")
+        .output()
+        .unwrap()
+}
+
+fn run_doctor_with_configuration(root: &Path, state_dir: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aether"))
+        .args(["doctor", "--root", root.to_str().unwrap()])
+        .env("AETHER_FX_STATE_DIR", state_dir)
+        .env("RAINY_API_KEY", "test-secret-value")
+        .env("AETHER_MODEL", "rainy-test-model")
         .output()
         .unwrap()
 }
@@ -188,11 +199,38 @@ fn informational_commands_report_os_state_without_touching_workspace() {
             assert!(stdout.contains("workspace: "), "{stdout}");
             assert!(stdout.contains("state: "), "{stdout}");
             assert!(stdout.contains("sessions: "), "{stdout}");
-            assert!(!stdout.contains("RAINY_API_KEY"), "{stdout}");
+            assert!(stdout.contains("RAINY_API_KEY: not configured"), "{stdout}");
+            assert!(stdout.contains("AETHER_MODEL: not configured"), "{stdout}");
+            assert!(stdout.contains("provider endpoint: SDK default HTTPS endpoint"), "{stdout}");
+            assert!(!stdout.contains("secret"), "{stdout}");
         }
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(state_root(&root));
     }
+}
+
+#[test]
+fn version_reports_exact_package_version() {
+    let root = temp_root("version");
+    let output = run(&root, ["--version"].as_slice());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), concat!(env!("CARGO_PKG_VERSION"), "\n"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn doctor_reports_configuration_without_disclosing_credentials() {
+    let root = temp_root("configured-doctor");
+    let output = run_doctor_with_configuration(&root, &state_root(&root));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("AETHER Fx "));
+    assert!(stdout.contains("RAINY_API_KEY: configured"), "{stdout}");
+    assert!(stdout.contains("AETHER_MODEL: configured"), "{stdout}");
+    assert!(!stdout.contains("test-secret-value"), "{stdout}");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
 }
 
 #[test]
@@ -361,7 +399,7 @@ fn resume_latest_skips_newer_corrupt_empty_and_unsupported_sessions() {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("skipped corrupt session: newest-invalid"), "{stderr}");
-        assert!(stderr.contains("Rainy credentials are unavailable"), "{stderr}");
+        assert!(stderr.contains("RAINY_API_KEY is not configured"), "{stderr}");
         assert!(!stderr.contains("session not found"), "{stderr}");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(state_root(&root));

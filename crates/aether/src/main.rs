@@ -78,7 +78,7 @@ fn run() -> Result<(), AppError> {
             Ok(())
         }
         Command::Version => {
-            println!("AETHER Fx {VERSION}");
+            println!("{VERSION}");
             Ok(())
         }
         Command::Doctor => doctor(&cli.root),
@@ -201,7 +201,28 @@ fn doctor(root: &Path) -> Result<(), AppError> {
     println!("sessions: {}", sessions.display());
     println!("telemetry: disabled");
     println!("provider integrations: Rainy SDK only");
+    println!(
+        "RAINY_API_KEY: {}",
+        if environment_variable_configured("RAINY_API_KEY") {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+    println!(
+        "AETHER_MODEL: {}",
+        if environment_variable_configured("AETHER_MODEL") {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+    println!("provider endpoint: SDK default HTTPS endpoint");
     Ok(())
+}
+
+fn environment_variable_configured(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
 fn sessions(root: &Path) -> Result<(), AppError> {

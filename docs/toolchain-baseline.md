@@ -22,7 +22,7 @@ Verified on 2026-08-21 using Rust/Cargo `1.98.0`, `cargo info`, crates.io metada
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 | Explicit bounded pattern validation/literal matcher support | Search hot path |
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | Preconditions and content identity | Tool hot path |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Consume the Rainy SDK stream without async-trait | Rainy stream |
-| rainy-sdk | 0.6.14 | Apache-2.0 | Official Rainy API boundary; verified Responses, stream, catalog, and error APIs | Network path |
+| rainy-sdk | 0.6.16 | Apache-2.0 | Official Rainy API boundary; verified Responses, stream, catalog, and error APIs | Network path |
 | criterion | 0.8.2 | Apache-2.0 OR MIT | Reproducible local benchmarks | Benchmark only |
 
 The verified Rainy SDK is `rainy-sdk 0.6.16`. No `6.5.x` release was available, so AETHER does not fabricate that version or its APIs. The adapter is isolated so a later verified SDK generation can replace it.

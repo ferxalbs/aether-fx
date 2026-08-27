@@ -1,38 +1,140 @@
 # AETHER Fx
 
-AETHER Fx is an experimental, native terminal coding agent written in Rust. It is one process, one binary, one async runtime, and a deliberately small set of local tools. Rainy owns inference; AETHER owns the local environment and terminal.
+AETHER Fx is an experimental native terminal coding agent. AETHER is one local binary with a
+bounded set of filesystem, process, search, patch, and Git tools.
 
-## Status
+## Alpha status
 
-This repository is in foundational bootstrap. The workspace, runtime boundaries, terminal substrate, nine-tool registry, context engine, local JSONL sessions, deterministic fake backend, and Rainy SDK adapter are being established. Incomplete capabilities return explicit errors rather than pretending to work.
+`v0.1.0-alpha-01` is an alpha preview. It is not stable or production-ready software. The first
+release is distributed only through GitHub Releases and supports the six platforms listed below.
 
-## Why native Rust
+## Install
 
-AETHER needs bounded local filesystem/process behavior, predictable startup, terminal restoration, cross-platform OS boundaries, and a small dependency surface. Rust provides those primitives without a WebView, JavaScript runtime, or TUI framework.
+### macOS and Linux
 
-## Model-visible tools
+The version-pinned installer downloads only from this repository's GitHub Release, verifies the
+archive with `SHA256SUMS`, installs to `$HOME/.local/bin`, and does not edit shell profiles:
 
-The v0.1 registry contains exactly: `read`, `list`, `find`, `search`, `write`, `patch`, `shell`, `process`, and `git`.
-
-## Supported release targets
-
-The release workflow treats Windows x64 and ARM64, macOS Intel and ARM64, and Linux x64 and ARM64 GNU as first-class targets. The ARM64 Windows and Ubuntu runners are currently preview labels and are called out in the workflow.
-
-## Build
-
-Rust 1.98.0 is pinned in `rust-toolchain.toml`.
-
-```text
-cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-features --locked
-cargo run -p aether -- --version
+```sh
+curl -fsSL \
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-01/install.sh \
+  | sh -s -- --version v0.1.0-alpha-01
 ```
 
-`aether` does not contact Rainy at startup. Inference requires `RAINY_API_KEY`; the key is read from the environment only when an inference operation is requested and is never printed or persisted. Repositories contain user/project data; AETHER Fx persistent application and session state lives in private OS state storage, grouped by canonical workspace identity. Set `AETHER_FX_STATE_DIR` for tests or controlled environments. Resume with `aether resume <session-id>`.
+Use `--dir <path>` to choose another user-owned installation directory.
 
-## Security and licensing
+### Windows PowerShell
 
-AETHER operates local tools against a canonical workspace root, bounds model-visible output, and keeps permissions separate from rendering. See `docs/security-model.md`. The project is pure Apache-2.0 open source; there is no activation, premium binary, telemetry, or required account to execute the binary.
+Download the tagged installer, then run it with the explicit prerelease version. It installs to
+`%LOCALAPPDATA%\AETHER\bin` without administrator privileges or PATH changes:
+
+```powershell
+Invoke-WebRequest `
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-01/install.ps1 `
+  -OutFile install.ps1
+
+.\install.ps1 -Version v0.1.0-alpha-01
+```
+
+Use `-Dir <path>` to choose another user-owned installation directory.
+
+### Manual archive installation
+
+Download the archive for your platform and `SHA256SUMS` from the
+[v0.1.0-alpha-01 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-01).
+Verify the archive before extracting it, then place `aether` or `aether.exe` in a user-owned
+directory on your PATH. Each archive contains only the executable, its CycloneDX SBOM, `LICENSE`,
+`NOTICE`, and `THIRD_PARTY_NOTICES.md`.
+
+## Configure
+
+Installation and provider configuration are separate stages. Check the local setup without an API
+request:
+
+```sh
+aether --version
+aether --help
+aether doctor
+```
+
+Inference and model discovery require a Rainy API key. The key is read from the environment only
+for those operations and is never printed or persisted:
+
+```sh
+export RAINY_API_KEY='your-key'
+aether models
+export AETHER_MODEL='model-id-from-the-catalog'
+```
+
+`--model <id>` overrides `AETHER_MODEL` for one invocation. AETHER does not require Rust, Cargo,
+Bun, the Rainy SDK, or a Rainy API deployment after installation. `rainy-sdk` is compiled into
+AETHER; the Rainy API is the hosted remote inference service.
+
+## Run
+
+From the repository you want to inspect:
+
+```sh
+cd path/to/repository
+aether
+```
+
+For one-shot use:
+
+```sh
+aether --model <id> "inspect this repository and explain the highest-risk issue"
+```
+
+## Resume
+
+Sessions are stored in private OS application-state storage outside the repository:
+
+```sh
+aether sessions
+aether resume <session-id>
+aether resume --latest
+```
+
+## Supported platforms
+
+The alpha release provides native archives for:
+
+- macOS x86_64
+- macOS aarch64/arm64
+- Linux x86_64 GNU
+- Linux aarch64 GNU
+- Windows x86_64
+- Windows aarch64/ARM64
+
+## Security and verification
+
+AETHER keeps filesystem operations inside a canonical workspace, bounds model-visible and process
+output, separates typed permissions from rendering, and never stores `RAINY_API_KEY`. The normal
+download flow verifies the archive against `SHA256SUMS`; `sha256sum` or `shasum -a 256` is used by
+the Unix installer. GitHub CLI users may additionally verify an archive's build attestation:
+
+```sh
+gh attestation verify aether-v0.1.0-alpha-01-linux-x86_64-gnu.tar.gz \
+  --repo ferxalbs/aether-fx
+```
+
+Attestation verification is optional; GitHub CLI is not required to install or run AETHER. See
+[`SECURITY.md`](SECURITY.md) and [`docs/security-model.md`](docs/security-model.md) for details.
+
+## Build from source
+
+This section is for developers. Rust `1.98.0` is pinned in `rust-toolchain.toml`.
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo run --locked -p aether -- --version
+```
+
+The release workflow builds the production binaries on matching GitHub runners; a locally built
+`target/release/aether` is not a release artifact.
 
 ## License
 
