@@ -402,7 +402,8 @@ mod tests {
         let root = test_root();
         let registry = Arc::new(registry(&root, true));
         let (program, args) = if cfg!(windows) {
-            ("cmd", vec!["/C".to_owned(), "for /L %i in (1,1,400000) do @echo x".to_owned()])
+            fs::write(root.join("overflow.txt"), "x".repeat(400_000)).unwrap();
+            ("cmd", vec!["/C".to_owned(), "type overflow.txt".to_owned()])
         } else {
             ("sh", vec!["-c".to_owned(), "yes x | head -c 400000".to_owned()])
         };

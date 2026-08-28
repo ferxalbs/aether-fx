@@ -7,6 +7,8 @@
 - Workspace-relative paths now compare and display with portable `/` separators, so Windows
   inspection, writes, and eval replay no longer treat `src\lib.rs` and `src/lib.rs` as different
   files.
+- Persistent-process overflow coverage dumps a large file on Windows instead of a slow `cmd` FOR
+  loop, so ARM runners still fill the 256 KiB drain buffer and report dropped bytes.
 
 ### Changed
 
