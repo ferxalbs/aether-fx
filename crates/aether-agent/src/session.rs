@@ -633,7 +633,10 @@ mod tests {
                 SessionRecord::Started { workspace_root: root.display().to_string(), model: None },
             )
             .unwrap();
-        assert!(path.starts_with(SessionStore::state_root().unwrap()));
+        let state_root =
+            crate::state::physical_state_root(&crate::state::resolve_state_root().unwrap())
+                .unwrap();
+        assert!(path.starts_with(state_root));
         assert!(path.is_file());
         assert!(!root.join(".aether").exists());
         assert!(!root.join(".aether-fx").exists());
