@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-27 (2) - Native Windows workspace paths
+
+### Fixed
+
+- Workspace-relative paths now compare and display with portable `/` separators, so Windows
+  inspection, writes, and eval replay no longer treat `src\lib.rs` and `src/lib.rs` as different
+  files.
+
+### Changed
+
+- Full deterministic and capability eval suites run once from the `aether-eval` binary in CI
+  instead of being re-executed as nested `cargo test` work on every native target.
+
 ## v0.1.0-alpha-01 - 2026-08-27 (1) - First installable alpha prerelease
 
 ### Release packaging and installation

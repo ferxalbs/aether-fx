@@ -43,18 +43,19 @@ pub struct WorkspacePath(PathBuf);
 impl WorkspacePath {
     /// Normalize a relative path without touching the filesystem.
     pub fn new(path: impl AsRef<Path>) -> CoreResult<Self> {
-        let path = path.as_ref();
-        if path.as_os_str().is_empty() {
+        let original = path.as_ref();
+        if original.as_os_str().is_empty() {
             return Ok(Self(PathBuf::from(".")));
         }
+        let unified = original.to_string_lossy().replace('\\', "/");
         let mut normalized = PathBuf::new();
-        for component in path.components() {
+        for component in Path::new(&unified).components() {
             match component {
                 Component::CurDir => {}
                 Component::Normal(part) => normalized.push(part),
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return Err(CoreError::PathEscape {
-                        path: path.to_string_lossy().into_owned(),
+                        path: original.to_string_lossy().into_owned(),
                     });
                 }
             }
@@ -70,9 +71,22 @@ impl WorkspacePath {
         &self.0
     }
 
-    /// Return a display-safe path string.
+    /// Return a portable workspace-relative path using `/` separators.
     pub fn display(&self) -> String {
-        self.0.to_string_lossy().into_owned()
+        let mut rendered = String::new();
+        for component in self.0.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => {
+                    if !rendered.is_empty() {
+                        rendered.push('/');
+                    }
+                    rendered.push_str(&part.to_string_lossy());
+                }
+                _ => {}
+            }
+        }
+        if rendered.is_empty() { ".".to_owned() } else { rendered }
     }
 }
 
@@ -85,5 +99,15 @@ mod tests {
         assert!(WorkspacePath::new("src/main.rs").is_ok());
         assert!(WorkspacePath::new("../outside").is_err());
         assert!(WorkspacePath::new("/outside").is_err());
+    }
+
+    #[test]
+    fn workspace_paths_compare_equal_across_native_separators() {
+        let portable = WorkspacePath::new("src/lib.rs").unwrap();
+        let native = WorkspacePath::new(format!("src{}lib.rs", std::path::MAIN_SEPARATOR)).unwrap();
+        assert_eq!(portable.display(), "src/lib.rs");
+        assert_eq!(native.display(), "src/lib.rs");
+        assert_eq!(portable, native);
+        assert!(!portable.display().contains('\\'));
     }
 }

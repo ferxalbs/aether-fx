@@ -45,7 +45,9 @@ jobs:
       - name: Deterministic coding-agent evaluations
         env:
           CARGO_NET_OFFLINE: "true"
-        run: cargo run --locked -p aether-eval -- target/aether-eval-results.json
+        run: |
+          cargo run --locked -p aether-eval -- target/aether-eval-results.json
+          cargo run --locked -p aether-eval -- --capability target/aether-eval-capability-results.json
 
       - name: Nextest
         run: |

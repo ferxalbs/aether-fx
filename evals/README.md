@@ -12,6 +12,9 @@ Run the separate hard-task capability suite with:
 cargo run --release -p aether-eval -- --capability target/aether-eval-capability-results.json
 ```
 
+Default `cargo test` does not replay these suites. CI runs them once through this binary so
+native workspace tests do not spawn nested `cargo test` for every fixture on every target.
+
 The regression suite is intentionally unchanged and remains the 9/9 non-regression gate. The
 capability suite measures autonomous progress across a serialized interruption boundary. Its five
 offline scenarios cover multi-file/new-module implementation, compiler-error-driven repair,
