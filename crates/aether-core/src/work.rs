@@ -4,9 +4,12 @@
 //! chooses the implementation strategy; the runtime records the objective, observable work
 //! units, evidence, mutations, blockers, and verification needed to resume that strategy.
 
-use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
-use crate::{BoundedText, VerificationStatus};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{BoundedText, VerificationStatus, WorkspacePath};
 
 /// Maximum bytes retained for the normalized task objective.
 pub const MAX_WORK_OBJECTIVE_BYTES: usize = 512;
@@ -184,7 +187,7 @@ impl WorkState {
         matches!(self.mode, WorkMode::Structured)
     }
 
-    /// Add an explicit bounded work unit supplied by an integration or future model adapter.
+    /// Add an explicit bounded work unit supplied by an integration.
     /// The runtime does not infer semantic dependencies; it only preserves and validates them.
     pub fn add_subgoal(&mut self, id: &str, label: &str, depends_on: &[String]) -> bool {
         if id.is_empty() || self.subgoals.iter().any(|subgoal| subgoal.id.as_str() == id) {
@@ -210,6 +213,114 @@ impl WorkState {
             MAX_WORK_SUBGOALS,
         );
         self.select_active_subgoal();
+        true
+    }
+
+    /// Apply a model-supplied work outline without allowing the model to assert correctness.
+    ///
+    /// Only pending/active intent is accepted here. Completion, blocker, criterion, evidence,
+    /// mutation, and verification state remain runtime-owned and can only be changed by actual
+    /// observations. Invalid paths, unknown dependencies, duplicate identifiers, and cycles are
+    /// rejected as one bounded update.
+    pub fn apply_model_update(&mut self, update: &Value) -> bool {
+        let Some(raw_subgoals) = update.get("subgoals").and_then(Value::as_array) else {
+            return false;
+        };
+        if raw_subgoals.is_empty() || raw_subgoals.len() > MAX_WORK_SUBGOALS {
+            return false;
+        }
+
+        let mut proposals = Vec::with_capacity(raw_subgoals.len());
+        let mut proposed_ids = HashSet::with_capacity(raw_subgoals.len());
+        for raw in raw_subgoals {
+            let Some(object) = raw.as_object() else { return false };
+            let Some(id) = bounded_model_text(object.get("id").and_then(Value::as_str)) else {
+                return false;
+            };
+            let Some(label) = bounded_model_text(object.get("label").and_then(Value::as_str))
+            else {
+                return false;
+            };
+            if !proposed_ids.insert(id.clone()) {
+                return false;
+            }
+            let Some(depends_on) = bounded_model_relations(object.get("depends_on")) else {
+                return false;
+            };
+            let Some(paths) = bounded_model_paths(object.get("paths")) else { return false };
+            proposals.push((id, label, depends_on, paths));
+        }
+
+        let existing_ids = self
+            .subgoals
+            .iter()
+            .map(|subgoal| subgoal.id.as_str().to_owned())
+            .collect::<HashSet<_>>();
+        let known_ids = existing_ids.union(&proposed_ids).cloned().collect::<HashSet<_>>();
+        let mut graph = HashMap::with_capacity(self.subgoals.len() + proposals.len());
+        for subgoal in &self.subgoals {
+            graph.insert(
+                subgoal.id.as_str().to_owned(),
+                subgoal
+                    .depends_on
+                    .iter()
+                    .map(|dependency| dependency.as_str().to_owned())
+                    .collect(),
+            );
+        }
+        for (id, _, depends_on, _) in &proposals {
+            if depends_on.iter().any(|dependency| !known_ids.contains(dependency)) {
+                return false;
+            }
+            graph.insert(id.clone(), depends_on.clone());
+        }
+        if graph
+            .keys()
+            .any(|id| dependency_cycle(id, &graph, &mut HashSet::new(), &mut HashSet::new()))
+        {
+            return false;
+        }
+        let new_count = proposals.iter().filter(|(id, _, _, _)| !existing_ids.contains(id)).count();
+        if self.subgoals.len().saturating_add(new_count) > MAX_WORK_SUBGOALS {
+            return false;
+        }
+        let requested_active = update.get("active_subgoal").and_then(Value::as_str);
+        if requested_active
+            .is_some_and(|active| !existing_ids.contains(active) && !proposed_ids.contains(active))
+        {
+            return false;
+        }
+
+        for (id, label, depends_on, paths) in proposals {
+            if let Some(subgoal) =
+                self.subgoals.iter_mut().find(|subgoal| subgoal.id.as_str() == id)
+            {
+                subgoal.label = bounded(&label);
+                subgoal.depends_on =
+                    depends_on.iter().map(|dependency| bounded(dependency)).collect();
+                subgoal.paths = paths.iter().map(|path| bounded(path)).collect();
+                if subgoal.status == WorkStatus::Stale {
+                    subgoal.status = WorkStatus::Pending;
+                    subgoal.completed_revision = None;
+                }
+            } else {
+                self.subgoals.push(WorkSubgoal {
+                    id: bounded(&id),
+                    label: bounded(&label),
+                    status: WorkStatus::Pending,
+                    depends_on: depends_on.iter().map(|dependency| bounded(dependency)).collect(),
+                    paths: paths.iter().map(|path| bounded(path)).collect(),
+                    attempts: 0,
+                    completed_revision: None,
+                });
+            }
+        }
+        self.mode = WorkMode::Structured;
+        if let Some(active) = requested_active {
+            self.active_subgoal = Some(bounded(active));
+        } else {
+            self.select_active_subgoal();
+        }
         true
     }
 
@@ -295,6 +406,11 @@ impl WorkState {
             );
         }
         if passed {
+            for criterion in &mut self.acceptance_criteria {
+                if criterion_supported_by_verification(criterion.description.as_str(), command) {
+                    criterion.satisfied = true;
+                }
+            }
             let completed_ids = self
                 .subgoals
                 .iter()
@@ -402,6 +518,12 @@ impl WorkState {
         }
     }
 
+    /// Return whether every explicitly supplied acceptance criterion was satisfied by runtime
+    /// evidence. An absent criteria list is intentionally vacuously satisfied.
+    pub fn criteria_satisfied(&self) -> bool {
+        self.acceptance_criteria.iter().all(|criterion| criterion.satisfied)
+    }
+
     /// Return a bounded count of work still pending or blocked.
     pub fn unresolved_count(&self) -> usize {
         self.subgoals
@@ -416,10 +538,9 @@ impl WorkState {
     /// concrete mutated paths and typed blockers are.
     pub fn blocks_completion(&self) -> bool {
         !self.blockers.is_empty()
-            || self
-                .subgoals
-                .iter()
-                .any(|subgoal| !subgoal.paths.is_empty() && subgoal.status != WorkStatus::Complete)
+            || self.subgoals.iter().any(|subgoal| {
+                subgoal.id.as_str() != "task" && subgoal.status != WorkStatus::Complete
+            })
     }
 
     /// Enforce all bounds after restoring a persisted session.
@@ -540,8 +661,76 @@ fn dependencies_complete(subgoal: &WorkSubgoal, subgoals: &[WorkSubgoal]) -> boo
         subgoals
             .iter()
             .find(|candidate| candidate.id == *dependency)
-            .is_none_or(|candidate| candidate.status == WorkStatus::Complete)
+            .is_some_and(|candidate| candidate.status == WorkStatus::Complete)
     })
+}
+
+fn bounded_model_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let bounded = bounded(value);
+    (!bounded.is_truncated()).then(|| bounded.as_str().to_owned())
+}
+
+fn bounded_model_relations(value: Option<&Value>) -> Option<Vec<String>> {
+    let Some(value) = value else { return Some(Vec::new()) };
+    let values = value.as_array()?;
+    if values.len() > MAX_WORK_RELATIONS {
+        return None;
+    }
+    let mut relations = Vec::with_capacity(values.len());
+    for value in values {
+        let relation = bounded_model_text(value.as_str())?;
+        if !relations.iter().any(|existing| existing == &relation) {
+            relations.push(relation);
+        }
+    }
+    Some(relations)
+}
+
+fn bounded_model_paths(value: Option<&Value>) -> Option<Vec<String>> {
+    let paths = bounded_model_relations(value)?;
+    paths.iter().all(|path| WorkspacePath::new(path).is_ok()).then_some(paths)
+}
+
+fn dependency_cycle(
+    id: &str,
+    graph: &HashMap<String, Vec<String>>,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if visited.contains(id) {
+        return false;
+    }
+    if !visiting.insert(id.to_owned()) {
+        return true;
+    }
+    let cycle = graph.get(id).is_some_and(|dependencies| {
+        dependencies.iter().any(|dependency| dependency_cycle(dependency, graph, visiting, visited))
+    });
+    visiting.remove(id);
+    if !cycle {
+        visited.insert(id.to_owned());
+    }
+    cycle
+}
+
+fn criterion_supported_by_verification(description: &str, command: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    let command = command.to_ascii_lowercase();
+    let mentions_tests = description.contains("test") || description.contains("spec");
+    let mentions_verification = description.contains("verif")
+        || description.contains("check")
+        || description.contains("compil")
+        || description.contains("build");
+    (mentions_tests && command.contains("test"))
+        || (mentions_verification
+            && (command.contains("check")
+                || command.contains("test")
+                || command.contains("build")
+                || command.contains("clippy")))
 }
 
 fn push_bounded<T>(items: &mut Vec<T>, item: T, limit: usize) {
@@ -694,5 +883,39 @@ mod tests {
         state.record_evidence("read", "src/lib.rs", "current", 0);
         state.invalidate_for_workspace_change(1);
         assert!(!state.evidence[0].valid);
+    }
+
+    #[test]
+    fn model_work_update_is_bounded_intent_and_rejects_invalid_dependencies() {
+        let mut state = WorkState::default();
+        state.initialize_from_prompt("refactor multiple modules");
+        let update = serde_json::json!({
+            "active_subgoal": "implementation",
+            "subgoals": [
+                {"id": "implementation", "label": "update the implementation", "paths": ["src/lib.rs"]},
+                {"id": "tests", "label": "run the focused tests", "depends_on": ["implementation"], "paths": ["tests/lib.rs"], "status": "complete"}
+            ]
+        });
+        assert!(state.apply_model_update(&update));
+        assert_eq!(state.active_subgoal.as_ref().map(BoundedText::as_str), Some("implementation"));
+        assert!(state.subgoals.iter().any(|subgoal| {
+            subgoal.id.as_str() == "tests" && subgoal.status == WorkStatus::Pending
+        }));
+        assert!(state.blocks_completion());
+
+        let before = state.clone();
+        assert!(!state.apply_model_update(&serde_json::json!({
+            "subgoals": [{"id": "cycle", "label": "cycle", "depends_on": ["missing"]}]
+        })));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn missing_acceptance_evidence_blocks_workflow_completion() {
+        let mut state = WorkState::default();
+        state.initialize_from_prompt("update one module\nacceptance: focused tests pass");
+        assert!(!state.criteria_satisfied());
+        state.satisfy_criterion("criterion-0");
+        assert!(state.criteria_satisfied());
     }
 }

@@ -70,6 +70,13 @@ local context. Stale remote continuation never outranks the filesystem. Dirty pa
 Git remain user-owned and are not silently overwritten; an attempted mutation still requires
 current inspection, a matching expected hash, and an independent permit.
 
+Compiler/test recovery and post-mutation context refreshes are observations, not authority. They
+read at most the bounded source window after rejecting symlinks, non-files, and canonical paths
+outside the workspace. A cached read is reused only for a complete retained range whose content
+hash still matches a bounded live re-hash; otherwise the normal read tool executes. Mutation
+admission continues to require its own typed permit, containment checks, and expected-hash
+revalidation.
+
 ## Dangerous operations
 
 The v0.1 Git contract exposes status, diff, show, log, and branch inspection. Push, remote mutation, hard reset, rebase, filter-branch, and automatic commit are absent. Shell execution is direct argv by default and is permission-gated.

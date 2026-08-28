@@ -4,7 +4,11 @@
 //! workflow transitions, focused verification, scheduler/guardrail preflight, and next-action
 //! ranking. It deliberately contains no model-facing planning or external state.
 
-use std::path::PathBuf;
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use aether_core::{
     ActionClassification, CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind,
@@ -172,6 +176,11 @@ impl AutonomousCodingPolicy {
     ) -> Option<ToolResult> {
         self.guardrails
             .preflight(call_id.clone(), name, input, snapshot.workflow.workspace_revision)
+            .or_else(|| {
+                (self.optimizations_enabled && name == "read")
+                    .then(|| cached_read_result(snapshot, call_id.clone(), input))
+                    .flatten()
+            })
             .or_else(|| self.mutation_preflight(snapshot, call_id, name, input))
     }
 
@@ -186,6 +195,19 @@ impl AutonomousCodingPolicy {
                 self.guardrails.preflight_prepared(action, snapshot.workflow.workspace_revision)
             })
             .flatten()
+            .or_else(|| {
+                (self.optimizations_enabled
+                    && action.tool == "read"
+                    && action.classification == ActionClassification::Read)
+                    .then(|| {
+                        cached_read_result(
+                            snapshot,
+                            action.call_id.clone(),
+                            &action.normalized_input,
+                        )
+                    })
+                    .flatten()
+            })
             .or_else(|| self.mutation_preflight_prepared(snapshot, action))
     }
 
@@ -804,6 +826,139 @@ fn relevant_paths(snapshot: &ContextSnapshot) -> Vec<&str> {
         }
     }
     paths
+}
+
+/// Build a read-shaped result only from a current, complete-enough retained excerpt. The real
+/// read tool remains the fallback for every ambiguous, stale, partial, or byte-limited request.
+fn cached_read_result(
+    snapshot: &ContextSnapshot,
+    call_id: ToolCallId,
+    input: &Value,
+) -> Option<ToolResult> {
+    if snapshot.workspace_changed || input.get("max_bytes").is_some() {
+        return None;
+    }
+    let targets = input.get("files")?.as_array()?;
+    if targets.is_empty() || targets.len() > 64 {
+        return None;
+    }
+    let mut files = Vec::with_capacity(targets.len());
+    for target in targets {
+        let path = target.get("path")?.as_str()?;
+        if WorkspacePath::new(path).is_err() {
+            return None;
+        }
+        let requested = match (target.get("start_line"), target.get("end_line")) {
+            (None, None) => None,
+            (Some(start), Some(end)) => Some(LineRange {
+                start: usize::try_from(start.as_u64()?).ok()?,
+                end: usize::try_from(end.as_u64()?).ok()?,
+            }),
+            _ => return None,
+        };
+        if requested.is_some_and(|range| range.start == 0 || range.start > range.end) {
+            return None;
+        }
+        let inspected = snapshot.inspected.iter().find(|file| {
+            file.path == path
+                && file.last_state == ObservedFileState::Present
+                && !file.stale
+                && file.content_hash.is_some()
+        })?;
+        let hash = inspected.content_hash.as_deref()?;
+        if !live_hash_matches(snapshot, path, hash) {
+            return None;
+        }
+        let excerpt = snapshot.excerpts.iter().rev().find(|excerpt| {
+            excerpt.path == path
+                && excerpt.content_hash.as_deref() == Some(hash)
+                && match requested {
+                    Some(range) => {
+                        range.start >= excerpt.start_line && range.end <= excerpt.end_line
+                    }
+                    None => excerpt.start_line == 1 && !excerpt.truncated,
+                }
+        })?;
+        let start = requested.map_or(excerpt.start_line, |range| range.start);
+        let end = requested.map_or(excerpt.end_line, |range| range.end);
+        let lines = excerpt
+            .text
+            .as_str()
+            .lines()
+            .enumerate()
+            .filter_map(|(index, text)| {
+                let number = excerpt.start_line + index;
+                (number >= start && number <= end).then(|| {
+                    serde_json::json!({
+                        "number": number,
+                        "text": text,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return None;
+        }
+        files.push(serde_json::json!({
+            "path": path,
+            "binary": false,
+            "truncated": false,
+            "bytes_read": excerpt.text.as_str().len(),
+            "content_hash": hash,
+            "lines": lines,
+        }));
+    }
+    let mut result = ToolResult::success_json(
+        call_id,
+        serde_json::json!({"files": files, "truncated": false}),
+        aether_core::DEFAULT_MAX_OUTPUT_BYTES,
+    );
+    result.output = aether_core::BoundedText::new(
+        format!("policy: reused current source evidence\n{}", result.output.as_str()),
+        aether_core::DEFAULT_MAX_OUTPUT_BYTES,
+    );
+    Some(result)
+}
+
+/// Revalidate a cached observation against the live canonical file before suppressing a read.
+/// This is a bounded freshness check, never an authority grant; the actual mutation tool still
+/// performs its own permit, containment, and expected-hash checks.
+fn live_hash_matches(snapshot: &ContextSnapshot, relative: &str, expected: &str) -> bool {
+    let relative = match WorkspacePath::new(relative) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let root = Path::new(&snapshot.workspace_root);
+    let canonical_root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    let candidate = root.join(relative.as_path());
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    let canonical = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if !canonical.starts_with(canonical_root) {
+        return false;
+    }
+    let file = match fs::File::open(canonical) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut bytes = Vec::with_capacity(8192);
+    if file.take((4 * 1024 * 1024 + 1) as u64).read_to_end(&mut bytes).is_err()
+        || bytes.len() > 4 * 1024 * 1024
+    {
+        return false;
+    }
+    blake3::hash(&bytes).to_hex().as_ref() == expected
 }
 
 fn candidate_key(snapshot: &ContextSnapshot) -> [u8; 16] {

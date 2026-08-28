@@ -47,6 +47,12 @@ verification. `EvalBackend` remains the trace-generation boundary for real provi
 backed evaluations should use a separate binary or feature so default CI remains offline and
 reproducible.
 
+The production loop also promotes bounded source windows from compiler/test diagnostics and
+successful mutations. A subsequent exact read can be served from that current evidence only after
+a live content-hash recheck; stale or partial evidence falls back to the real tool. Recovery
+updates are capped separately from the full context packet so the optimization does not trade
+fewer tool/model turns for unbounded prompt growth.
+
 JSON output includes per-task correctness, model requests, tokens when the provider reports them,
 requested and executed calls, prevented/reused observations, bytes read, bytes shown to the model,
 context bytes, static-prefix/tool-schema/context/tool-result/policy-feedback/protocol byte

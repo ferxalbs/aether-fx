@@ -277,6 +277,16 @@ impl RepoMapSnapshot {
 
     /// Return a bounded, human-readable representation suitable for model context selection.
     pub fn compact(&self, max_bytes: usize) -> String {
+        self.compact_with_instructions(max_bytes, true)
+    }
+
+    /// Return repository metadata without exposing instruction bodies or unrelated instruction
+    /// previews. Callers should add effective instructions only for active paths.
+    pub fn compact_without_instructions(&self, max_bytes: usize) -> String {
+        self.compact_with_instructions(max_bytes, false)
+    }
+
+    fn compact_with_instructions(&self, max_bytes: usize, include_instructions: bool) -> String {
         let mut output = String::new();
         push_line(&mut output, format!("tracked files: {}", self.tracked_file_count));
         if self.truncated {
@@ -345,24 +355,26 @@ impl RepoMapSnapshot {
                 format!("{}{}", display_path(&document.path), preview)
             }),
         );
-        push_section(
-            &mut output,
-            "instructions (broad to specific)",
-            self.instructions.iter().map(|instruction| {
-                let preview = instruction
-                    .content
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map_or_else(String::new, |line| format!(" — {}", truncate_preview(line)));
-                format!(
-                    "{} scope={}{}",
-                    display_path(&instruction.path),
-                    display_scope(&instruction.scope),
-                    preview
-                )
-            }),
-        );
+        if include_instructions {
+            push_section(
+                &mut output,
+                "instructions (broad to specific)",
+                self.instructions.iter().map(|instruction| {
+                    let preview = instruction
+                        .content
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map_or_else(String::new, |line| format!(" — {}", truncate_preview(line)));
+                    format!(
+                        "{} scope={}{}",
+                        display_path(&instruction.path),
+                        display_scope(&instruction.scope),
+                        preview
+                    )
+                }),
+            );
+        }
         BoundedText::new(output, max_bytes).into_string()
     }
 

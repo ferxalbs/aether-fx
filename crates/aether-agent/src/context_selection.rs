@@ -13,6 +13,7 @@ pub enum ContextKind {
     Excerpt,
     InspectedFile,
     ToolSummary,
+    ScopedInstructions,
     RepositoryMetadata,
     GitMetadata,
 }
@@ -278,6 +279,7 @@ fn score_candidate(candidate: ContextCandidate<'_>, terms: &[&str], newest: usiz
         ContextKind::Excerpt => 55,
         ContextKind::InspectedFile => 35,
         ContextKind::ToolSummary => 25,
+        ContextKind::ScopedInstructions => 52,
         ContextKind::RepositoryMetadata => 15,
         ContextKind::GitMetadata => 10,
     };
@@ -313,6 +315,7 @@ fn phase_bonus(candidate: ContextCandidate<'_>) -> i32 {
     match candidate.phase {
         WorkflowPhase::Discover => match candidate.kind {
             ContextKind::RepositoryMetadata
+            | ContextKind::ScopedInstructions
             | ContextKind::GitMetadata
             | ContextKind::ModifiedPath
             | ContextKind::UserModifiedPath
@@ -321,7 +324,9 @@ fn phase_bonus(candidate: ContextCandidate<'_>) -> i32 {
         },
         WorkflowPhase::Inspect => match candidate.kind {
             ContextKind::Excerpt | ContextKind::InspectedFile => 42,
-            ContextKind::RepositoryMetadata | ContextKind::ToolSummary => 16,
+            ContextKind::RepositoryMetadata
+            | ContextKind::ScopedInstructions
+            | ContextKind::ToolSummary => 16,
             ContextKind::ModifiedPath
             | ContextKind::UserModifiedPath
             | ContextKind::GitMetadata => 8,
@@ -330,19 +335,21 @@ fn phase_bonus(candidate: ContextCandidate<'_>) -> i32 {
             ContextKind::ModifiedPath | ContextKind::UserModifiedPath => 48,
             ContextKind::Excerpt | ContextKind::InspectedFile => 32,
             ContextKind::ToolSummary => 20,
-            ContextKind::RepositoryMetadata | ContextKind::GitMetadata => 4,
+            ContextKind::RepositoryMetadata
+            | ContextKind::ScopedInstructions
+            | ContextKind::GitMetadata => 4,
         },
         WorkflowPhase::Verify => match candidate.kind {
             ContextKind::ModifiedPath | ContextKind::Excerpt | ContextKind::InspectedFile => 38,
             ContextKind::ToolSummary | ContextKind::GitMetadata => 34,
             ContextKind::UserModifiedPath => 28,
-            ContextKind::RepositoryMetadata => 4,
+            ContextKind::RepositoryMetadata | ContextKind::ScopedInstructions => 4,
         },
         WorkflowPhase::Complete => match candidate.kind {
             ContextKind::ToolSummary | ContextKind::GitMetadata => 30,
             ContextKind::ModifiedPath | ContextKind::Excerpt | ContextKind::InspectedFile => 24,
             ContextKind::UserModifiedPath => 20,
-            ContextKind::RepositoryMetadata => 4,
+            ContextKind::RepositoryMetadata | ContextKind::ScopedInstructions => 4,
         },
     }
 }

@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-28 (1) - Evidence-driven coding loop hardening
+
+### Added
+
+- Added bounded live source promotion around compiler/test diagnostics and successful mutations,
+  so recovery steps receive the affected paths and a small current source window.
+- Added an intent-only `<aether-work>` outline channel for bounded subgoals, dependencies, and
+  paths; runtime observations still own evidence, verification, blockers, and completion.
+
+### Changed
+
+- Exact current read observations can be reused after a successful mutation only when the live
+  canonical file re-hashes to the retained content hash; stale, partial, and ambiguous reads
+  fall back to the read tool.
+- Context selection now supplies effective instruction bodies broad-to-specific for active paths
+  and excludes unrelated instruction previews from repository metadata.
+
+### Security
+
+- Automatic evidence reads are bounded, canonical-root-contained, symlink-rejecting observations
+  and never grant mutation authority or bypass tool permits and expected-hash checks.
+
 ## Unreleased - 2026-08-27 (2) - Native Windows workspace paths
 
 ### Fixed

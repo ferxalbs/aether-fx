@@ -1,4 +1,4 @@
-use std::{fmt::Write as FmtWrite, path::Path};
+use std::{fmt::Write as FmtWrite, fs, io::Read, path::Path};
 
 use aether_core::{
     ActionClassification, BoundedText, CONTEXT_GUIDANCE, CommandEffects, CompactToolSummary,
@@ -7,8 +7,9 @@ use aether_core::{
     MAX_CONTEXT_RENDER_BYTES, MAX_EXCERPT_BYTES, MAX_FILE_EXCERPTS, MAX_INSPECTED_FILES,
     MAX_STORED_TOOL_SUMMARIES, MAX_SUMMARY_PATHS, MAX_TASK_BYTES, MAX_USER_MODIFIED_FILES,
     MAX_WORKFLOW_FIELD_BYTES, ObservedFileState, OpaqueContinuation, PreparedAction, ToolResult,
-    WorkflowFailure, WorkflowFailureCategory, WorkflowPhase, WorkflowVerification, WorkspacePath,
-    analyze_command, compact_tool_result, extract_diagnostics, merge_line_ranges,
+    WorkflowDiagnostic, WorkflowFailure, WorkflowFailureCategory, WorkflowPhase,
+    WorkflowVerification, WorkspacePath, analyze_command, compact_tool_result, extract_diagnostics,
+    merge_line_ranges,
 };
 use serde_json::Value;
 
@@ -19,6 +20,12 @@ use crate::{
 };
 
 const MAX_REPO_MAP_CONTEXT_BYTES: usize = 8 * 1024;
+const MAX_AUTOMATIC_EVIDENCE_FILES: usize = 8;
+const MAX_AUTOMATIC_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AUTOMATIC_SOURCE_LINES: usize = 96;
+const AUTOMATIC_DIAGNOSTIC_LINES_BEFORE: usize = 4;
+const AUTOMATIC_DIAGNOSTIC_LINES_AFTER: usize = 8;
+const MAX_EVIDENCE_UPDATE_BYTES: usize = 128;
 
 fn relevant_symbol_paths(snapshot: &ContextSnapshot) -> Vec<&str> {
     let mut paths = Vec::new();
@@ -98,6 +105,12 @@ impl ContextEngine {
     pub fn set_task(&mut self, prompt: &str) {
         self.snapshot.current_task = BoundedText::new(prompt, MAX_TASK_BYTES);
         self.snapshot.workflow.work.initialize_from_prompt(prompt);
+    }
+
+    /// Apply a bounded model work outline. The core work state accepts only intent; runtime
+    /// observations remain the sole authority for completion, evidence, and blockers.
+    pub(crate) fn apply_model_work_update(&mut self, update: &Value) -> bool {
+        self.snapshot.workflow.work.apply_model_update(update)
     }
 
     /// Store the latest opaque continuation after sanitizing identity keys.
@@ -243,6 +256,7 @@ impl ContextEngine {
                 self.invalidate_command_effects(effects);
             }
             self.snapshot.workflow.record_mutation_scope(name, &mutation_paths);
+            self.promote_mutation_evidence(&mutation_paths);
             self.refresh_verification_plan();
         }
         if focused_verification {
@@ -279,6 +293,7 @@ impl ContextEngine {
                     self.snapshot.workflow.workspace_revision,
                     diagnostics,
                 ));
+                self.promote_diagnostic_evidence(&extract_diagnostics(result));
             }
         }
         if name == "read" && result.ok && read_contains_files(result) {
@@ -381,6 +396,34 @@ impl ContextEngine {
         self.render_internal(include_guidance, true)
     }
 
+    /// Render a small, high-signal update immediately after a failure or mutation. Unlike a full
+    /// delta packet this contains only current affected paths and the newest bounded source
+    /// windows, keeping the recovery loop cheap while still avoiding a redundant read round-trip.
+    pub(crate) fn render_evidence_delta(&self) -> String {
+        let mut out = format!(
+            "evidence_update: revision={} workspace_changed={}\n",
+            self.snapshot.workflow.workspace_revision, self.snapshot.workspace_changed
+        );
+        render_workflow_paths(&mut out, "affected", &self.snapshot.modified);
+        let mut shown = 0;
+        for excerpt in self.snapshot.excerpts.iter().rev() {
+            if shown == 3 {
+                break;
+            }
+            let current = self.snapshot.inspected.iter().find(|file| file.path == excerpt.path);
+            if current.is_some_and(|file| file.stale) {
+                continue;
+            }
+            out.push_str("source ");
+            out.push_str(&excerpt.path);
+            let _ = writeln!(out, ":{}-{}", excerpt.start_line, excerpt.end_line);
+            out.push_str(excerpt.text.as_str());
+            out.push('\n');
+            shown += 1;
+        }
+        BoundedText::new(out, MAX_EVIDENCE_UPDATE_BYTES).into_string()
+    }
+
     fn render_internal(&mut self, include_guidance: bool, delta_only: bool) -> String {
         let mut out = String::from("# AETHER workspace context\n");
         if !self.snapshot.workspace_root.is_empty() {
@@ -399,12 +442,32 @@ impl ContextEngine {
             );
         }
         self.render_workflow(&mut out);
-        let repo_metadata = self
+        let symbol_paths = relevant_symbol_paths(&self.snapshot);
+        let active_instruction_paths = if symbol_paths.is_empty() {
+            vec![".".to_owned()]
+        } else {
+            symbol_paths.iter().map(|path| (*path).to_owned()).collect()
+        };
+        let (repo_metadata, scoped_instruction_storage) = self
             .repo_map
             .as_ref()
-            .and_then(|map| map.compact(MAX_REPO_MAP_CONTEXT_BYTES).ok())
+            .and_then(|map| map.snapshot().ok())
+            .map(|snapshot| {
+                let instructions = active_instruction_paths
+                    .iter()
+                    .take(MAX_AUTOMATIC_EVIDENCE_FILES)
+                    .fold(Vec::new(), |mut instructions, path| {
+                        let content = snapshot.effective_instructions(path, 4 * 1024);
+                        if !content.is_empty()
+                            && !instructions.iter().any(|(_, existing)| existing == &content)
+                        {
+                            instructions.push((path.clone(), content));
+                        }
+                        instructions
+                    });
+                (snapshot.compact_without_instructions(MAX_REPO_MAP_CONTEXT_BYTES), instructions)
+            })
             .unwrap_or_default();
-        let symbol_paths = relevant_symbol_paths(&self.snapshot);
         let symbol_matches = self
             .repo_map
             .as_ref()
@@ -458,6 +521,7 @@ impl ContextEngine {
                 + self.snapshot.modified.len()
                 + self.snapshot.tool_summaries.len()
                 + self.snapshot.excerpts.len()
+                + scoped_instruction_storage.len()
                 + 2,
         );
         let mut recency = 0;
@@ -602,6 +666,32 @@ impl ContextEngine {
             });
             recency += 1;
         }
+        for (path, content) in &scoped_instruction_storage {
+            let fingerprint = candidate_fingerprint(
+                task,
+                ContextKind::ScopedInstructions,
+                Some(path),
+                content,
+                &[],
+                false,
+                false,
+            );
+            candidates.push(ContextCandidate {
+                kind: ContextKind::ScopedInstructions,
+                path: Some(path),
+                content,
+                start_line: 0,
+                end_line: 0,
+                recency,
+                modified: false,
+                stale: false,
+                phase,
+                delta: !delta_only
+                    || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
+                fingerprint,
+            });
+            recency += 1;
+        }
         if let Some(git) = &self.snapshot.git {
             let fingerprint = candidate_fingerprint(
                 task,
@@ -689,6 +779,7 @@ impl ContextEngine {
                 ContextKind::Excerpt => "excerpt",
                 ContextKind::InspectedFile => "inspected",
                 ContextKind::ToolSummary => "tool",
+                ContextKind::ScopedInstructions => "instructions",
                 ContextKind::RepositoryMetadata => "repository",
                 ContextKind::GitMetadata => "git",
             });
@@ -1030,6 +1121,7 @@ impl ContextEngine {
         for diagnostic in &diagnostics {
             self.record_relevant_path(diagnostic.path.as_str());
         }
+        self.promote_diagnostic_evidence(&diagnostics);
         self.snapshot.workflow.record_failure(WorkflowFailure::new_at_revision(
             key,
             name,
@@ -1039,6 +1131,58 @@ impl ContextEngine {
             self.snapshot.workflow.workspace_revision,
             diagnostics,
         ));
+    }
+
+    fn promote_diagnostic_evidence(&mut self, diagnostics: &[WorkflowDiagnostic]) {
+        if self.snapshot.workspace_root.is_empty() {
+            return;
+        }
+        let root = self.snapshot.workspace_root.clone();
+        let mut seen = Vec::new();
+        for diagnostic in diagnostics.iter().take(MAX_AUTOMATIC_EVIDENCE_FILES) {
+            let path = diagnostic.path.as_str();
+            if !path_is_workspace_relative(path) || seen.iter().any(|existing| existing == path) {
+                continue;
+            }
+            seen.push(path.to_owned());
+            let line = usize::try_from(diagnostic.line).unwrap_or(usize::MAX).max(1);
+            let focus = LineRange {
+                start: line.saturating_sub(AUTOMATIC_DIAGNOSTIC_LINES_BEFORE),
+                end: line.saturating_add(AUTOMATIC_DIAGNOSTIC_LINES_AFTER),
+            };
+            if let Some(excerpt) = read_auto_excerpt(Path::new(&root), path, Some(focus)) {
+                self.store_automatic_excerpt(excerpt);
+            }
+        }
+    }
+
+    fn promote_mutation_evidence(&mut self, paths: &[String]) {
+        if self.snapshot.workspace_root.is_empty() {
+            return;
+        }
+        let root = self.snapshot.workspace_root.clone();
+        let mut seen = Vec::new();
+        for path in paths.iter().take(MAX_AUTOMATIC_EVIDENCE_FILES) {
+            if !path_is_workspace_relative(path) || seen.iter().any(|existing| existing == path) {
+                continue;
+            }
+            seen.push(path.clone());
+            if let Some(excerpt) = read_auto_excerpt(Path::new(&root), path, None) {
+                self.store_automatic_excerpt(excerpt);
+            }
+        }
+    }
+
+    fn store_automatic_excerpt(&mut self, excerpt: FileExcerpt) {
+        let path = excerpt.path.clone();
+        let hash = excerpt.content_hash.clone();
+        let range = Some(LineRange { start: excerpt.start_line, end: excerpt.end_line });
+        self.upsert_inspected(&path, hash, range, ObservedFileState::Present);
+        self.record_relevant_path(&path);
+        self.push_excerpt(excerpt);
+        self.snapshot
+            .workflow
+            .record_inspection_with_provenance(aether_core::EvidenceProvenance::ToolOutput);
     }
 
     fn is_focused_verification(&self, name: &str, input: &Value) -> bool {
@@ -1083,6 +1227,7 @@ impl ContextEngine {
                     end_line: range.end,
                     text: BoundedText::new(text, MAX_EXCERPT_BYTES),
                     content_hash: hash,
+                    truncated: file.get("truncated").and_then(Value::as_bool).unwrap_or(false),
                 });
             }
         }
@@ -1532,6 +1677,64 @@ fn live_file_hash(root: &Path, relative: &str) -> Option<String> {
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// Read only a small, canonicalized source window for runtime recovery context. This observation
+/// never substitutes for the tool's execution permit or its final hash/containment revalidation.
+fn read_auto_excerpt(root: &Path, relative: &str, focus: Option<LineRange>) -> Option<FileExcerpt> {
+    let relative_path = WorkspacePath::new(relative).ok()?;
+    let canonical_root = root.canonicalize().ok()?;
+    let candidate = root.join(relative_path.as_path());
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let canonical = candidate.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_root) {
+        return None;
+    }
+    let file = fs::File::open(canonical).ok()?;
+    let mut bytes = Vec::with_capacity(8192);
+    file.take((MAX_AUTOMATIC_SOURCE_BYTES + 1) as u64).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_AUTOMATIC_SOURCE_BYTES {
+        return None;
+    }
+    if bytes.contains(&0) {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let (start, requested_end) = focus.map_or((1, MAX_AUTOMATIC_SOURCE_LINES), |range| {
+        (
+            range.start.max(1).saturating_sub(AUTOMATIC_DIAGNOSTIC_LINES_BEFORE).max(1),
+            range.end.saturating_add(AUTOMATIC_DIAGNOSTIC_LINES_AFTER),
+        )
+    });
+    if start > lines.len() {
+        return None;
+    }
+    let end =
+        requested_end.min(lines.len()).min(start.saturating_add(MAX_AUTOMATIC_SOURCE_LINES - 1));
+    let mut excerpt_text = String::new();
+    for line in &lines[(start - 1)..end] {
+        if !excerpt_text.is_empty() {
+            excerpt_text.push('\n');
+        }
+        excerpt_text.push_str(line);
+    }
+    let bounded_text = BoundedText::new(excerpt_text, MAX_EXCERPT_BYTES);
+    let selected_end = start.saturating_add(lines[(start - 1)..end].len()).saturating_sub(1);
+    Some(FileExcerpt {
+        path: relative_path.as_path().to_string_lossy().into_owned(),
+        start_line: start,
+        end_line: selected_end,
+        truncated: bounded_text.is_truncated() || selected_end < lines.len(),
+        text: bounded_text,
+        content_hash: Some(blake3::hash(&bytes).to_hex().to_string()),
+    })
+}
+
 /// Capture a compact git status snapshot without exposing a new model-visible tool.
 pub fn capture_git_snapshot(workspace_root: &Path) -> GitSnapshot {
     let status = std::process::Command::new("git")
@@ -1923,5 +2126,128 @@ mod tests {
             available: true,
         });
         assert_eq!(engine.snapshot().user_modified, ["src/lib.rs", "src/new.rs", "src/renamed.rs"]);
+    }
+
+    #[test]
+    fn failed_diagnostic_promotes_bounded_current_source_context() {
+        let root = std::env::temp_dir().join(format!(
+            "aether-context-diagnostic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("src.rs");
+        std::fs::write(&path, (1..=32).map(|line| format!("line {line}\n")).collect::<String>())
+            .unwrap();
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        let failure = ToolResult::failure(
+            ToolCallId::new("diagnostic-failure").unwrap(),
+            "verification_failed",
+            "error[E0308]: mismatch --> src.rs:12:5 in `parse_value`",
+            true,
+            4096,
+        );
+        engine.observe_tool("shell", &Value::Null, &failure);
+        let excerpt = engine
+            .snapshot()
+            .excerpts
+            .iter()
+            .find(|excerpt| excerpt.path == "src.rs")
+            .expect("diagnostic source excerpt");
+        assert!(excerpt.start_line <= 12 && excerpt.end_line >= 12);
+        assert!(excerpt.text.as_str().contains("line 12"));
+        assert!(engine.snapshot().workflow.relevant_files.iter().any(|path| path == "src.rs"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_mutation_promotes_reusable_evidence_and_stale_reuse_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "aether-context-mutation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("src.rs");
+        std::fs::write(&path, "fn current() {}\n").unwrap();
+        let hash = blake3::hash(b"fn current() {}\n").to_hex().to_string();
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.observe_tool(
+            "write",
+            &serde_json::json!({"path": "src.rs"}),
+            &success(serde_json::json!({"path": "src.rs", "hash": hash})),
+        );
+        assert!(engine.snapshot().excerpts.iter().any(|excerpt| excerpt.path == "src.rs"));
+        let policy = crate::AutonomousCodingPolicy::new();
+        let read = policy.preflight(
+            engine.snapshot(),
+            ToolCallId::new("reused-read").unwrap(),
+            "read",
+            &serde_json::json!({"files": [{"path": "src.rs"}]}),
+        );
+        assert!(read.is_some(), "complete current source should be reusable");
+
+        std::fs::write(&path, "fn changed() {}\n").unwrap();
+        assert!(
+            policy
+                .preflight(
+                    engine.snapshot(),
+                    ToolCallId::new("changed-read").unwrap(),
+                    "read",
+                    &serde_json::json!({"files": [{"path": "src.rs"}]})
+                )
+                .is_none()
+        );
+        engine.refresh_against_workspace(&root);
+        assert!(
+            policy
+                .preflight(
+                    engine.snapshot(),
+                    ToolCallId::new("stale-read").unwrap(),
+                    "read",
+                    &serde_json::json!({"files": [{"path": "src.rs"}]})
+                )
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn render_includes_effective_instructions_only_for_active_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "aether-context-instructions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root instruction").unwrap();
+        std::fs::write(root.join("src/AGENTS.md"), "src instruction").unwrap();
+        std::fs::write(root.join("other/AGENTS.md"), "other instruction").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&root)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&root)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.set_task("update target");
+        engine.snapshot_mut().workflow.record_relevant_file("src/lib.rs");
+        let rendered = engine.render(false);
+        assert!(rendered.contains("root instruction"));
+        assert!(rendered.contains("src instruction"));
+        assert!(!rendered.contains("other instruction"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

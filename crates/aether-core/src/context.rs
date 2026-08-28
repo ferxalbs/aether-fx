@@ -98,6 +98,9 @@ pub struct FileExcerpt {
     pub text: BoundedText,
     /// File hash observed with this excerpt, when known.
     pub content_hash: Option<String>,
+    /// Whether the excerpt omits source lines or bytes from the requested observation.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Deterministic local compaction of a tool result.
@@ -905,6 +908,7 @@ mod tests {
             end_line: 2,
             text: BoundedText::new("fn secret() {}", MAX_EXCERPT_BYTES),
             content_hash: Some("abc".to_owned()),
+            truncated: false,
         });
         snapshot.tool_summaries.push(CompactToolSummary {
             tool: "shell".to_owned(),

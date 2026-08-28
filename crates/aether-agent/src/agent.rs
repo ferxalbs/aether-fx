@@ -382,6 +382,7 @@ where
                 result => result?,
             };
             let mut tool_calls = Vec::new();
+            let mut step_text = String::new();
             loop {
                 let provider_started = metrics.as_ref().map(|_| Instant::now());
                 let event = tokio::select! {
@@ -397,6 +398,7 @@ where
                 let event = event?;
                 match event {
                     ModelEvent::TextDelta { text } => {
+                        append_bounded(&mut step_text, &text, 8 * 1024);
                         append_bounded(&mut accumulated, &text, DEFAULT_MAX_OUTPUT_BYTES);
                         send_event(
                             &events,
@@ -448,6 +450,12 @@ where
                         self.with_context(|engine| engine.set_continuation(continuation.clone()));
                     }
                 }
+            }
+
+            if let Some(work_update) = extract_work_update(&step_text) {
+                self.with_context(|engine| {
+                    let _ = engine.apply_model_work_update(&work_update);
+                });
             }
 
             let prepared_calls = tool_calls
@@ -568,7 +576,8 @@ where
                 )
                 .await?
             };
-            let mut outputs = Vec::with_capacity(completed.len());
+            let mut outputs = Vec::with_capacity(completed.len().saturating_add(1));
+            let mut refresh_context = false;
             for completed in completed {
                 let action = completed.action;
                 let result = completed.result;
@@ -587,6 +596,9 @@ where
                 let feedback = self.with_context(|engine| {
                     policy.observe_prepared(engine, &action, &result, completed.executed)
                 });
+                refresh_context |= !result.ok
+                    || verification_failed
+                    || action.classification == aether_core::ActionClassification::Mutation;
                 if let Some(metrics) = &mut metrics {
                     if completed.executed {
                         metrics.value.executed_tool_calls =
@@ -665,6 +677,16 @@ where
                 }));
                 if let Some(feedback) = feedback {
                     outputs.push(json!({"type":"message","role":"developer","content":feedback}));
+                }
+            }
+            if refresh_context {
+                let context_update = self.with_context(|engine| engine.render_evidence_delta());
+                if !context_update.trim().is_empty() {
+                    outputs.push(json!({
+                        "type": "message",
+                        "role": "developer",
+                        "content": format!("bounded evidence update:\n{context_update}"),
+                    }));
                 }
             }
             input = serde_json::Value::Array(outputs);
@@ -1068,6 +1090,20 @@ fn append_bounded(target: &mut String, value: &str, max_bytes: usize) {
     target.push_str(bounded.as_str());
 }
 
+/// Extract the optional bounded work outline from assistant text. The marker is an intent
+/// channel only; `WorkState` validates it and never accepts model-declared completion.
+fn extract_work_update(text: &str) -> Option<serde_json::Value> {
+    const OPEN: &str = "<aether-work>";
+    const CLOSE: &str = "</aether-work>";
+    let start = text.find(OPEN)?.saturating_add(OPEN.len());
+    let end = text[start..].find(CLOSE)?.saturating_add(start);
+    if end <= start || end.saturating_sub(start) > 8 * 1024 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text[start..end].trim()).ok()?;
+    value.is_object().then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -1156,6 +1192,16 @@ mod tests {
                 + breakdown.protocol_envelope_bytes,
             input_bytes
         );
+    }
+
+    #[test]
+    fn bounded_work_marker_parses_intent_but_not_completion() {
+        let value = extract_work_update(
+            "<aether-work>{\"subgoals\":[{\"id\":\"edit\",\"label\":\"edit source\",\"paths\":[\"src/lib.rs\"],\"status\":\"complete\"}]}</aether-work>",
+        )
+        .expect("work marker");
+        assert_eq!(value["subgoals"][0]["id"], "edit");
+        assert_eq!(value["subgoals"][0]["status"], "complete");
     }
 
     #[test]

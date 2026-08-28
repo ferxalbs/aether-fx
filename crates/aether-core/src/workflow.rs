@@ -574,6 +574,7 @@ impl WorkflowState {
                 .iter()
                 .filter(|step| step.required && step.revision == self.workspace_revision)
                 .all(|step| step.status == VerificationStatus::Passed)
+            && self.work.criteria_satisfied()
             && !self.work.blocks_completion()
             && (!verification_required || self.verification == WorkflowVerification::Passed);
         if ready {

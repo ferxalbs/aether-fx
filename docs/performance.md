@@ -85,6 +85,23 @@ host. CPU time, RSS, and allocation counters are zero when no portable in-proces
 available; `evals/compare.py` records external wall/RSS measurements for fresh processes. The
 suite gates correctness, step count, executed calls, and context bytes; timing is diagnostic.
 
+Evidence-loop hardening verification on 2026-08-28 used the same release deterministic runner after
+adding bounded diagnostic/mutation source promotion, live-hash-checked read reuse, scoped
+instruction selection, and runtime-owned work outlines. The regression suite remained 9/9 in both
+runs. Optimized execution used 49 model requests versus 55 baseline, 40 requested tool calls
+versus 46, and 39 executed calls versus 45; six observations were reused and 10 verification
+attempts produced one expected failed-then-recovered verification. Context input was 38,860 bytes
+versus 48,848 baseline (-20.45%), and total model-visible bytes were 296,061 versus 337,543
+(-12.29%). The optimized runner used 13 process spawns, completed in 16,191 ms of agent wall
+time, and retained 0 unresolved work items. A direct `/usr/bin/time -l` probe of the release eval
+process measured 91,009,024 bytes maximum RSS; the capability process measured 89,989,120 bytes.
+These are single-host diagnostics, not cross-machine guarantees.
+
+The release `aether` binary measured 6,012,656 bytes after the hardening work, versus 5,963,440
+bytes at the starting tree (+49,216 bytes, +0.83%). A direct `--version` probe measured 7,364,608
+bytes maximum RSS. The binary delta is bounded but not a claim that all platforms produce the same
+size.
+
 The full Criterion suite also completed on this host during the same verification pass. Selected
 medians were 105.45 µs for tool dispatch, 59.127 µs for blocking dispatch, 71.496 µs for a
 small-file read, 1.6755 ms for a large-file read, 783.78 µs for content search, 1.9264 ms for

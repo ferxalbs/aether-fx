@@ -1174,6 +1174,7 @@ mod tests {
             end_line: 81,
             text: BoundedText::new("fn parse_port() {}", 4096),
             content_hash: Some("hash".to_owned()),
+            truncated: false,
         });
         let plan = RepositoryActionPlanner::default().plan(RepositoryPlanRequest::new(
             RepositoryRequestKind::Search,
