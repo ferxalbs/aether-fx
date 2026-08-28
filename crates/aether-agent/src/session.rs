@@ -640,6 +640,22 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn opening_new_session_without_existing_file_succeeds() {
+        let (root, path, session) = temp_session("new-empty");
+        assert!(!path.exists());
+        let mut store = SessionStore::open(&root, session).unwrap();
+        assert!(!path.exists());
+        store
+            .append(
+                None,
+                SessionRecord::Started { workspace_root: root.display().to_string(), model: None },
+            )
+            .unwrap();
+        assert!(path.is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_id_hashes_non_utf8_native_path_bytes() {

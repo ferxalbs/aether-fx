@@ -1798,12 +1798,14 @@ mod tests {
         }
 
         fn track(&self, paths: &[&str]) {
-            let mut command = Command::new("git");
-            command.current_dir(&self.path).arg("add").arg("--");
-            for path in paths {
-                command.arg(path);
+            for chunk in paths.chunks(128) {
+                let mut command = Command::new("git");
+                command.current_dir(&self.path).arg("add").arg("--");
+                for path in chunk {
+                    command.arg(path);
+                }
+                assert!(command.status().expect("git add").success());
             }
-            assert!(command.status().expect("git add").success());
         }
     }
 

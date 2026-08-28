@@ -860,7 +860,13 @@ fn open_contained_jsonl(layout: &SessionLayout, create: bool) -> Result<File, Se
     if create {
         options.create(true);
     }
-    let file = options.open(&layout.path).map_err(|error| io_err("open session file", error))?;
+    let file = options.open(&layout.path).map_err(|error| {
+        if !create && error.kind() == io::ErrorKind::NotFound {
+            SessionStoreError::NotFound
+        } else {
+            io_err("open session file", error)
+        }
+    })?;
     let metadata =
         fs::symlink_metadata(&layout.path).map_err(|error| io_err("stat session file", error))?;
     if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
