@@ -237,7 +237,12 @@ fn classify_bounded(program: &str, args: &[String]) -> CommandClass {
 
 fn classify_cargo(args: &[String]) -> CommandClass {
     match cargo_subcommand(args) {
-        Some("metadata" | "locate-project" | "tree") => CommandClass::Inspection,
+        Some("locate-project") => CommandClass::Inspection,
+        Some("metadata" | "tree")
+            if args.iter().any(|arg| matches!(arg.as_str(), "--offline" | "--frozen")) =>
+        {
+            CommandClass::Inspection
+        }
         Some("check" | "test" | "clippy" | "bench") => CommandClass::Verification,
         Some("build") => CommandClass::Build,
         Some("fmt") if args.iter().any(|arg| arg == "--check") => CommandClass::Verification,
@@ -1015,6 +1020,24 @@ mod tests {
             classify_command("git", &args(&["commit", "-am", "change"])),
             CommandClass::GitMutation
         );
+    }
+
+    #[test]
+    fn cargo_metadata_and_tree_require_network_disabled_flags_for_inspection() {
+        for subcommand in ["metadata", "tree"] {
+            for flag in ["--offline", "--frozen"] {
+                let effects = analyze_command("cargo", &args(&[subcommand, flag]), "fixture");
+                assert_eq!(effects.class, CommandClass::Inspection);
+                assert!(!effects.uncertain);
+                assert!(!effects.mutates_workspace());
+            }
+
+            let effects = analyze_command("cargo", &args(&[subcommand]), "fixture");
+            assert_eq!(effects.class, CommandClass::Unknown);
+            assert!(effects.uncertain);
+        }
+
+        assert_eq!(classify_command("cargo", &args(&["locate-project"])), CommandClass::Inspection);
     }
 
     #[test]
