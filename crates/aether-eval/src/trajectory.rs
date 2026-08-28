@@ -274,8 +274,8 @@ mod tests {
     #[test]
     fn read_only_shell_repeats_are_bounded_but_mutating_commands_are_not_reused() {
         let script = [
-            Action::Shell { program: "rg", args: &["needle", "src"] },
-            Action::Shell { program: "rg", args: &["needle", "src"] },
+            Action::Shell { program: "cargo", args: &["metadata", "--offline"] },
+            Action::Shell { program: "cargo", args: &["metadata", "--offline"] },
             Action::Shell { program: "cargo", args: &["fmt"] },
             Action::Shell { program: "cargo", args: &["fmt"] },
         ];

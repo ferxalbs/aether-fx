@@ -38,8 +38,18 @@ jobs:
           test -f install.ps1
           sh -n install.sh
 
-          if git ls-files | rg '(^|/)(target|dist|build|generated)(/|$)'; then
-            echo 'generated build material is tracked' >&2
+          tracked_generated=$(
+            git ls-files -z |
+              while IFS= read -r -d '' path; do
+                case "$path" in
+                  target/*|*/target/*|dist/*|*/dist/*|build/*|*/build/*|generated/*|*/generated/*)
+                    printf '%s\n' "$path"
+                    ;;
+                esac
+              done
+          )
+          if test -n "$tracked_generated"; then
+            printf 'generated build material is tracked:\n%s\n' "$tracked_generated" >&2
             exit 1
           fi
           if git grep -n -I -E '/Users/|/home/|[A-Za-z]:[\\/]Users[\\/]' -- \

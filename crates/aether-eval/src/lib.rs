@@ -1037,9 +1037,10 @@ const TARGETED_EXPLORATION_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
-const SHELL_RG_ARGS: &[&str] = &["last_index", "src"];
-const SHELL_FIND_ARGS: &[&str] = &["src", "-name", "*.rs"];
-const SHELL_CAT_ARGS: &[&str] = &["src/lib.rs"];
+const SHELL_CARGO_METADATA_ARGS: &[&str] =
+    &["metadata", "--format-version", "1", "--no-deps", "--offline"];
+const SHELL_CARGO_LOCATE_PROJECT_ARGS: &[&str] = &["locate-project", "--message-format", "plain"];
+const SHELL_CARGO_TREE_ARGS: &[&str] = &["tree", "--offline"];
 const SHELL_HEAVY: Task = Task {
     id: "shell-heavy-command-reuse",
     prompt: "Repair last_index after an inefficient shell-heavy discovery loop.",
@@ -1052,12 +1053,12 @@ const SHELL_HEAVY: Task = Task {
     max_verification_attempts: 1,
 };
 const SHELL_HEAVY_SCRIPT: &[Action] = &[
-    Action::Shell { program: "rg", args: SHELL_RG_ARGS },
-    Action::Shell { program: "rg", args: SHELL_RG_ARGS },
-    Action::Shell { program: "find", args: SHELL_FIND_ARGS },
-    Action::Shell { program: "find", args: SHELL_FIND_ARGS },
-    Action::Shell { program: "cat", args: SHELL_CAT_ARGS },
-    Action::Shell { program: "cat", args: SHELL_CAT_ARGS },
+    Action::Shell { program: "cargo", args: SHELL_CARGO_METADATA_ARGS },
+    Action::Shell { program: "cargo", args: SHELL_CARGO_METADATA_ARGS },
+    Action::Shell { program: "cargo", args: SHELL_CARGO_LOCATE_PROJECT_ARGS },
+    Action::Shell { program: "cargo", args: SHELL_CARGO_LOCATE_PROJECT_ARGS },
+    Action::Shell { program: "cargo", args: SHELL_CARGO_TREE_ARGS },
+    Action::Shell { program: "cargo", args: SHELL_CARGO_TREE_ARGS },
     Action::Read { path: "src/lib.rs" },
     Action::Write { path: "src/lib.rs", contents: TARGETED_FIXED },
     Action::Verify,

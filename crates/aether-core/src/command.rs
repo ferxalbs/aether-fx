@@ -237,6 +237,7 @@ fn classify_bounded(program: &str, args: &[String]) -> CommandClass {
 
 fn classify_cargo(args: &[String]) -> CommandClass {
     match cargo_subcommand(args) {
+        Some("metadata" | "locate-project" | "tree") => CommandClass::Inspection,
         Some("check" | "test" | "clippy" | "bench") => CommandClass::Verification,
         Some("build") => CommandClass::Build,
         Some("fmt") if args.iter().any(|arg| arg == "--check") => CommandClass::Verification,
@@ -983,6 +984,18 @@ mod tests {
         );
         assert_eq!(classify_command("cargo", &args(&["build"])), CommandClass::Build);
         assert_eq!(classify_command("cargo", &args(&["fmt"])), CommandClass::Formatting);
+        assert_eq!(
+            classify_command("cargo", &args(&["metadata", "--offline"])),
+            CommandClass::Inspection
+        );
+        assert_eq!(
+            classify_command("cargo", &args(&["locate-project", "--message-format", "plain"])),
+            CommandClass::Inspection
+        );
+        assert_eq!(
+            classify_command("cargo", &args(&["tree", "--offline"])),
+            CommandClass::Inspection
+        );
         assert_eq!(classify_command("cargo", &args(&["fix"])), CommandClass::Mutation);
         assert_eq!(
             classify_command("cargo", &args(&["add", "serde"])),
