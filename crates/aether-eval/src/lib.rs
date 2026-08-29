@@ -86,6 +86,7 @@ pub struct ExecutionMetrics {
     pub policy_feedback_bytes: u64,
     pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
+    pub automatic_verification_attempts: u32,
     pub verification_failures: u32,
     pub recovery_attempts: u32,
     pub recovery_successes: u32,
@@ -160,6 +161,7 @@ pub struct TaskResult {
     pub policy_feedback_bytes: u64,
     pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
+    pub automatic_verification_attempts: u32,
     pub verification_failures: u32,
     pub recovery_attempts: u32,
     pub recovery_successes: u32,
@@ -210,6 +212,7 @@ pub struct CapabilityTaskResult {
     pub bytes_shown_to_model: u64,
     pub wall_time_ms: u64,
     pub verification_attempts: u32,
+    pub automatic_verification_attempts: u32,
     pub verification_failures: u32,
     pub reused_observations: u32,
     pub automatic_evidence_reactions: u32,
@@ -247,6 +250,7 @@ pub struct CapabilityAggregate {
     pub bytes_shown_to_model: u64,
     pub wall_time_ms: u64,
     pub verification_attempts: u32,
+    pub automatic_verification_attempts: u32,
     pub verification_failures: u32,
     pub reused_observations: u32,
     pub automatic_evidence_reactions: u32,
@@ -258,6 +262,34 @@ pub struct CapabilityAggregate {
     pub unresolved_work_at_finish: u32,
 }
 
+/// One same-trace comparison for runtime-owned verification and zero-waste control.
+#[derive(Debug, Serialize)]
+pub struct ControlLoopCaseResult {
+    pub case_id: String,
+    pub baseline_success: bool,
+    pub optimized_success: bool,
+    pub correctness_preserved: bool,
+    pub automatic_verification_attempts: u32,
+    pub prevented_redundant_calls: u32,
+    pub baseline_model_requests: u32,
+    pub optimized_model_requests: u32,
+    pub baseline_requested_tool_calls: u32,
+    pub optimized_requested_tool_calls: u32,
+    pub baseline_executed_tool_calls: u32,
+    pub optimized_executed_tool_calls: u32,
+    pub verification_scope: String,
+    pub completion_rejections: u32,
+    pub failure: Option<String>,
+}
+
+/// Deterministic end-to-end checks for the runtime/model control seam.
+#[derive(Debug, Serialize)]
+pub struct ControlLoopEvaluation {
+    pub total: usize,
+    pub passed: usize,
+    pub cases: Vec<ControlLoopCaseResult>,
+}
+
 /// Separate hard-task suite. Its threshold requires a real gain over the interrupted baseline;
 /// it is never folded into the 9/9 deterministic regression suite.
 #[derive(Debug, Serialize)]
@@ -267,6 +299,7 @@ pub struct CapabilitySuiteResult {
     pub success: bool,
     pub aggregate: CapabilityAggregate,
     pub tasks: Vec<CapabilityTaskResult>,
+    pub control_loop: ControlLoopEvaluation,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,6 +326,7 @@ pub struct AggregateMetrics {
     pub policy_feedback_bytes: u64,
     pub protocol_envelope_bytes: u64,
     pub verification_attempts: u32,
+    pub automatic_verification_attempts: u32,
     pub verification_failures: u32,
     pub recovery_attempts: u32,
     pub recovery_successes: u32,
@@ -480,6 +514,7 @@ pub fn run_capability_suite(output: Option<&Path>) -> Result<CapabilitySuiteResu
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let control_loop = real::run_control_loop_evaluation()?;
     let succeeded = tasks.iter().filter(|task| task.resumed_success).count();
     let baseline_succeeded = tasks.iter().filter(|task| task.baseline_success).count();
     let checkpoint_resume_successes =
@@ -512,6 +547,10 @@ pub fn run_capability_suite(output: Option<&Path>) -> Result<CapabilitySuiteResu
         bytes_shown_to_model: tasks.iter().map(|task| task.bytes_shown_to_model).sum(),
         wall_time_ms: tasks.iter().map(|task| task.wall_time_ms).sum(),
         verification_attempts: tasks.iter().map(|task| task.verification_attempts).sum(),
+        automatic_verification_attempts: tasks
+            .iter()
+            .map(|task| task.automatic_verification_attempts)
+            .sum(),
         verification_failures: tasks.iter().map(|task| task.verification_failures).sum(),
         reused_observations: tasks.iter().map(|task| task.reused_observations).sum(),
         automatic_evidence_reactions: tasks
@@ -534,13 +573,15 @@ pub fn run_capability_suite(output: Option<&Path>) -> Result<CapabilitySuiteResu
     let success = aggregate.succeeded > aggregate.baseline_succeeded
         && aggregate.checkpoint_resume_successes == aggregate.tasks
         && aggregate.user_change_corruptions == 0
-        && aggregate.false_completion_count == 0;
+        && aggregate.false_completion_count == 0
+        && control_loop.passed == control_loop.total;
     let suite = CapabilitySuiteResult {
         schema_version: 1,
         backend: "deterministic-checkpoint-replay".to_owned(),
         success,
         aggregate,
         tasks,
+        control_loop,
     };
     if let Some(path) = output {
         let json = serde_json::to_vec_pretty(&suite).map_err(|error| error.to_string())?;
@@ -559,7 +600,7 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
     for task in &suite.tasks {
         let mark = if task.resumed_success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} baseline={} checkpoint={} work={} recovery={} user_change={} verify={}/{} stale={} auto={} hydrate={} refresh={} escalate={} reject={} unresolved={}\n",
+            "{mark:4} {:28} baseline={} checkpoint={} work={} recovery={} user_change={} verify={}/{} auto_verify={} stale={} auto={} hydrate={} refresh={} escalate={} reject={} unresolved={}\n",
             task.task_id,
             task.baseline_success,
             task.checkpoint_captured,
@@ -568,6 +609,7 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
             task.user_change_tested && !task.user_change_corruption,
             task.verification_attempts,
             task.verification_failures,
+            task.automatic_verification_attempts,
             task.stale_evidence_violations,
             task.automatic_evidence_reactions,
             task.diagnostic_hydration_events,
@@ -578,7 +620,7 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
         ));
     }
     output.push_str(&format!(
-        "capability: {}/{} ({:.0}%) success_at_1={} baseline={}/{} ({:.0}%) newly_solved={} checkpoint_resume={} recovery={} user_change={}/{} corruptions={} false_completion={} stale={} auto={} hydrate={} refresh={} escalate={} reject={} unresolved={} requests={} tools={} context={}B shown={}B wall={}ms\n",
+        "capability: {}/{} ({:.0}%) success_at_1={} baseline={}/{} ({:.0}%) newly_solved={} checkpoint_resume={} recovery={} user_change={}/{} corruptions={} false_completion={} stale={} auto_verify={} auto={} hydrate={} refresh={} escalate={} reject={} unresolved={} requests={} tools={} context={}B shown={}B wall={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
@@ -594,6 +636,7 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
         suite.aggregate.user_change_corruptions,
         suite.aggregate.false_completion_count,
         suite.aggregate.stale_evidence_violations,
+        suite.aggregate.automatic_verification_attempts,
         suite.aggregate.automatic_evidence_reactions,
         suite.aggregate.diagnostic_hydration_events,
         suite.aggregate.mutation_refresh_events,
@@ -605,6 +648,22 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
         suite.aggregate.context_bytes,
         suite.aggregate.bytes_shown_to_model,
         suite.aggregate.wall_time_ms,
+    ));
+    let automatic = suite
+        .control_loop
+        .cases
+        .iter()
+        .map(|case| case.automatic_verification_attempts)
+        .sum::<u32>();
+    let reduced = suite
+        .control_loop
+        .cases
+        .iter()
+        .filter(|case| case.baseline_executed_tool_calls > case.optimized_executed_tool_calls)
+        .count();
+    output.push_str(&format!(
+        "control_loop: {}/{} same_trace_reduced={} automatic_verifications={}\n",
+        suite.control_loop.passed, suite.control_loop.total, reduced, automatic,
     ));
     output
 }
@@ -630,13 +689,14 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
     for result in &suite.tasks {
         let mark = if result.success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} quality={} read={}B reuse={} auto={} hydrate={} refresh={} stale={} escalate={} reject={} patterns={}\n",
+            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} auto_verify={} scope={} quality={} read={}B reuse={} auto={} hydrate={} refresh={} stale={} escalate={} reject={} patterns={}\n",
             result.task_id,
             result.model_steps,
             result.executed_tool_calls,
             result.tool_calls,
             result.before.executed_tool_calls,
             result.verification_attempts,
+            result.after.automatic_verification_attempts,
             result.verification_scope,
             result.verification_quality,
             result.bytes_read,
@@ -651,7 +711,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         ));
     }
     output.push_str(&format!(
-        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) requests={}/{} steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} reuse={} auto={} hydrate={} refresh={} stale={} escalate={} reject={} context={}B/{}B shown={}B/{}B schema={}B result={}B policy={}B protocol={}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B spawns={} wall={}ms local={}ms overhead={}ms\n",
+        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) requests={}/{} steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} reuse={} verify_auto={} auto={} hydrate={} refresh={} stale={} escalate={} reject={} context={}B/{}B shown={}B/{}B schema={}B result={}B policy={}B protocol={}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B spawns={} wall={}ms local={}ms overhead={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
@@ -668,6 +728,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         suite.aggregate.baseline_executed_tool_calls,
         suite.aggregate.prevented_redundant_calls,
         suite.aggregate.reused_observations,
+        suite.aggregate.automatic_verification_attempts,
         suite.aggregate.automatic_evidence_reactions,
         suite.aggregate.diagnostic_hydration_events,
         suite.aggregate.mutation_refresh_events,
@@ -763,6 +824,10 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .map(|result| result.after.protocol_envelope_bytes)
             .sum(),
         verification_attempts: results.iter().map(|result| result.verification_attempts).sum(),
+        automatic_verification_attempts: results
+            .iter()
+            .map(|result| result.after.automatic_verification_attempts)
+            .sum(),
         verification_failures: results
             .iter()
             .map(|result| result.after.verification_failures)
@@ -1110,6 +1175,28 @@ const INSUFFICIENT_EVIDENCE_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
+const CONTROL_LOOP_OUTCOMES: &[ExpectedOutcome] =
+    &[ExpectedOutcome { path: "notes.txt", contains: "runtime-owned verification" }];
+const CONTROL_LOOP_TASK: Task = Task {
+    id: "runtime-verification-zero-waste",
+    prompt: "Update the repository note and verify the exact workspace diff before finishing.",
+    fixture: "control-loop",
+    expected_outcomes: CONTROL_LOOP_OUTCOMES,
+    verification_command: &["git", "diff", "--check"],
+    focused_verification_command: None,
+    max_steps: 8,
+    max_tool_calls: 7,
+    max_verification_attempts: 2,
+};
+const CONTROL_LOOP_FIXED: &str = "runtime-owned verification\n";
+const CONTROL_LOOP_SCRIPT: &[Action] = &[
+    Action::Read { path: "notes.txt" },
+    Action::Write { path: "notes.txt", contents: CONTROL_LOOP_FIXED },
+    Action::Verify,
+    Action::Verify,
+    Action::Finish,
+];
+
 const TARGETED_EXPLORATION: Task = Task {
     id: "targeted-exploration-reuse",
     prompt: "Fix is_blank after a model repeatedly lists the same source directory.",
@@ -1216,6 +1303,7 @@ mod tests {
                 .expect("premature completion eval runs");
         assert!(!premature_result.success);
         assert_eq!(premature_result.final_test_status, "not_run");
+        assert!(premature_result.completion_rejections > 0);
 
         let mut stale = ContextSnapshot::new("/workspace", None);
         stale.workspace_changed = true;
@@ -1268,6 +1356,7 @@ mod tests {
     #[test]
     fn capability_cases_exercise_runtime_recovery_and_bounded_reuse() {
         let suite = run_capability_suite(None).expect("capability suite runs offline");
+        assert!(suite.success);
         assert_eq!(suite.aggregate.succeeded, suite.aggregate.tasks);
         assert_eq!(suite.aggregate.checkpoint_resume_successes, suite.aggregate.tasks);
         assert!(suite.aggregate.recovery_successes >= 2);
@@ -1276,5 +1365,11 @@ mod tests {
         assert!(suite.aggregate.automatic_evidence_reactions > 0);
         assert!(suite.aggregate.mutation_refresh_events > 0);
         assert_eq!(suite.aggregate.false_completion_count, 0);
+        assert_eq!(suite.control_loop.passed, suite.control_loop.total);
+        assert!(suite.control_loop.cases[0].automatic_verification_attempts > 0);
+        assert!(
+            suite.control_loop.cases[0].baseline_executed_tool_calls
+                > suite.control_loop.cases[0].optimized_executed_tool_calls
+        );
     }
 }

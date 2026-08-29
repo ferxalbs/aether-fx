@@ -174,14 +174,16 @@ impl WorkingSet {
     #[must_use]
     pub fn render(&self) -> String {
         let mut output = String::new();
-        let _ = write!(
-            output,
-            "phase={} rev={} objective={}",
-            self.phase.as_str(),
-            self.revision,
-            bounded(&self.objective),
-        );
-        if let Some(active) = &self.active_subgoal {
+        let _ = write!(output, "phase={}", self.phase.as_str());
+        if self.revision > 0 {
+            let _ = write!(output, " rev={}", self.revision);
+        }
+        if !self.objective.is_empty() {
+            let _ = write!(output, " objective={}", bounded(&self.objective));
+        }
+        if let Some(active) = &self.active_subgoal
+            && active != "task"
+        {
             let _ = write!(output, " active={}", bounded(active));
         }
         if !self.pending_criteria.is_empty() {
@@ -207,18 +209,20 @@ impl WorkingSet {
                 &self.stale_paths.iter().map(|item| bounded(item)).collect::<Vec<_>>().join(","),
             );
         }
-        output.push_str(" items=");
+        // The ordinary structured `task` subgoal and the default evidence role are already
+        // represented by the workflow lines; omit those defaults from this compact path list.
+        output.push_str(" p=");
         for (index, item) in self.items.iter().enumerate() {
             if index > 0 {
                 output.push(';');
             }
-            let _ = write!(
-                output,
-                "{}:{}:{}",
-                bounded(&item.path),
-                item.role.as_str(),
-                if item.fresh { "fresh" } else { "stale" },
-            );
+            output.push_str(&bounded(&item.path));
+            if item.role != WorkingSetRole::Evidence {
+                let _ = write!(output, ":{}", item.role.as_str());
+            }
+            if !item.fresh {
+                output.push_str(":stale");
+            }
         }
         BoundedText::new(output, MAX_WORKING_SET_RENDER_BYTES).into_string()
     }

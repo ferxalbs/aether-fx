@@ -123,6 +123,8 @@ pub struct AgentMetrics {
     pub protocol_envelope_bytes: u64,
     pub bytes_read: u64,
     pub verification_attempts: u64,
+    /// Verification commands executed by the runtime without a model tool-call round trip.
+    pub automatic_verification_attempts: u64,
     /// Verification attempts that failed and therefore require repair.
     pub verification_failures: u64,
     /// Failed observations that the model later recovered from.
@@ -592,110 +594,29 @@ where
             };
             let mut outputs = Vec::with_capacity(completed.len().saturating_add(1));
             let mut refresh_context = false;
+            let mut mutation_executed = false;
             for completed in completed {
-                let action = completed.action;
-                let result = completed.result;
-                let had_failure = self
-                    .with_context(|engine| engine.snapshot().workflow.has_unresolved_failures());
-                let verification_action =
-                    action.classification == aether_core::ActionClassification::Verification;
-                let verification_failed = verification_action
-                    && (!result.ok
-                        || result
-                            .data
-                            .as_ref()
-                            .and_then(|data| data.get("success"))
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(false));
-                let feedback = self.with_context(|engine| {
-                    policy.observe_prepared(engine, &action, &result, completed.executed)
-                });
-                refresh_context |= !result.ok
-                    || verification_failed
-                    || action.classification == aether_core::ActionClassification::Mutation;
-                if let Some(metrics) = &mut metrics {
-                    if completed.executed {
-                        metrics.value.executed_tool_calls =
-                            metrics.value.executed_tool_calls.saturating_add(1);
-                        if action.tool == "shell"
-                            || (action.tool == "process"
-                                && action
-                                    .normalized_input
-                                    .get("operation")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some("start"))
-                        {
-                            metrics.value.process_spawns =
-                                metrics.value.process_spawns.saturating_add(1);
-                        }
-                        if action.classification == aether_core::ActionClassification::Verification
-                        {
-                            metrics.value.verification_attempts =
-                                metrics.value.verification_attempts.saturating_add(1);
-                            if verification_failed {
-                                metrics.value.verification_failures =
-                                    metrics.value.verification_failures.saturating_add(1);
-                            }
-                        }
-                        if had_failure {
-                            metrics.value.recovery_successes =
-                                metrics.value.recovery_successes.saturating_add(1);
-                        }
-                    } else {
-                        if result.error.is_some() {
-                            metrics.value.recovery_attempts =
-                                metrics.value.recovery_attempts.saturating_add(1);
-                        }
-                        if result.error.as_ref().is_some_and(|error| {
-                            matches!(
-                                error.code.as_str(),
-                                "insufficient_evidence"
-                                    | "inspection_required"
-                                    | "concurrent_modification"
-                            )
-                        }) {
-                            metrics.value.stale_evidence_violations =
-                                metrics.value.stale_evidence_violations.saturating_add(1);
-                        }
-                        if !completed.planned {
-                            metrics.value.prevented_calls =
-                                metrics.value.prevented_calls.saturating_add(1);
-                        }
-                        if !completed.executed {
-                            metrics.value.reused_observations =
-                                metrics.value.reused_observations.saturating_add(1);
-                        }
-                    }
-                    if completed.planned {
-                        metrics.value.planner_hits = metrics.value.planner_hits.saturating_add(1);
-                        metrics.value.planner_actions = metrics
-                            .value
-                            .planner_actions
-                            .saturating_add(completed.planner_actions as u64);
-                        metrics.value.planner_bytes_read = metrics
-                            .value
-                            .planner_bytes_read
-                            .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
-                    }
-                    metrics.value.bytes_read = metrics
-                        .value
-                        .bytes_read
-                        .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
-                }
-                outputs.push(json!({
-                    "type": "function_call_output",
-                    "call_id": result.call_id.as_str(),
-                    "output": result.output.as_str(),
-                    "ok": result.ok,
-                    "error": result.error.as_ref().map(|error| json!({
-                        "code": error.code.as_str(),
-                        "message": error.message.as_str(),
-                        "retryable": error.retryable,
-                    })),
-                }));
-                if let Some(feedback) = feedback {
-                    outputs.push(json!({"type":"message","role":"developer","content":feedback}));
-                }
+                mutation_executed |= self.consume_tool_result(
+                    &mut policy,
+                    completed,
+                    &mut metrics,
+                    &mut outputs,
+                    &mut refresh_context,
+                    false,
+                );
+            }
+            if request.optimize && mutation_executed {
+                self.execute_pending_verifications(
+                    &mut policy,
+                    &request.turn_id,
+                    &events,
+                    &cancellation,
+                    broker,
+                    &mut metrics,
+                    &mut outputs,
+                    &mut refresh_context,
+                )
+                .await?;
             }
             if refresh_context {
                 let context_update = self.with_context(|engine| engine.render_evidence_delta());
@@ -709,6 +630,198 @@ where
             }
             input = serde_json::Value::Array(outputs);
         }
+    }
+
+    fn consume_tool_result(
+        &self,
+        policy: &mut AutonomousCodingPolicy,
+        completed: ScheduledToolResult,
+        metrics: &mut Option<MetricsState>,
+        outputs: &mut Vec<serde_json::Value>,
+        refresh_context: &mut bool,
+        automatic_verification: bool,
+    ) -> bool {
+        let action = completed.action;
+        let result = completed.result;
+        let had_failure =
+            self.with_context(|engine| engine.snapshot().workflow.has_unresolved_failures());
+        let verification_action =
+            action.classification == aether_core::ActionClassification::Verification;
+        let verification_failed = verification_action
+            && (!result.ok
+                || result
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("success"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false));
+        let mutation_succeeded = completed.executed
+            && result.ok
+            && action.classification == aether_core::ActionClassification::Mutation;
+        let feedback = self.with_context(|engine| {
+            policy.observe_prepared(engine, &action, &result, completed.executed)
+        });
+        *refresh_context |= !result.ok
+            || verification_failed
+            || action.classification == aether_core::ActionClassification::Mutation;
+        if let Some(metrics) = metrics {
+            if completed.executed {
+                metrics.value.executed_tool_calls =
+                    metrics.value.executed_tool_calls.saturating_add(1);
+                if action.tool == "shell"
+                    || (action.tool == "process"
+                        && action
+                            .normalized_input
+                            .get("operation")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("start"))
+                {
+                    metrics.value.process_spawns = metrics.value.process_spawns.saturating_add(1);
+                }
+                if verification_action {
+                    metrics.value.verification_attempts =
+                        metrics.value.verification_attempts.saturating_add(1);
+                    if automatic_verification {
+                        metrics.value.automatic_verification_attempts =
+                            metrics.value.automatic_verification_attempts.saturating_add(1);
+                    }
+                    if verification_failed {
+                        metrics.value.verification_failures =
+                            metrics.value.verification_failures.saturating_add(1);
+                    }
+                }
+                if had_failure {
+                    metrics.value.recovery_successes =
+                        metrics.value.recovery_successes.saturating_add(1);
+                }
+            } else {
+                if result.error.is_some() {
+                    metrics.value.recovery_attempts =
+                        metrics.value.recovery_attempts.saturating_add(1);
+                }
+                if result.error.as_ref().is_some_and(|error| {
+                    matches!(
+                        error.code.as_str(),
+                        "insufficient_evidence" | "inspection_required" | "concurrent_modification"
+                    )
+                }) {
+                    metrics.value.stale_evidence_violations =
+                        metrics.value.stale_evidence_violations.saturating_add(1);
+                }
+                if !completed.planned {
+                    metrics.value.prevented_calls = metrics.value.prevented_calls.saturating_add(1);
+                }
+                if !completed.executed {
+                    metrics.value.reused_observations =
+                        metrics.value.reused_observations.saturating_add(1);
+                }
+            }
+            if completed.planned {
+                metrics.value.planner_hits = metrics.value.planner_hits.saturating_add(1);
+                metrics.value.planner_actions =
+                    metrics.value.planner_actions.saturating_add(completed.planner_actions as u64);
+                metrics.value.planner_bytes_read = metrics
+                    .value
+                    .planner_bytes_read
+                    .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
+            }
+            metrics.value.bytes_read = metrics
+                .value
+                .bytes_read
+                .saturating_add(sum_named_u64(result.data.as_ref(), "bytes_read"));
+        }
+        outputs.push(json!({
+            "type": "function_call_output",
+            "call_id": result.call_id.as_str(),
+            "output": result.output.as_str(),
+            "ok": result.ok,
+            "error": result.error.as_ref().map(|error| json!({
+                "code": error.code.as_str(),
+                "message": error.message.as_str(),
+                "retryable": error.retryable,
+            })),
+        }));
+        if let Some(feedback) = feedback {
+            outputs.push(json!({"type":"message","role":"developer","content":feedback}));
+        }
+        mutation_succeeded
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_pending_verifications<P: PermissionBroker + ?Sized>(
+        &self,
+        policy: &mut AutonomousCodingPolicy,
+        turn_id: &TurnId,
+        events: &mpsc::Sender<AgentEvent>,
+        cancellation: &CancellationToken,
+        broker: &P,
+        metrics: &mut Option<MetricsState>,
+        outputs: &mut Vec<serde_json::Value>,
+        refresh_context: &mut bool,
+    ) -> Result<(), AgentError> {
+        for index in 0..aether_core::MAX_WORKFLOW_VERIFICATIONS {
+            let Some(command) = self.with_context(|engine| engine.next_pending_verification())
+            else {
+                break;
+            };
+            let call_id =
+                aether_core::ToolCallId::new(format!("auto-verify-{}-{index}", turn_id.as_str()))
+                    .map_err(|error| AgentError::Tool(error.to_string()))?;
+            let action = self.tools.prepare(ToolInvocation {
+                call_id,
+                name: "shell".to_owned(),
+                input: json!({
+                    "program": command.program,
+                    "args": command.args,
+                    "cwd": if command.cwd.is_empty() { ".".to_owned() } else { command.cwd },
+                    "timeout_ms": 120_000
+                }),
+            });
+            if action.classification != aether_core::ActionClassification::Verification {
+                break;
+            }
+            let snapshot = self.current_context();
+            let gate = AgentToolGate { workflow: WorkflowMutationGate { snapshot }, policy };
+            let completed = crate::scheduler::execute_prepared_tool_calls_with_gate(
+                self.tools.as_ref(),
+                vec![action],
+                events,
+                cancellation,
+                broker,
+                &gate,
+            )
+            .await?;
+            if completed.is_empty() {
+                break;
+            }
+            let mut executed = false;
+            let mut failed = false;
+            for completed in completed {
+                executed |= completed.executed;
+                failed |= completed.action.classification
+                    == aether_core::ActionClassification::Verification
+                    && (!completed.result.ok
+                        || completed
+                            .result
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("success"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false));
+                self.consume_tool_result(
+                    policy,
+                    completed,
+                    metrics,
+                    outputs,
+                    refresh_context,
+                    true,
+                );
+            }
+            if !executed || failed {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn prepare_turn(&self, request: &AgentRequest) {
@@ -762,6 +875,11 @@ where
         let refreshed = tokio::task::spawn_blocking(move || {
             let mut engine = ContextEngine::restore(snapshot);
             engine.refresh_against_workspace(&root);
+            // Completion is the last point at which user-owned dirty paths can change. Capture
+            // Git state in the same deterministic refresh so a late external edit cannot evade
+            // the preservation check merely because no model tool was called afterward.
+            let git = capture_git_snapshot(&root);
+            engine.set_git(git);
             engine
         });
         let refreshed = tokio::select! {

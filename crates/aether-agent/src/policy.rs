@@ -174,13 +174,25 @@ impl AutonomousCodingPolicy {
         name: &str,
         input: &Value,
     ) -> Option<ToolResult> {
+        // A read cache is only safe after its source hash has been checked against the live
+        // canonical file. The generic guardrail cache has no workspace handle and therefore must
+        // not be allowed to satisfy reads first after an external edit.
+        if name == "read" {
+            return (self.optimizations_enabled)
+                .then(|| cached_read_result(snapshot, call_id.clone(), input))
+                .flatten()
+                .or_else(|| {
+                    self.guardrails.preflight_failure(
+                        call_id.clone(),
+                        name,
+                        input,
+                        snapshot.workflow.workspace_revision,
+                    )
+                })
+                .or_else(|| self.mutation_preflight(snapshot, call_id, name, input));
+        }
         self.guardrails
             .preflight(call_id.clone(), name, input, snapshot.workflow.workspace_revision)
-            .or_else(|| {
-                (self.optimizations_enabled && name == "read")
-                    .then(|| cached_read_result(snapshot, call_id.clone(), input))
-                    .flatten()
-            })
             .or_else(|| self.mutation_preflight(snapshot, call_id, name, input))
     }
 
@@ -190,24 +202,29 @@ impl AutonomousCodingPolicy {
         snapshot: &ContextSnapshot,
         action: &PreparedAction,
     ) -> Option<ToolResult> {
+        if action.tool == "read" && action.classification == ActionClassification::Read {
+            return (self.optimizations_enabled)
+                .then(|| {
+                    cached_read_result(snapshot, action.call_id.clone(), &action.normalized_input)
+                })
+                .flatten()
+                .or_else(|| {
+                    self.optimizations_enabled
+                        .then(|| {
+                            self.guardrails.preflight_failure_prepared(
+                                action,
+                                snapshot.workflow.workspace_revision,
+                            )
+                        })
+                        .flatten()
+                })
+                .or_else(|| self.mutation_preflight_prepared(snapshot, action));
+        }
         self.optimizations_enabled
             .then(|| {
                 self.guardrails.preflight_prepared(action, snapshot.workflow.workspace_revision)
             })
             .flatten()
-            .or_else(|| {
-                (self.optimizations_enabled
-                    && action.tool == "read"
-                    && action.classification == ActionClassification::Read)
-                    .then(|| {
-                        cached_read_result(
-                            snapshot,
-                            action.call_id.clone(),
-                            &action.normalized_input,
-                        )
-                    })
-                    .flatten()
-            })
             .or_else(|| self.mutation_preflight_prepared(snapshot, action))
     }
 
@@ -1327,6 +1344,50 @@ mod tests {
             )
             .expect("stale target must be blocked");
         assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");
+    }
+
+    #[test]
+    fn prepared_read_cache_rejects_external_edit_before_guardrail_reuse() {
+        let root = std::env::temp_dir().join(format!(
+            "aether-policy-live-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("src.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+        let hash = blake3::hash(b"fn before() {}\n").to_hex().to_string();
+        let input = json!({
+            "files": [{"path": "src.rs", "start_line": 1, "end_line": 1}]
+        });
+        let result = ToolResult::success_json(
+            ToolCallId::new("initial-read").unwrap(),
+            json!({
+                "files": [{
+                    "path": "src.rs",
+                    "content_hash": hash,
+                    "lines": [{"number": 1, "text": "fn before() {}"}]
+                }]
+            }),
+            aether_core::DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.set_task("inspect src.rs");
+        let mut policy = AutonomousCodingPolicy::new();
+        assert!(policy.observe(&mut engine, "read", &input, &result, true).is_some());
+        let action = PreparedAction::fallback(
+            aether_core::ToolInvocation {
+                call_id: ToolCallId::new("cached-read").unwrap(),
+                name: "read".to_owned(),
+                input: input.clone(),
+            },
+            aether_core::PermissionClass::ReadOnly,
+        );
+        assert!(policy.preflight_prepared(engine.snapshot(), &action).is_some());
+
+        std::fs::write(&path, "fn after() {}\n").unwrap();
+        assert!(policy.preflight_prepared(engine.snapshot(), &action).is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

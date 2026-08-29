@@ -173,29 +173,9 @@ impl LoopGuardrails {
     ) -> Option<ToolResult> {
         let kind = classify(name, input)?;
         let fingerprint = call_fingerprint(kind, name, input);
-        if !self.failures.is_empty()
-            && let Some(failure) = self.failures.iter().rev().find(|item| {
-                item.revision == revision
-                    && item.fingerprint == fingerprint
-                    && item.attempts >= NO_PROGRESS_LIMIT
-            })
+        if let Some(result) =
+            self.preflight_failure_fingerprint(call_id.clone(), fingerprint, revision)
         {
-            let mut result = ToolResult::failure(
-                call_id,
-                "repeated_failure",
-                "guardrail: repeated failure for the same action; change arguments or approach",
-                false,
-                DEFAULT_MAX_OUTPUT_BYTES,
-            );
-            if let Some(error) = failure.result.error.as_ref() {
-                result.output = aether_core::BoundedText::new(
-                    format!("{}; last failure={}", result.output.as_str(), error.code.as_str()),
-                    DEFAULT_MAX_OUTPUT_BYTES,
-                );
-            }
-            let _ = self.prevented.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_add(1))
-            });
             return Some(result);
         }
         let cached = self.observations
@@ -220,6 +200,61 @@ impl LoopGuardrails {
         cached
     }
 
+    /// Return only the bounded repeated-failure response for an action. Read callers use this
+    /// after live hash validation so an old successful observation can never bypass the workspace
+    /// check while the failure circuit remains active.
+    pub(crate) fn preflight_failure(
+        &self,
+        call_id: ToolCallId,
+        name: &str,
+        input: &Value,
+        revision: u32,
+    ) -> Option<ToolResult> {
+        let kind = classify(name, input)?;
+        let fingerprint = call_fingerprint(kind, name, input);
+        self.preflight_failure_fingerprint(call_id, fingerprint, revision)
+    }
+
+    /// Prepared-action form of [`Self::preflight_failure`].
+    pub(crate) fn preflight_failure_prepared(
+        &self,
+        action: &PreparedAction,
+        revision: u32,
+    ) -> Option<ToolResult> {
+        prepared_kind(action)?;
+        self.preflight_failure_fingerprint(action.call_id.clone(), action.fingerprint, revision)
+    }
+
+    fn preflight_failure_fingerprint(
+        &self,
+        call_id: ToolCallId,
+        fingerprint: [u8; 16],
+        revision: u32,
+    ) -> Option<ToolResult> {
+        let failure = self.failures.iter().rev().find(|item| {
+            item.revision == revision
+                && item.fingerprint == fingerprint
+                && item.attempts >= NO_PROGRESS_LIMIT
+        })?;
+        let mut result = ToolResult::failure(
+            call_id,
+            "repeated_failure",
+            "guardrail: repeated failure for the same action; change arguments or approach",
+            false,
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        if let Some(error) = failure.result.error.as_ref() {
+            result.output = aether_core::BoundedText::new(
+                format!("{}; last failure={}", result.output.as_str(), error.code.as_str()),
+                DEFAULT_MAX_OUTPUT_BYTES,
+            );
+        }
+        let _ = self.prevented.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
+        Some(result)
+    }
+
     /// Fast preflight using the action fingerprint and classification prepared by the registry.
     pub(crate) fn preflight_prepared(
         &self,
@@ -228,25 +263,9 @@ impl LoopGuardrails {
     ) -> Option<ToolResult> {
         let kind = prepared_kind(action)?;
         let fingerprint = action.fingerprint;
-        if let Some(failure) = self.failures.iter().rev().find(|item| {
-            item.revision == revision
-                && item.fingerprint == fingerprint
-                && item.attempts >= NO_PROGRESS_LIMIT
-        }) {
-            let mut result = ToolResult::failure(
-                action.call_id.clone(),
-                "repeated_failure",
-                "guardrail: repeated failure for the same action; change arguments or approach",
-                false,
-                DEFAULT_MAX_OUTPUT_BYTES,
-            );
-            if let Some(error) = failure.result.error.as_ref() {
-                result.output = aether_core::BoundedText::new(
-                    format!("{}; last failure={}", result.output.as_str(), error.code.as_str()),
-                    DEFAULT_MAX_OUTPUT_BYTES,
-                );
-            }
-            self.prevented.fetch_add(1, Ordering::Relaxed);
+        if let Some(result) =
+            self.preflight_failure_fingerprint(action.call_id.clone(), fingerprint, revision)
+        {
             return Some(result);
         }
         let cached = self

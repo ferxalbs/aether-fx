@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-29 (2) - Runtime-owned completion and verification
+
+### Added
+
+- Added runtime-owned Discover → Understand → Implement → Recover → Verify → Review → Done
+  orchestration with bounded checkpoint restoration, operational WorkingSet projections, and
+  deterministic completion review.
+- Added mutation-triggered scoped verification through the existing permission and scheduler
+  path, plus a Git-backed control-loop evaluation for correctness-preserving zero-waste execution.
+
+### Changed
+
+- Task steering now advances revisions when acceptance constraints change and reopens incompatible
+  completion state while preserving valid repository evidence.
+- Read-cache reuse now validates live canonical file hashes and rejects symlinked or out-of-root
+  files; bounded repeated-failure suppression remains available for safe recovery.
+- Verification classification now recognizes `git diff --check`, and persisted workflow metrics
+  remain available when an agent turn returns a typed error.
+
+### Security
+
+- Automatic verification continues through normal action preparation, permission gates, scheduling,
+  and execution; completion remains fail-closed on stale evidence, unresolved work, or incomplete
+  verification.
+
 ## Unreleased - 2026-08-29 (1) - Adaptive repository orchestration
 
 ### Added

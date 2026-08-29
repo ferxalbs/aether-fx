@@ -329,6 +329,7 @@ fn classify_formatter(args: &[String]) -> CommandClass {
 fn classify_git(args: &[String]) -> CommandClass {
     match first_subcommand(args, &["-C", "--git-dir", "--work-tree", "--namespace", "--config-env"])
     {
+        Some("diff") if args.iter().any(|arg| arg == "--check") => CommandClass::Verification,
         Some(
             "status" | "diff" | "show" | "log" | "branch" | "tag" | "rev-parse" | "ls-files"
             | "grep" | "shortlog" | "describe",
@@ -394,7 +395,7 @@ fn analyze_cargo(effects: &mut CommandEffects, args: &[String], cwd: &str) {
 fn analyze_git(effects: &mut CommandEffects, args: &[String], cwd: &str) {
     let subcommand =
         first_subcommand(args, &["-C", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
-    if effects.class == CommandClass::GitRead {
+    if matches!(effects.class, CommandClass::GitRead | CommandClass::Verification) {
         for path in args.iter().skip_while(|arg| arg.as_str() != "--").skip(1) {
             add_path_with_cwd(&mut effects.paths, cwd, path);
         }
@@ -1012,6 +1013,10 @@ mod tests {
             CommandClass::Inspection
         );
         assert_eq!(classify_command("git", &args(&["status", "--short"])), CommandClass::GitRead);
+        assert_eq!(
+            classify_command("git", &args(&["diff", "--check"])),
+            CommandClass::Verification
+        );
         assert_eq!(
             classify_command("git", &args(&["-C", "repo", "status"])),
             CommandClass::GitRead

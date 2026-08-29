@@ -152,6 +152,11 @@ pub struct WorkState {
     /// Monotonic task revision; workspace mutations use the separate workflow revision.
     #[serde(default)]
     pub task_revision: u32,
+    /// Digest of the redacted task text and effective constraints used for safe task steering.
+    /// The digest detects changes outside the normalized objective without persisting raw prompt
+    /// material or secrets.
+    #[serde(default)]
+    pub task_fingerprint: [u8; 16],
     pub revision: u32,
 }
 
@@ -186,6 +191,8 @@ impl WorkState {
                 changed = true;
             }
         }
+        let next_fingerprint = task_fingerprint(prompt, &self.constraints);
+        changed |= self.task_fingerprint == [0; 16] || self.task_fingerprint != next_fingerprint;
         if changed {
             self.task_revision = self.task_revision.saturating_add(1).max(1);
             self.invalidate_task_completion();
@@ -207,12 +214,16 @@ impl WorkState {
         }
         if changed {
             let next_criteria = extract_criteria(prompt);
+            // A steering update may change constraints without restating the original
+            // acceptance contract. Preserve that contract until the caller supplies replacement
+            // criteria; dropping it would make completion vacuously pass.
             if !next_criteria.is_empty() || self.acceptance_criteria.is_empty() {
                 self.acceptance_criteria = next_criteria;
             }
         } else if self.acceptance_criteria.is_empty() {
             self.acceptance_criteria = extract_criteria(prompt);
         }
+        self.task_fingerprint = next_fingerprint;
     }
 
     fn apply_objective_update(&mut self, objective: &str, mode: WorkMode) -> bool {
@@ -678,6 +689,7 @@ impl WorkState {
         self.mutations.clear();
         self.verifications.clear();
         self.task_revision = 0;
+        self.task_fingerprint = [0; 16];
         self.revision = 0;
     }
 
@@ -813,6 +825,24 @@ fn push_bounded<T>(items: &mut Vec<T>, item: T, limit: usize) {
 
 fn bounded(value: &str) -> BoundedText {
     BoundedText::new(value, MAX_WORK_FIELD_BYTES)
+}
+
+fn task_fingerprint(prompt: &str, constraints: &[BoundedText]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aether-task-v1\0");
+    for line in prompt.lines() {
+        hasher.update(redact_secret_assignments(line.trim()).as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.update(&[1]);
+    for constraint in constraints {
+        hasher.update(constraint.as_str().as_bytes());
+        hasher.update(&[0]);
+    }
+    let digest = hasher.finalize();
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&digest.as_bytes()[..16]);
+    fingerprint
 }
 
 fn classify_work_mode(prompt: &str) -> WorkMode {
@@ -1005,5 +1035,20 @@ mod tests {
         assert!(!state.criteria_satisfied());
         assert!(state.evidence.iter().any(|evidence| evidence.valid));
         assert_eq!(state.constraints[0].as_str(), "do not touch unrelated files");
+    }
+
+    #[test]
+    fn changed_acceptance_text_advances_task_revision_and_reopens_completion() {
+        let mut state = WorkState::default();
+        state.initialize_from_prompt("update one module\nacceptance: focused tests pass");
+        state.satisfy_criterion("criterion-0");
+        let revision = state.task_revision;
+        assert!(state.criteria_satisfied());
+
+        state.apply_task_update("update one module\nacceptance: workspace tests pass", None);
+
+        assert_eq!(state.task_revision, revision + 1);
+        assert!(!state.criteria_satisfied());
+        assert_eq!(state.acceptance_criteria[0].description.as_str(), "workspace tests pass");
     }
 }

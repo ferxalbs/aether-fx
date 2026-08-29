@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -18,7 +19,8 @@ use aether_core::{AgentEvent, ContextSnapshot, SessionId, TurnId, WorkflowVerifi
 use aether_tools::ToolRegistry;
 
 use super::{
-    Action, CapabilityTaskResult, ExecutionMetrics, Task, TaskResult, TrajectoryMetrics, trajectory,
+    Action, CapabilityTaskResult, ControlLoopCaseResult, ControlLoopEvaluation, ExecutionMetrics,
+    Task, TaskResult, TrajectoryMetrics, trajectory,
 };
 
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
@@ -28,8 +30,32 @@ pub(crate) fn run_task(
     script: &[Action],
     optimize: bool,
 ) -> Result<TaskResult, String> {
+    run_task_internal(task, script, optimize, false)
+}
+
+/// Run a task in a temporary Git-backed fixture. Repository-aware verification planning is
+/// intentionally exercised only by callers that request it; the historical regression fixtures
+/// remain byte-for-byte comparable to their non-Git baseline.
+pub(crate) fn run_task_with_git(
+    task: &Task,
+    script: &[Action],
+    optimize: bool,
+) -> Result<TaskResult, String> {
+    run_task_internal(task, script, optimize, true)
+}
+
+fn run_task_internal(
+    task: &Task,
+    script: &[Action],
+    optimize: bool,
+    initialize_git: bool,
+) -> Result<TaskResult, String> {
     let copy_started = Instant::now();
     let root = copy_fixture(task.fixture)?;
+    if initialize_git && let Err(error) = initialize_git_repository(&root) {
+        let _ = fs::remove_dir_all(&root);
+        return Err(error);
+    }
     let harness_overhead_ms = copy_started.elapsed().as_millis();
     let retained = trajectory::retained_indices(script, optimize);
     let existing_write_targets = script
@@ -84,7 +110,15 @@ pub(crate) fn run_task(
             let metrics = result.metrics.clone().unwrap_or_default();
             (Some(result), metrics, None)
         }
-        Err(error) => (None, AgentMetrics::default(), Some(error.to_string())),
+        Err(error) => {
+            // AgentRunResult intentionally exists only for completed turns, but the bounded
+            // workflow state remains available after a typed failure. Preserve its deterministic
+            // review/recovery counters so an eval can prove why the turn stopped without
+            // retaining transient tool output or raw model text.
+            let mut metrics = AgentMetrics::default();
+            record_workflow_metrics(&mut metrics, &agent.context_snapshot());
+            (None, metrics, Some(error.to_string()))
+        }
     };
     let outcomes_ok = task.expected_outcomes.iter().all(|expected| {
         fs::read_to_string(root.join(expected.path))
@@ -141,6 +175,91 @@ pub(crate) fn run_task(
     );
     let _ = fs::remove_dir_all(&root);
     Ok(result)
+}
+
+fn initialize_git_repository(root: &Path) -> Result<(), String> {
+    let init = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("initialize control-loop fixture repository: {error}"))?;
+    if !init.success() {
+        return Err("initialize control-loop fixture repository: git init failed".to_owned());
+    }
+    let add = Command::new("git")
+        .args(["add", "--all"])
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("index control-loop fixture repository: {error}"))?;
+    if !add.success() {
+        return Err("index control-loop fixture repository: git add failed".to_owned());
+    }
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=AETHER Eval",
+            "-c",
+            "user.email=aether-eval@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            "fixture baseline",
+        ])
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("commit control-loop fixture repository: {error}"))?;
+    if !commit.success() {
+        return Err("commit control-loop fixture repository: git commit failed".to_owned());
+    }
+    Ok(())
+}
+
+/// Compare the same deterministic model trace with and without runtime-owned verification. The
+/// fixture is deliberately not a language package: the planner's bounded `git diff --check`
+/// fallback makes the control result fast, reproducible, and independent of a dependency cache.
+pub(crate) fn run_control_loop_evaluation() -> Result<ControlLoopEvaluation, String> {
+    let baseline = run_task_with_git(&super::CONTROL_LOOP_TASK, super::CONTROL_LOOP_SCRIPT, false)?;
+    let optimized = run_task_with_git(&super::CONTROL_LOOP_TASK, super::CONTROL_LOOP_SCRIPT, true)?;
+    let correctness_preserved = baseline.success && optimized.success;
+    let reduced_tool_work = baseline.executed_tool_calls > optimized.executed_tool_calls;
+    let automatic_verification = optimized.automatic_verification_attempts > 0;
+    let prevented_redundant = optimized.prevented_redundant_calls > 0;
+    let passed =
+        correctness_preserved && reduced_tool_work && automatic_verification && prevented_redundant;
+    let failure = (!passed).then(|| {
+        format!(
+            "same-trace control failed: baseline_success={} optimized_success={} baseline_tools={} optimized_tools={} automatic_verifications={} prevented={} baseline_failure={} optimized_failure={}",
+            baseline.success,
+            optimized.success,
+            baseline.executed_tool_calls,
+            optimized.executed_tool_calls,
+            optimized.automatic_verification_attempts,
+            optimized.prevented_redundant_calls,
+            baseline.failure.as_deref().unwrap_or("none"),
+            optimized.failure.as_deref().unwrap_or("none"),
+        )
+    });
+    let case = ControlLoopCaseResult {
+        case_id: super::CONTROL_LOOP_TASK.id.to_owned(),
+        baseline_success: baseline.success,
+        optimized_success: optimized.success,
+        correctness_preserved,
+        automatic_verification_attempts: optimized.automatic_verification_attempts,
+        prevented_redundant_calls: optimized.prevented_redundant_calls,
+        baseline_model_requests: baseline.model_requests,
+        optimized_model_requests: optimized.model_requests,
+        baseline_requested_tool_calls: baseline.requested_tool_calls,
+        optimized_requested_tool_calls: optimized.requested_tool_calls,
+        baseline_executed_tool_calls: baseline.executed_tool_calls,
+        optimized_executed_tool_calls: optimized.executed_tool_calls,
+        verification_scope: optimized.verification_scope,
+        completion_rejections: optimized.completion_rejections,
+        failure,
+    };
+    Ok(ControlLoopEvaluation { total: 1, passed: usize::from(passed), cases: vec![case] })
 }
 
 /// Run a checkpointed task while applying one bounded external change between segments.
@@ -221,6 +340,7 @@ pub(crate) fn run_resumable_task_with_change(
         bytes_shown_to_model: metrics.bytes_shown_to_model,
         wall_time_ms: metrics.wall_time_ms,
         verification_attempts: metrics.verification_attempts as u32,
+        automatic_verification_attempts: metrics.automatic_verification_attempts as u32,
         verification_failures: metrics.verification_failures as u32,
         reused_observations: metrics.reused_observations as u32,
         automatic_evidence_reactions: metrics.automatic_evidence_reactions as u32,
@@ -276,17 +396,19 @@ fn run_segment(
         while receiver.recv().await.is_some() {}
         result
     });
+    let failed_context = agent.context_snapshot();
     let (result, metrics, error) = match result {
         Ok(result) => {
             let metrics = result.metrics.clone();
             (Some(result), metrics, None)
         }
-        Err(error) => (None, None, Some(error.to_string())),
+        Err(error) => {
+            let mut metrics = AgentMetrics::default();
+            record_workflow_metrics(&mut metrics, &failed_context);
+            (None, Some(metrics), Some(error.to_string()))
+        }
     };
-    let context = result
-        .as_ref()
-        .map(|result| result.context.clone())
-        .unwrap_or_else(|| agent.context_snapshot());
+    let context = result.as_ref().map(|result| result.context.clone()).unwrap_or(failed_context);
     Ok(SegmentResult { result, context, metrics, error })
 }
 
@@ -328,6 +450,21 @@ fn build_steps(
         });
     }
     Ok(steps)
+}
+
+fn record_workflow_metrics(metrics: &mut AgentMetrics, context: &ContextSnapshot) {
+    let progress = &context.workflow.progress;
+    metrics.automatic_evidence_reactions = u64::from(progress.automatic_evidence_reactions);
+    metrics.diagnostic_hydration_events = u64::from(progress.diagnostic_hydrations);
+    metrics.mutation_refresh_events = u64::from(progress.mutation_refreshes);
+    metrics.stale_evidence_invalidations = u64::from(progress.stale_invalidations);
+    metrics.verification_escalations = u64::from(progress.verification_escalations);
+    metrics.completion_rejections = u64::from(progress.completion_rejections);
+    metrics.unresolved_work_at_finish = context.workflow.work.unresolved_count() as u64;
+    let scope = context.workflow.decision.verification_scope.as_str();
+    if !scope.is_empty() {
+        metrics.verification_scope = Some(scope.to_owned());
+    }
 }
 
 fn action_to_call(
@@ -470,6 +607,7 @@ impl TaskResult {
             policy_feedback_bytes: after.policy_feedback_bytes,
             protocol_envelope_bytes: after.protocol_envelope_bytes,
             verification_attempts: after.verification_attempts,
+            automatic_verification_attempts: after.automatic_verification_attempts,
             verification_failures: after.verification_failures,
             recovery_attempts: after.recovery_attempts,
             recovery_successes: after.recovery_successes,
@@ -527,6 +665,7 @@ impl ExecutionMetrics {
             policy_feedback_bytes: metrics.policy_feedback_bytes,
             protocol_envelope_bytes: metrics.protocol_envelope_bytes,
             verification_attempts: metrics.verification_attempts as u32,
+            automatic_verification_attempts: metrics.automatic_verification_attempts as u32,
             verification_failures: metrics.verification_failures as u32,
             recovery_attempts: metrics.recovery_attempts as u32,
             recovery_successes: metrics.recovery_successes as u32,

@@ -30,7 +30,9 @@ impl PlannedCommand {
     }
 
     pub(crate) fn workflow_key(&self) -> String {
-        if self.cwd.is_empty() {
+        // The tool schema permits both an omitted/root cwd and the explicit `.` spelling. Treat
+        // them as the same scope so a runtime-planned check can safely match a model request.
+        if self.cwd.is_empty() || self.cwd == "." {
             self.display()
         } else {
             format!("[cwd={}] {}", shell_word(&self.cwd), self.display())
@@ -391,6 +393,18 @@ mod tests {
         let plan = plan_verification(&repo(ManifestKind::Go, "go.mod", None), &["main.go".into()]);
         assert!(plan.unsupported);
         assert_eq!(plan.commands[0].display(), "git diff --check");
+    }
+
+    #[test]
+    fn root_cwd_spellings_share_a_verification_key() {
+        let omitted = PlannedCommand {
+            program: "git".to_owned(),
+            args: vec!["diff".to_owned(), "--check".to_owned()],
+            cwd: String::new(),
+            scope: "workspace diff".to_owned(),
+        };
+        let explicit = PlannedCommand { cwd: ".".to_owned(), ..omitted.clone() };
+        assert_eq!(omitted.workflow_key(), explicit.workflow_key());
     }
 
     #[test]

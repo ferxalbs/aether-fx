@@ -77,6 +77,10 @@ impl ContextEngine {
             !fingerprint.is_empty() && fingerprint.len() <= MAX_CONTEXT_FINGERPRINT_BYTES
         });
         snapshot.workflow.enforce_bounds();
+        let stale_evidence =
+            snapshot.workspace_changed || snapshot.inspected.iter().any(|file| file.stale);
+        let modified = snapshot.modified.clone();
+        snapshot.workflow.sync_director(&modified, stale_evidence);
         let repo_map =
             (!snapshot.workspace_root.is_empty()).then(|| RepoMap::new(&snapshot.workspace_root));
         Self { snapshot, repo_map }
@@ -367,6 +371,31 @@ impl ContextEngine {
         );
     }
 
+    /// Return the first planned verification command that is still pending for the live revision.
+    /// The command is reconstructed from the repository map and matched against the persisted
+    /// workflow plan, so a stale or changed plan cannot silently authorize a different command.
+    pub(crate) fn next_pending_verification(&self) -> Option<crate::PlannedCommand> {
+        let repo_map = self.repo_map.as_ref()?;
+        let repo = repo_map.snapshot().ok()?;
+        let revision = self.snapshot.workflow.workspace_revision;
+        let pending = self
+            .snapshot
+            .workflow
+            .verification_steps
+            .iter()
+            .filter(|step| {
+                step.required
+                    && step.revision == revision
+                    && step.status == aether_core::VerificationStatus::Pending
+            })
+            .map(|step| step.command.as_str())
+            .collect::<Vec<_>>();
+        plan_verification(&repo, &self.snapshot.modified)
+            .commands
+            .into_iter()
+            .find(|command| pending.iter().any(|expected| *expected == command.workflow_key()))
+    }
+
     /// Re-hash inspected files against the live workspace. Stale hashes never win.
     pub fn refresh_against_workspace(&mut self, workspace_root: &Path) -> Vec<String> {
         let mut stale_paths = Vec::new();
@@ -478,17 +507,30 @@ impl ContextEngine {
             out.push_str(&self.snapshot.workspace_root);
             out.push('\n');
         }
-        if !self.snapshot.current_task.as_str().is_empty() {
-            out.push_str("task: ");
-            out.push_str(self.snapshot.current_task.as_str());
-            out.push('\n');
-        }
         if self.snapshot.workspace_changed {
             out.push_str(
                 "workspace_changed: true; treat persisted hashes and excerpts as stale until re-read\n",
             );
         }
         self.render_workflow(&mut out);
+        // Keep the bounded operational projection beside the workflow facts that it summarizes.
+        // The projection is derived from the snapshot, so it cannot become a second source of
+        // truth, but making it explicit here lets every model turn resume from the same compact
+        // target/freshness/blocker view without another bookkeeping round-trip.
+        let working_set = self.working_set();
+        let working_set_render = working_set.render();
+        let working_set_fingerprint = working_set_fingerprint(&working_set_render);
+        let working_set_changed = !delta_only
+            || !self
+                .snapshot
+                .rendered_fingerprints
+                .iter()
+                .any(|seen| seen == &working_set_fingerprint);
+        if working_set_changed {
+            out.push_str("working_set: ");
+            out.push_str(&working_set_render);
+            out.push('\n');
+        }
         let symbol_paths = relevant_symbol_paths(&self.snapshot);
         let active_instruction_paths = if symbol_paths.is_empty() {
             vec![".".to_owned()]
@@ -807,6 +849,9 @@ impl ContextEngine {
                 }
             }
         }
+        if working_set_changed {
+            self.snapshot.rendered_fingerprints.push(working_set_fingerprint);
+        }
         if self.snapshot.rendered_fingerprints.len() > MAX_CONTEXT_FINGERPRINTS {
             let excess = self.snapshot.rendered_fingerprints.len() - MAX_CONTEXT_FINGERPRINTS;
             self.snapshot.rendered_fingerprints.drain(..excess);
@@ -978,16 +1023,6 @@ impl ContextEngine {
             out.push_str(target.as_str());
         }
         out.push('\n');
-        if let Some(candidate) = decision.candidate_files.first() {
-            out.push_str("decision_candidate: ");
-            out.push_str(candidate.path.as_str());
-            out.push_str(" score=");
-            let _ = write!(out, "{}", candidate.score);
-            if !candidate.inspected || candidate.stale {
-                out.push_str(" inspect_required");
-            }
-            out.push('\n');
-        }
         if let Some(question) = decision.unresolved_questions.first() {
             out.push_str("decision_question: ");
             out.push_str(question.question.as_str());
@@ -1046,16 +1081,6 @@ impl ContextEngine {
             out.push_str(step.scope.as_str());
             out.push('\n');
         }
-        let action = match workflow.phase {
-            WorkflowPhase::Discover => "identify relevant files before editing",
-            WorkflowPhase::Inspect => "inspect identified files before editing",
-            WorkflowPhase::Modify => "retry or complete the pending mutation",
-            WorkflowPhase::Verify => "run focused verification for modified files",
-            WorkflowPhase::Complete => "workflow complete",
-        };
-        out.push_str("workflow_action: ");
-        out.push_str(action);
-        out.push('\n');
     }
 
     fn reset_workflow_for_workspace_change(&mut self) {
@@ -1770,12 +1795,26 @@ fn excerpt_from_lines(lines: &[Value]) -> Option<String> {
 
 fn live_file_hash(root: &Path, relative: &str) -> Option<String> {
     let relative = WorkspacePath::new(relative).ok()?;
+    let canonical_root = root.canonicalize().ok()?;
     let path = root.join(relative.as_path());
-    let bytes = std::fs::read(&path).ok()?;
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_root) {
+        return None;
+    }
+    let bytes = fs::read(canonical).ok()?;
     if bytes.len() > 4 * 1024 * 1024 {
         return None;
     }
     Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn working_set_fingerprint(rendered: &str) -> String {
+    let digest = blake3::hash(rendered.as_bytes()).to_hex().to_string();
+    format!("working_set:{}", &digest[..16])
 }
 
 /// Read only a small, canonicalized source window for runtime recovery context. This observation
@@ -2032,6 +2071,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_refresh_rejects_symlinked_inspected_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-context-symlink-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "aether-context-symlink-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, "outside source\n").unwrap();
+        symlink(&outside, root.join("src.rs")).unwrap();
+
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.observe_tool(
+            "read",
+            &serde_json::json!({"files": [{"path": "src.rs"}]}),
+            &success(serde_json::json!({
+                "files": [{
+                    "path": "src.rs",
+                    "content_hash": blake3::hash(b"outside source\n").to_hex().to_string(),
+                    "lines": [{"number": 1, "text": "outside source"}]
+                }]
+            })),
+        );
+
+        let stale = engine.refresh_against_workspace(&root);
+        assert_eq!(stale, vec!["src.rs".to_owned()]);
+        assert!(engine.snapshot().inspected[0].stale);
+        assert!(engine.snapshot().workspace_changed);
+        assert!(engine.snapshot().excerpts.is_empty());
+        assert!(read_auto_excerpt(&root, "src.rs", None).is_none());
+
+        let _ = std::fs::remove_file(root.join("src.rs"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(outside);
+    }
+
     #[test]
     fn workflow_follows_discover_inspect_modify_verify_complete() {
         let mut engine = ContextEngine::new("/workspace", None);
@@ -2206,8 +2289,8 @@ mod tests {
         );
         let rendered = engine.render(false);
         assert!(rendered.contains("workflow: phase=inspect"));
+        assert!(rendered.contains("working_set: phase="));
         assert!(rendered.contains("workflow_relevant: src/lib.rs"));
-        assert!(rendered.contains("workflow_action: inspect identified files before editing"));
         assert!(!rendered.contains("raw transcript"));
 
         engine.set_workspace_changed(true);
@@ -2237,6 +2320,35 @@ mod tests {
         engine.observe_tool("read", &input, &read);
         assert!(!engine.snapshot().workspace_changed);
         assert!(engine.finish_turn());
+    }
+
+    #[test]
+    fn mutation_exposes_a_current_revision_verification_command() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/fixtures/targeted-bug");
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.set_task("repair the source and verify the change");
+        let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let read_input = serde_json::json!({
+            "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 32}]
+        });
+        let read = success(serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "content_hash": blake3::hash(source.as_bytes()).to_hex().to_string(),
+                "lines": [{"number": 1, "text": source.lines().next().unwrap_or("")}]
+            }]
+        }));
+        engine.observe_tool("read", &read_input, &read);
+        engine.observe_tool(
+            "write",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            &success(serde_json::json!({
+                "path": "src/lib.rs",
+                "hash": "new-hash"
+            })),
+        );
+        assert!(!engine.snapshot().workflow.verification_steps.is_empty());
+        assert!(engine.next_pending_verification().is_some());
     }
 
     #[test]
@@ -2270,6 +2382,7 @@ mod tests {
         assert!(delta.contains("changed"));
         let unchanged_again = engine.render_delta(false);
         assert!(!unchanged_again.contains("changed"));
+        assert!(!unchanged_again.contains("working_set: phase="));
     }
 
     #[test]
