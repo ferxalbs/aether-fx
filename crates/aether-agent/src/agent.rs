@@ -32,6 +32,9 @@ pub struct AgentRequest {
     pub turn_id: TurnId,
     /// User prompt.
     pub prompt: String,
+    /// Optional bounded steering constraints applied to the durable work state.
+    #[serde(default)]
+    pub constraints: Option<Vec<String>>,
     /// Optional opaque model identifier.
     pub model: Option<String>,
     /// Maximum model/tool continuation steps.
@@ -63,6 +66,7 @@ impl AgentRequest {
             session_id,
             turn_id,
             prompt: prompt.into(),
+            constraints: None,
             model: None,
             max_steps: 16,
             continuation: None,
@@ -126,6 +130,15 @@ pub struct AgentMetrics {
     pub recovery_successes: u64,
     /// Workspace-drift or stale-evidence completion rejections.
     pub stale_evidence_violations: u64,
+    /// Read-only observations served from current, hash-checked local evidence.
+    pub reused_observations: u64,
+    /// Deterministic repository reactions recorded by the context engine.
+    pub automatic_evidence_reactions: u64,
+    pub diagnostic_hydration_events: u64,
+    pub mutation_refresh_events: u64,
+    pub stale_evidence_invalidations: u64,
+    pub verification_escalations: u64,
+    pub completion_rejections: u64,
     /// Work units still unresolved when the turn completed.
     pub unresolved_work_at_finish: u64,
     /// Smallest verification scope selected by the deterministic policy, when known.
@@ -498,6 +511,7 @@ where
                 let context = self.current_context();
                 let final_metrics = metrics.map(|metrics| {
                     let mut value = metrics.finish();
+                    record_workflow_metrics(&mut value, &context);
                     let scope = context.workflow.decision.verification_scope.as_str();
                     if !scope.is_empty() {
                         value.verification_scope = Some(scope.to_owned());
@@ -647,6 +661,10 @@ where
                             metrics.value.prevented_calls =
                                 metrics.value.prevented_calls.saturating_add(1);
                         }
+                        if !completed.executed {
+                            metrics.value.reused_observations =
+                                metrics.value.reused_observations.saturating_add(1);
+                        }
                     }
                     if completed.planned {
                         metrics.value.planner_hits = metrics.value.planner_hits.saturating_add(1);
@@ -705,6 +723,9 @@ where
             }
             engine.set_model(request.model.clone());
             engine.set_task(&request.prompt);
+            if let Some(constraints) = request.constraints.as_deref() {
+                engine.set_constraints(constraints);
+            }
             if request.continuation.is_some() {
                 engine.set_continuation(request.continuation.clone());
             }
@@ -862,6 +883,16 @@ where
         }
         Ok(Some(completed))
     }
+}
+
+fn record_workflow_metrics(metrics: &mut AgentMetrics, context: &ContextSnapshot) {
+    let progress = &context.workflow.progress;
+    metrics.automatic_evidence_reactions = u64::from(progress.automatic_evidence_reactions);
+    metrics.diagnostic_hydration_events = u64::from(progress.diagnostic_hydrations);
+    metrics.mutation_refresh_events = u64::from(progress.mutation_refreshes);
+    metrics.stale_evidence_invalidations = u64::from(progress.stale_invalidations);
+    metrics.verification_escalations = u64::from(progress.verification_escalations);
+    metrics.completion_rejections = u64::from(progress.completion_rejections);
 }
 
 fn add_usage(
@@ -1158,6 +1189,7 @@ mod tests {
 
     fn completed_context() -> ContextSnapshot {
         let mut context = ContextSnapshot::new("/workspace", None);
+        context.workflow.work.initialize_from_prompt("inspect source");
         context.workflow.record_relevant_file("src/lib.rs");
         context.inspected.push(InspectedFile {
             path: "src/lib.rs".to_owned(),
@@ -1284,6 +1316,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("lib.rs"), "new").unwrap();
         let mut seed = ContextSnapshot::new(root.display().to_string(), None);
+        seed.workflow.work.initialize_from_prompt("inspect the changed file");
         seed.workflow.record_relevant_file("lib.rs");
         seed.inspected.push(InspectedFile {
             path: "lib.rs".to_owned(),
@@ -1730,7 +1763,11 @@ mod tests {
                 model: None,
                 workspace_changed: false,
                 rendered_fingerprints: Vec::new(),
-                workflow: aether_core::WorkflowState::new(),
+                workflow: {
+                    let mut workflow = aether_core::WorkflowState::new();
+                    workflow.work.initialize_from_prompt("write the inspected file");
+                    workflow
+                },
             });
             request.context_seed.as_mut().unwrap().workflow.record_relevant_file("test.txt");
             request.context_seed.as_mut().unwrap().workflow.record_inspection();

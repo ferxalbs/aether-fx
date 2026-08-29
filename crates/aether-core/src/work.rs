@@ -139,6 +139,9 @@ pub struct WorkBlocker {
 pub struct WorkState {
     pub mode: WorkMode,
     pub objective: BoundedText,
+    /// Explicit bounded constraints carried across turns for future steering updates.
+    #[serde(default)]
+    pub constraints: Vec<BoundedText>,
     pub acceptance_criteria: Vec<WorkCriterion>,
     pub subgoals: Vec<WorkSubgoal>,
     pub active_subgoal: Option<BoundedText>,
@@ -146,26 +149,51 @@ pub struct WorkState {
     pub evidence: Vec<WorkEvidence>,
     pub mutations: Vec<WorkMutation>,
     pub verifications: Vec<WorkVerification>,
+    /// Monotonic task revision; workspace mutations use the separate workflow revision.
+    #[serde(default)]
+    pub task_revision: u32,
     pub revision: u32,
 }
 
 impl WorkState {
     /// Initialize the compact task objective and complexity mode from the user request.
     pub fn initialize_from_prompt(&mut self, prompt: &str) {
+        self.apply_task_update(prompt, None);
+    }
+
+    /// Apply a bounded objective and optional constraints update from a new user turn.
+    ///
+    /// A changed task revision invalidates completion claims and completed subgoals while
+    /// preserving repository evidence and mutation history that remains useful for the new task.
+    pub fn apply_task_update(&mut self, prompt: &str, constraints: Option<&[String]>) {
         let objective = normalized_objective(prompt);
         let mode = classify_work_mode(prompt);
+        let mut changed = self.objective.as_str().is_empty();
         if self.objective.as_str().is_empty() {
             self.reset_task(objective, mode);
         } else {
-            // A later prompt in the same session is commonly a continuation or repair
-            // instruction. Keep completed work and evidence; update only the compact objective
-            // and promote the mode if the new instruction is more complex.
-            self.objective = bounded(&objective);
-            if mode == WorkMode::Structured {
-                self.mode = WorkMode::Structured;
+            changed |= self.apply_objective_update(&objective, mode);
+        }
+        if let Some(constraints) = constraints {
+            let next = constraints
+                .iter()
+                .take(MAX_WORK_RELATIONS)
+                .map(|constraint| bounded(constraint))
+                .filter(|constraint| !constraint.as_str().is_empty() && !constraint.is_truncated())
+                .collect::<Vec<_>>();
+            if next != self.constraints {
+                self.constraints = next;
+                changed = true;
             }
         }
-        if mode == WorkMode::Structured && self.subgoals.is_empty() {
+        if changed {
+            self.task_revision = self.task_revision.saturating_add(1).max(1);
+            self.invalidate_task_completion();
+        }
+        if mode == WorkMode::Structured {
+            self.mode = WorkMode::Structured;
+        }
+        if self.subgoals.is_empty() && mode == WorkMode::Structured {
             self.subgoals.push(WorkSubgoal {
                 id: bounded("task"),
                 label: bounded("complete the requested repository task"),
@@ -177,9 +205,38 @@ impl WorkState {
             });
             self.active_subgoal = Some(bounded("task"));
         }
-        if self.acceptance_criteria.is_empty() {
+        if changed {
+            let next_criteria = extract_criteria(prompt);
+            if !next_criteria.is_empty() || self.acceptance_criteria.is_empty() {
+                self.acceptance_criteria = next_criteria;
+            }
+        } else if self.acceptance_criteria.is_empty() {
             self.acceptance_criteria = extract_criteria(prompt);
         }
+    }
+
+    fn apply_objective_update(&mut self, objective: &str, mode: WorkMode) -> bool {
+        let next = bounded(objective);
+        let changed = self.objective != next;
+        self.objective = next;
+        if mode == WorkMode::Structured {
+            self.mode = WorkMode::Structured;
+        }
+        changed
+    }
+
+    fn invalidate_task_completion(&mut self) {
+        for subgoal in &mut self.subgoals {
+            if subgoal.status == WorkStatus::Complete {
+                subgoal.status = WorkStatus::Stale;
+                subgoal.completed_revision = None;
+            }
+        }
+        for criterion in &mut self.acceptance_criteria {
+            criterion.satisfied = false;
+        }
+        self.active_subgoal = None;
+        self.select_active_subgoal();
     }
 
     /// Return whether this task has enough independent structure to justify work units.
@@ -355,6 +412,12 @@ impl WorkState {
     /// structured tracking is active.
     pub fn record_mutation(&mut self, operation: &str, paths: &[String], revision: u32) {
         self.revision = revision;
+        for verification in &mut self.verifications {
+            verification.status = VerificationStatus::Stale;
+        }
+        for criterion in &mut self.acceptance_criteria {
+            criterion.satisfied = false;
+        }
         let paths = paths.iter().map(|path| bounded(path)).collect::<Vec<_>>();
         push_bounded(
             &mut self.mutations,
@@ -546,6 +609,12 @@ impl WorkState {
     /// Enforce all bounds after restoring a persisted session.
     pub fn enforce_bounds(&mut self) {
         self.objective = BoundedText::new(self.objective.as_str(), MAX_WORK_OBJECTIVE_BYTES);
+        self.constraints.truncate(MAX_WORK_RELATIONS);
+        for constraint in &mut self.constraints {
+            *constraint = bounded(constraint.as_str());
+        }
+        self.constraints
+            .retain(|constraint| !constraint.as_str().is_empty() && !constraint.is_truncated());
         self.acceptance_criteria.truncate(MAX_WORK_CRITERIA);
         self.subgoals.truncate(MAX_WORK_SUBGOALS);
         self.blockers.truncate(MAX_WORK_BLOCKERS);
@@ -601,12 +670,14 @@ impl WorkState {
         self.mode = mode;
         self.objective = bounded(&objective);
         self.acceptance_criteria.clear();
+        self.constraints.clear();
         self.subgoals.clear();
         self.active_subgoal = None;
         self.blockers.clear();
         self.evidence.clear();
         self.mutations.clear();
         self.verifications.clear();
+        self.task_revision = 0;
         self.revision = 0;
     }
 
@@ -917,5 +988,22 @@ mod tests {
         assert!(!state.criteria_satisfied());
         state.satisfy_criterion("criterion-0");
         assert!(state.criteria_satisfied());
+    }
+
+    #[test]
+    fn changed_task_constraints_invalidate_completion_but_keep_repository_evidence() {
+        let mut state = WorkState::default();
+        state.initialize_from_prompt("update one module\nacceptance: focused tests pass");
+        state.record_evidence("read", "src/lib.rs", "current source", 0);
+        state.satisfy_criterion("criterion-0");
+        assert_eq!(state.task_revision, 1);
+        state.apply_task_update(
+            "update one module and preserve the public API",
+            Some(&["do not touch unrelated files".to_owned()]),
+        );
+        assert_eq!(state.task_revision, 2);
+        assert!(!state.criteria_satisfied());
+        assert!(state.evidence.iter().any(|evidence| evidence.valid));
+        assert_eq!(state.constraints[0].as_str(), "do not touch unrelated files");
     }
 }

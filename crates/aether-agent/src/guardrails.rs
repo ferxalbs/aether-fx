@@ -639,6 +639,7 @@ mod tests {
         );
 
         let mut complete = state.clone();
+        complete.work.initialize_from_prompt("inspect the source");
         complete.record_relevant_file("src/lib.rs");
         complete.record_inspection();
         assert!(complete.complete_if_ready(&[]));

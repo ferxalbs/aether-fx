@@ -14,6 +14,7 @@ use aether_core::{
 use serde_json::Value;
 
 use crate::repo_map::RepoMap;
+use crate::working_set::WorkingSet;
 use crate::{
     ContextCandidate, ContextKind, RelationshipHint, SymbolHint, plan_verification,
     select_context_with_relationships,
@@ -91,6 +92,12 @@ impl ContextEngine {
         &mut self.snapshot
     }
 
+    /// Return the bounded operational memory projection for the active repository task.
+    #[must_use]
+    pub fn working_set(&self) -> WorkingSet {
+        WorkingSet::from_snapshot(&self.snapshot)
+    }
+
     /// Consume the engine and return the snapshot.
     pub fn into_snapshot(self) -> ContextSnapshot {
         self.snapshot
@@ -103,8 +110,34 @@ impl ContextEngine {
 
     /// Record the latest user task.
     pub fn set_task(&mut self, prompt: &str) {
+        let before = self.snapshot.workflow.work.task_revision;
         self.snapshot.current_task = BoundedText::new(prompt, MAX_TASK_BYTES);
         self.snapshot.workflow.work.initialize_from_prompt(prompt);
+        let workflow = &mut self.snapshot.workflow;
+        workflow.task_revision = workflow.work.task_revision;
+        if workflow.task_revision != before {
+            workflow.completed_task_revision = None;
+            workflow.phase = WorkflowPhase::Discover;
+            workflow.recovery.clear();
+        }
+        let modified = self.snapshot.modified.clone();
+        workflow.sync_director(&modified, false);
+    }
+
+    /// Apply a bounded user steering update without discarding still-useful repository evidence.
+    pub fn set_constraints(&mut self, constraints: &[String]) {
+        let prompt = self.snapshot.current_task.as_str().to_owned();
+        let before = self.snapshot.workflow.work.task_revision;
+        self.snapshot.workflow.work.apply_task_update(&prompt, Some(constraints));
+        let workflow = &mut self.snapshot.workflow;
+        workflow.task_revision = workflow.work.task_revision;
+        if workflow.task_revision != before {
+            workflow.completed_task_revision = None;
+            workflow.phase = WorkflowPhase::Discover;
+            workflow.recovery.clear();
+        }
+        let modified = self.snapshot.modified.clone();
+        workflow.sync_director(&modified, false);
     }
 
     /// Apply a bounded model work outline. The core work state accepts only intent; runtime
@@ -147,7 +180,16 @@ impl ContextEngine {
             self.reset_workflow_for_workspace_change();
             return false;
         }
-        self.snapshot.workflow.complete_if_ready(&self.snapshot.modified)
+        let user_changes_preserved = !self.snapshot.user_modified.iter().any(|path| {
+            self.snapshot.modified.iter().any(|modified| paths_overlap(path, modified))
+        });
+        let ready = self.snapshot.workflow.complete_if_ready_with_evidence(
+            &self.snapshot.modified,
+            true,
+            user_changes_preserved,
+        );
+        self.enforce_bounds();
+        ready
     }
 
     /// Record a bounded dirty-worktree path as user-owned unless this session owns it already.
@@ -284,12 +326,13 @@ impl ContextEngine {
                 for diagnostic in &diagnostics {
                     self.record_relevant_path(diagnostic.path.as_str());
                 }
+                let category = failure_category(name, "verification_failed", result);
                 self.snapshot.workflow.record_failure(WorkflowFailure::new_at_revision(
                     failure_key.as_deref().unwrap_or("operation"),
                     name,
                     "verification_failed",
                     verification_message(result),
-                    WorkflowFailureCategory::Verification,
+                    category,
                     self.snapshot.workflow.workspace_revision,
                     diagnostics,
                 ));
@@ -306,6 +349,9 @@ impl ContextEngine {
             && !self.snapshot.inspected.iter().any(|file| file.stale)
         {
             self.snapshot.workspace_changed = false;
+            if self.snapshot.workflow.recovery.category == WorkflowFailureCategory::StaleEvidence {
+                self.snapshot.workflow.clear_recovery();
+            }
         }
         self.enforce_bounds();
     }
@@ -375,6 +421,7 @@ impl ContextEngine {
         }
         if !stale_paths.is_empty() {
             self.snapshot.workspace_changed = true;
+            self.snapshot.workflow.progress.note_stale_invalidation();
             self.snapshot
                 .excerpts
                 .retain(|excerpt| !stale_paths.iter().any(|path| path == &excerpt.path));
@@ -836,6 +883,8 @@ impl ContextEngine {
         let workflow = &self.snapshot.workflow;
         out.push_str("workflow: phase=");
         out.push_str(workflow.phase.as_str());
+        out.push_str(" dir=");
+        out.push_str(workflow.director.phase.as_str());
         out.push_str(" verification=");
         out.push_str(workflow.verification.as_str());
         out.push_str(" relevant=");
@@ -853,6 +902,26 @@ impl ContextEngine {
         out.push('/');
         let _ = write!(out, "{}", workflow.progress.verifications);
         out.push('\n');
+        if workflow.recovery.active {
+            out.push_str("workflow_recovery: category=");
+            out.push_str(workflow.recovery.category.as_str());
+            out.push_str(" action=");
+            out.push_str(workflow.recovery.action.as_str());
+            out.push_str(" attempts=");
+            let _ = write!(out, "{}", workflow.recovery.attempts);
+            out.push_str(" revision=");
+            let _ = write!(out, "{}", workflow.recovery.revision);
+            if !workflow.recovery.affected_paths.is_empty() {
+                out.push_str(" paths=");
+                for (index, path) in workflow.recovery.affected_paths.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(path.as_str());
+                }
+            }
+            out.push('\n');
+        }
         let work = &workflow.work;
         if work.is_structured() {
             out.push_str("work: mode=");
@@ -1001,6 +1070,9 @@ impl ContextEngine {
         let Ok(snapshot) = repo_map.snapshot() else { return };
         let plan = plan_verification(&snapshot, &self.snapshot.modified);
         let revision = self.snapshot.workflow.workspace_revision;
+        if plan.requires_broader || plan.commands.len() > 1 {
+            self.snapshot.workflow.progress.note_verification_escalation();
+        }
         self.snapshot.workflow.set_verification_plan(
             plan.commands.iter().map(|command| command.workflow_step(revision)),
         );
@@ -1116,7 +1188,7 @@ impl ContextEngine {
 
     fn record_workflow_failure(&mut self, key: &str, name: &str, result: &ToolResult) {
         let code = result.error.as_ref().map_or("tool_failed", |error| error.code.as_str());
-        let category = failure_category(code);
+        let category = failure_category(name, code, result);
         let diagnostics = extract_diagnostics(result);
         for diagnostic in &diagnostics {
             self.record_relevant_path(diagnostic.path.as_str());
@@ -1152,6 +1224,8 @@ impl ContextEngine {
             };
             if let Some(excerpt) = read_auto_excerpt(Path::new(&root), path, Some(focus)) {
                 self.store_automatic_excerpt(excerpt);
+                self.snapshot.workflow.progress.note_automatic_evidence_reaction();
+                self.snapshot.workflow.progress.note_diagnostic_hydration();
             }
         }
     }
@@ -1169,6 +1243,8 @@ impl ContextEngine {
             seen.push(path.clone());
             if let Some(excerpt) = read_auto_excerpt(Path::new(&root), path, None) {
                 self.store_automatic_excerpt(excerpt);
+                self.snapshot.workflow.progress.note_automatic_evidence_reaction();
+                self.snapshot.workflow.progress.note_mutation_refresh();
             }
         }
     }
@@ -1381,6 +1457,10 @@ impl ContextEngine {
         self.snapshot.tool_summaries.truncate(MAX_STORED_TOOL_SUMMARIES);
         self.snapshot.modified.truncate(MAX_CONTEXT_ITEMS);
         self.snapshot.workflow.enforce_bounds();
+        let stale = self.snapshot.workspace_changed
+            || self.snapshot.inspected.iter().any(|file| file.stale);
+        let modified = self.snapshot.modified.clone();
+        self.snapshot.workflow.sync_director(&modified, stale);
     }
 }
 
@@ -1475,14 +1555,35 @@ fn mutation_paths(
     paths
 }
 
-fn failure_category(code: &str) -> WorkflowFailureCategory {
+fn failure_category(name: &str, code: &str, result: &ToolResult) -> WorkflowFailureCategory {
+    let output = result.output.as_str().to_ascii_lowercase();
     match code {
+        "patch_conflict" | "context_mismatch" => WorkflowFailureCategory::PatchConflict,
+        "concurrent_modification" if name == "patch" => WorkflowFailureCategory::PatchConflict,
         "insufficient_evidence" | "inspection_required" | "concurrent_modification" => {
             WorkflowFailureCategory::StaleEvidence
         }
         "permission_denied" | "permission_required" => WorkflowFailureCategory::Permission,
         "cancelled" | "timeout" | "process_limit" => WorkflowFailureCategory::Environment,
+        "verification_mismatch" | "verification_scope_mismatch" => {
+            WorkflowFailureCategory::VerificationMismatch
+        }
+        "verification_failed"
+            if output.contains("could not compile")
+                || output.contains("error[")
+                || output.contains("rustc") =>
+        {
+            WorkflowFailureCategory::Compiler
+        }
+        "verification_failed"
+            if output.contains("test failed")
+                || output.contains("assertion")
+                || output.contains("panicked") =>
+        {
+            WorkflowFailureCategory::Test
+        }
         "verification_failed" => WorkflowFailureCategory::Verification,
+        _ if matches!(name, "shell" | "process") => WorkflowFailureCategory::Command,
         _ => WorkflowFailureCategory::Tool,
     }
 }
@@ -1922,12 +2023,19 @@ mod tests {
         assert!(engine.snapshot().inspected[0].stale);
         assert!(engine.snapshot().excerpts.is_empty());
         assert!(engine.snapshot().workspace_changed);
+        assert_eq!(
+            engine.snapshot().workflow.recovery.category,
+            WorkflowFailureCategory::StaleEvidence
+        );
+        assert_eq!(engine.snapshot().workflow.director.phase, aether_core::TurnPhase::Recover);
+        assert_eq!(engine.snapshot().workflow.progress.stale_invalidations, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn workflow_follows_discover_inspect_modify_verify_complete() {
         let mut engine = ContextEngine::new("/workspace", None);
+        engine.set_task("update the source and verify the change");
         let discovered = success(serde_json::json!({
             "paths": ["src/lib.rs"],
             "truncated": false
@@ -1973,6 +2081,7 @@ mod tests {
     #[test]
     fn workflow_read_only_completion_and_failed_verification_retry() {
         let mut read_only = ContextEngine::new("/workspace", None);
+        read_only.set_task("inspect the readme");
         let read_input = serde_json::json!({
             "files": [{"path": "README.md", "start_line": 1, "end_line": 1}]
         });
@@ -1988,6 +2097,7 @@ mod tests {
         assert_eq!(read_only.snapshot().workflow.phase, WorkflowPhase::Complete);
 
         let mut coding = ContextEngine::new("/workspace", None);
+        coding.set_task("update the readme and verify the change");
         coding.observe_tool("read", &read_input, &read);
         let write = success(serde_json::json!({"path": "README.md", "hash": "changed"}));
         coding.observe_tool("write", &serde_json::json!({"path": "README.md"}), &write);
@@ -2040,6 +2150,53 @@ mod tests {
     }
 
     #[test]
+    fn patch_conflict_and_environment_failures_choose_bounded_recovery() {
+        let mut patch = ContextEngine::new("/workspace", None);
+        patch.observe_tool(
+            "patch",
+            &serde_json::json!({"files": [{"path": "src/lib.rs"}]}),
+            &ToolResult::failure(
+                ToolCallId::new("patch-conflict").unwrap(),
+                "patch_conflict",
+                "source context changed",
+                true,
+                1024,
+            ),
+        );
+        assert_eq!(
+            patch.snapshot().workflow.unresolved_failures[0].category,
+            WorkflowFailureCategory::PatchConflict
+        );
+        assert_eq!(
+            patch.snapshot().workflow.recovery.action,
+            aether_core::RecoveryAction::RequestNewDecision
+        );
+        assert!(patch.snapshot().modified.is_empty());
+
+        let mut environment = ContextEngine::new("/workspace", None);
+        environment.observe_tool(
+            "shell",
+            &serde_json::json!({"program": "cargo", "args": ["test"]}),
+            &ToolResult::failure(
+                ToolCallId::new("environment-failure").unwrap(),
+                "timeout",
+                "command timed out",
+                true,
+                1024,
+            ),
+        );
+        assert_eq!(
+            environment.snapshot().workflow.unresolved_failures[0].category,
+            WorkflowFailureCategory::Environment
+        );
+        assert_eq!(
+            environment.snapshot().workflow.recovery.action,
+            aether_core::RecoveryAction::RecordBlocker
+        );
+        assert!(environment.snapshot().modified.is_empty());
+    }
+
+    #[test]
     fn workflow_context_is_compact_and_workspace_drift_reopens_discovery() {
         let mut engine = ContextEngine::new("/workspace", None);
         engine.observe_tool(
@@ -2061,6 +2218,7 @@ mod tests {
     #[test]
     fn stale_context_blocks_completion_until_current_observation() {
         let mut engine = ContextEngine::new("/workspace", None);
+        engine.set_task("inspect the source");
         let input = serde_json::json!({
             "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
         });
@@ -2157,6 +2315,12 @@ mod tests {
         assert!(excerpt.start_line <= 12 && excerpt.end_line >= 12);
         assert!(excerpt.text.as_str().contains("line 12"));
         assert!(engine.snapshot().workflow.relevant_files.iter().any(|path| path == "src.rs"));
+        assert_eq!(
+            engine.snapshot().workflow.unresolved_failures[0].category,
+            WorkflowFailureCategory::Compiler
+        );
+        assert_eq!(engine.snapshot().workflow.director.phase, aether_core::TurnPhase::Recover);
+        assert_eq!(engine.snapshot().workflow.progress.diagnostic_hydrations, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2178,6 +2342,8 @@ mod tests {
             &success(serde_json::json!({"path": "src.rs", "hash": hash})),
         );
         assert!(engine.snapshot().excerpts.iter().any(|excerpt| excerpt.path == "src.rs"));
+        assert_eq!(engine.snapshot().workflow.progress.mutation_refreshes, 1);
+        assert_eq!(engine.snapshot().workflow.progress.automatic_evidence_reactions, 1);
         let policy = crate::AutonomousCodingPolicy::new();
         let read = policy.preflight(
             engine.snapshot(),

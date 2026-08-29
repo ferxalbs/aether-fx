@@ -99,6 +99,19 @@ memory.
 
 There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in this bootstrap.
 
+The bounded Turn Director projects observed state into Discover, Understand, Implement, Recover,
+Verify, Review, or Done; it never accepts a model phase claim and does not script the model's
+strategy. A separate in-memory WorkingSet projects the objective, active subgoal, pending
+criteria, changed/user-owned paths, diagnostics, definitions/relationships, mutations, freshness,
+and blockers into a small deterministic view. Full excerpts remain in ContextSnapshot and are
+selected only when needed. Typed failures feed a bounded Recovery Controller: stale evidence is
+invalidated and refreshed, compiler/test and patch failures request a new decision, and
+permission/environment failures remain blockers. The verification director orders targeted checks
+before package or workspace-dependent checks; public Rust module changes in multi-package
+workspaces require the broader dependent check. Completion is a current-revision review over task
+state, evidence, verification, blockers, and user-owned paths, and fails closed when any required
+fact is missing or stale.
+
 Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json` plus `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 5 stores `Started`, committed `TurnSnapshot` records, resumable `Checkpoint` records, and `Finished`. Each turn record contains only bounded metadata, minimized context (paths/hashes/ranges, structured work state, and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the latest committed turn or checkpoint, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
 
 Context bounds (also documented on the constants in `aether-core::context`):

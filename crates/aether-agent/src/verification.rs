@@ -42,6 +42,8 @@ impl PlannedCommand {
 pub struct VerificationPlan {
     pub commands: Vec<PlannedCommand>,
     pub unsupported: bool,
+    /// Whether the change crosses a package boundary and needs a broader dependent check.
+    pub requires_broader: bool,
 }
 
 /// Plan bounded checks ordered from the narrowest affected package to a safe fallback.
@@ -52,6 +54,9 @@ pub fn plan_verification(repo: &RepoMapSnapshot, modified: &[String]) -> Verific
         let Some(manifest) = nearest_manifest(repo, path) else { continue };
         if !supports_path(manifest.kind, &manifest.path, path) {
             continue;
+        }
+        if requires_workspace_scope(repo, manifest, path) {
+            plan.requires_broader = true;
         }
         let root = manifest.path.parent().unwrap_or_else(|| Path::new(""));
         match manifest.kind {
@@ -64,6 +69,38 @@ pub fn plan_verification(repo: &RepoMapSnapshot, modified: &[String]) -> Verific
     if plan.commands.is_empty() {
         plan.unsupported = true;
         push_unique(&mut plan, command("git", &["diff", "--check"], "", "workspace diff"));
+    }
+    if plan.requires_broader {
+        let broad = repo
+            .manifests
+            .iter()
+            .find(|manifest| {
+                manifest.kind == ManifestKind::Cargo && !manifest.workspace_members.is_empty()
+            })
+            .map(|manifest| manifest.path.as_path());
+        if let Some(manifest) = broad {
+            let workspace_change = modified.iter().any(|path| {
+                let path = Path::new(path);
+                path == manifest || path.ends_with("Cargo.lock")
+            });
+            let args = if workspace_change {
+                vec!["test", "--workspace"]
+            } else {
+                vec!["check", "--workspace"]
+            };
+            let broad_command = command("cargo", &args, "", "workspace dependents");
+            if !plan.commands.iter().any(|existing| {
+                existing.display() == broad_command.display() && existing.cwd == broad_command.cwd
+            }) {
+                // Keep the cross-package check even when narrow package planning reaches its
+                // bounded command limit.
+                if plan.commands.len() >= aether_core::MAX_WORKFLOW_VERIFICATIONS {
+                    plan.commands
+                        .truncate(aether_core::MAX_WORKFLOW_VERIFICATIONS.saturating_sub(1));
+                }
+                push_unique(&mut plan, broad_command);
+            }
+        }
     }
     plan.commands.truncate(aether_core::MAX_WORKFLOW_VERIFICATIONS);
     plan
@@ -166,6 +203,30 @@ fn supports_path(kind: ManifestKind, manifest: &Path, path: &Path) -> bool {
     }
 }
 
+fn requires_workspace_scope(
+    repo: &RepoMapSnapshot,
+    manifest: &crate::ManifestInfo,
+    path: &Path,
+) -> bool {
+    if manifest.kind != ManifestKind::Cargo
+        || repo.packages.len() < 2
+        || repo.workspace_members.is_empty()
+    {
+        return false;
+    }
+    let Some(workspace_manifest) = repo.manifests.iter().find(|candidate| {
+        candidate.kind == ManifestKind::Cargo && !candidate.workspace_members.is_empty()
+    }) else {
+        return false;
+    };
+    let workspace_root = workspace_manifest.path.parent().unwrap_or_else(|| Path::new(""));
+    let workspace_file =
+        path == workspace_manifest.path || path == workspace_root.join("Cargo.lock");
+    let public_api = repo.packages.iter().any(|package| package.manifest == manifest.path)
+        && matches!(path.file_name().and_then(|name| name.to_str()), Some("lib.rs" | "mod.rs"));
+    workspace_file || public_api
+}
+
 fn is_test_path(path: &Path) -> bool {
     path.components()
         .any(|part| matches!(part.as_os_str().to_str(), Some("test" | "tests" | "__tests__")))
@@ -214,7 +275,9 @@ fn shell_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ManifestInfo, ManifestStatus, PackageInfo, RepoMapSnapshot};
+    use crate::{
+        ManifestInfo, ManifestStatus, PackageInfo, RepoMap, RepoMapSnapshot, WorkspaceMember,
+    };
     use std::path::PathBuf;
 
     fn repo(kind: ManifestKind, manifest: &str, package: Option<&str>) -> RepoMapSnapshot {
@@ -270,6 +333,43 @@ mod tests {
         assert!(!plan.unsupported);
         assert_eq!(plan.commands[0].display(), "cargo test -p api");
         assert_eq!(plan.commands[1].display(), "cargo check -p api");
+    }
+
+    #[test]
+    fn public_rust_api_changes_add_workspace_dependent_check() {
+        let mut repo = repo(ManifestKind::Cargo, "crates/api/Cargo.toml", Some("api"));
+        repo.manifests.push(ManifestInfo {
+            path: "Cargo.toml".into(),
+            kind: ManifestKind::Cargo,
+            package_name: None,
+            workspace_members: vec!["crates/*".to_owned()],
+            status: ManifestStatus::Parsed,
+            truncated: false,
+        });
+        repo.packages.push(PackageInfo {
+            name: Some("app".to_owned()),
+            root: "crates/app".into(),
+            manifest: "crates/app/Cargo.toml".into(),
+        });
+        repo.workspace_members.push(WorkspaceMember {
+            declared_by: "Cargo.toml".into(),
+            pattern: "crates/*".to_owned(),
+            manifest: Some("crates/api/Cargo.toml".into()),
+        });
+        let plan = plan_verification(&repo, &["crates/api/src/lib.rs".to_owned()]);
+        assert!(plan.requires_broader);
+        assert_eq!(plan.commands.last().unwrap().display(), "cargo check --workspace");
+        assert_eq!(plan.commands.last().unwrap().scope, "workspace dependents");
+    }
+
+    #[test]
+    fn workspace_fixture_public_change_escalates_from_package_to_dependents() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/fixtures/workspace-task");
+        let snapshot = RepoMap::new(&root).snapshot().expect("workspace fixture map");
+        let plan = plan_verification(&snapshot, &["crates/codec/src/lib.rs".to_owned()]);
+        assert!(plan.requires_broader);
+        assert!(plan.commands.iter().any(|command| command.display() == "cargo check --workspace"));
     }
 
     #[test]

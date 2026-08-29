@@ -127,3 +127,25 @@ release build on 2026-08-26 is 5,963,440 bytes. Fresh local `/usr/bin/time -l` p
 configuration error. The 151,784-byte increase is the bounded long-horizon/checkpoint
 implementation; startup and idle RSS remain in the same local range. These are single-host
 diagnostics, not cross-platform or cross-machine guarantees.
+
+Adaptive repository orchestration acceptance run on 2026-08-29 used the release deterministic
+evaluator after adding the Turn Director, bounded WorkingSet, evidence reactions, recovery state,
+scope-aware verification, revision-aware steering, and fail-closed completion review. All 9/9
+regression fixtures passed in both baseline and optimized traces. The optimized trace used
+49/55 model requests, 39/40 executed tool calls, one locally reused observation, 12 automatic
+evidence reactions, 12 mutation-refresh events, 13 process spawns, and 16,339 ms of agent wall
+time. Context input was 39,986/50,138 bytes and total model-visible bytes were 297,187/338,833
+bytes (optimized/baseline); the 40,000-byte context gate passed by 14 bytes. The focused
+capability suite passed 5/5, including checkpoint resume, two recovery cases, one dirty-user
+change case, one stale-observation case, zero corruptions, and zero false completions. It
+recorded 8 automatic evidence reactions, 8 mutation-refresh events, and 8,061 ms of wall time.
+These are deterministic single-host diagnostics, not cross-machine guarantees; the new
+hydration, escalation, and completion-rejection counters remained zero in these release traces
+because those branches are covered by focused unit/evaluator tests rather than this particular
+fixture mix.
+
+The current stripped release `aether` binary is 6,061,872 bytes (5.78 MiB), measured after the
+orchestration changes: +98,432 bytes (+1.65%) versus the 5,963,440-byte post-checkpoint build.
+A direct `/usr/bin/time -l target/release/aether --version` probe reported 7,352,320 bytes peak
+RSS and 0.06 seconds wall time on this host. The binary-size increase is bounded state and
+policy machinery; these figures are local diagnostics, not cross-platform guarantees.

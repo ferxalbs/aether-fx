@@ -12,6 +12,10 @@ pub const MAX_WORKFLOW_FIELD_BYTES: usize = 256;
 pub const MAX_WORKFLOW_VERIFICATIONS: usize = 16;
 /// Maximum structured diagnostics retained for one workflow failure.
 pub const MAX_WORKFLOW_DIAGNOSTICS: usize = 8;
+/// Maximum affected paths retained by recovery state.
+pub const MAX_WORKFLOW_RECOVERY_PATHS: usize = 8;
+/// Maximum completion-gate reasons retained in a bounded review.
+pub const MAX_COMPLETION_REVIEW_REASONS: usize = 8;
 
 /// Stable category for a failure that may require a changed hypothesis or action.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -19,7 +23,17 @@ pub const MAX_WORKFLOW_DIAGNOSTICS: usize = 8;
 pub enum WorkflowFailureCategory {
     #[default]
     Tool,
+    /// A compiler emitted a structured diagnostic that can guide repair.
+    Compiler,
+    /// A test or assertion failure needs a changed implementation hypothesis.
+    Test,
+    /// A patch could not be applied to its exact source context.
+    PatchConflict,
+    /// A direct command failed without being a verification result.
+    Command,
     Verification,
+    /// Verification completed but did not cover the required current scope.
+    VerificationMismatch,
     StaleEvidence,
     Permission,
     Environment,
@@ -30,11 +44,178 @@ impl WorkflowFailureCategory {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tool => "tool",
+            Self::Compiler => "compiler",
+            Self::Test => "test",
+            Self::PatchConflict => "patch_conflict",
+            Self::Command => "command",
             Self::Verification => "verification",
+            Self::VerificationMismatch => "verification_mismatch",
             Self::StaleEvidence => "stale_evidence",
             Self::Permission => "permission",
             Self::Environment => "environment",
             Self::Backend => "backend",
+        }
+    }
+}
+
+/// Deterministic action the runtime can take after observing a failure.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    /// Refresh only the affected repository evidence before the next decision.
+    RefreshEvidence,
+    /// Retry an unchanged read-only observation when its preconditions remain valid.
+    RetryEquivalent,
+    /// Require a new model decision because the previous action is no longer safe.
+    RequestNewDecision,
+    /// Keep the failure as a blocker instead of guessing a repair.
+    RecordBlocker,
+    #[default]
+    NoAction,
+}
+
+impl RecoveryAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RefreshEvidence => "refresh_evidence",
+            Self::RetryEquivalent => "retry_equivalent",
+            Self::RequestNewDecision => "request_new_decision",
+            Self::RecordBlocker => "record_blocker",
+            Self::NoAction => "no_action",
+        }
+    }
+}
+
+/// Bounded recovery bookkeeping owned by the runtime, not a second agent.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryState {
+    pub active: bool,
+    pub category: WorkflowFailureCategory,
+    pub action: RecoveryAction,
+    pub attempts: u16,
+    pub revision: u32,
+    pub affected_paths: Vec<BoundedText>,
+}
+
+impl RecoveryState {
+    pub fn begin(
+        &mut self,
+        category: WorkflowFailureCategory,
+        action: RecoveryAction,
+        revision: u32,
+        affected_paths: &[String],
+    ) {
+        self.active = true;
+        self.category = category;
+        self.action = action;
+        self.attempts = self.attempts.saturating_add(1);
+        self.revision = revision;
+        self.affected_paths = affected_paths
+            .iter()
+            .take(MAX_WORKFLOW_RECOVERY_PATHS)
+            .map(|path| BoundedText::new(path, MAX_WORKFLOW_FIELD_BYTES))
+            .filter(|path| !path.as_str().is_empty() && !path.is_truncated())
+            .collect();
+    }
+
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.action = RecoveryAction::NoAction;
+        self.affected_paths.clear();
+    }
+
+    pub fn enforce_bounds(&mut self) {
+        self.affected_paths.truncate(MAX_WORKFLOW_RECOVERY_PATHS);
+        for path in &mut self.affected_paths {
+            *path = BoundedText::new(path.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+        }
+        self.affected_paths.retain(|path| !path.as_str().is_empty() && !path.is_truncated());
+    }
+}
+
+/// Operational phase used to select evidence, recovery, verification, and completion behavior.
+/// The legacy `WorkflowPhase` remains in the persisted contract for compatibility; this richer
+/// director state is the runtime's authoritative phase model.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    #[default]
+    Discover,
+    Understand,
+    Implement,
+    Recover,
+    Verify,
+    Review,
+    Done,
+}
+
+impl TurnPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discover => "discover",
+            Self::Understand => "understand",
+            Self::Implement => "implement",
+            Self::Recover => "recover",
+            Self::Verify => "verify",
+            Self::Review => "review",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// Minimal durable state for the bounded turn director.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TurnDirectorState {
+    pub phase: TurnPhase,
+    pub revision: u32,
+    pub transitions: u16,
+    pub last_reason: BoundedText,
+}
+
+impl TurnDirectorState {
+    fn transition(&mut self, phase: TurnPhase, revision: u32, reason: &str) {
+        if self.phase != phase || self.revision != revision {
+            self.transitions = self.transitions.saturating_add(1);
+        }
+        self.phase = phase;
+        self.revision = revision;
+        self.last_reason = BoundedText::new(reason, MAX_WORKFLOW_FIELD_BYTES);
+    }
+
+    pub fn enforce_bounds(&mut self) {
+        self.last_reason = BoundedText::new(self.last_reason.as_str(), MAX_WORKFLOW_FIELD_BYTES);
+    }
+}
+
+/// Bounded current-revision evidence used by the completion gate.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompletionReview {
+    pub objective_present: bool,
+    pub acceptance_criteria_satisfied: bool,
+    pub work_complete: bool,
+    pub blockers_clear: bool,
+    pub evidence_current: bool,
+    pub verification_current: bool,
+    pub user_changes_preserved: bool,
+    pub workspace_revision: u32,
+    pub task_revision: u32,
+    pub reasons: Vec<BoundedText>,
+}
+
+impl CompletionReview {
+    pub fn ready(&self) -> bool {
+        self.objective_present
+            && self.acceptance_criteria_satisfied
+            && self.work_complete
+            && self.blockers_clear
+            && self.evidence_current
+            && self.verification_current
+            && self.user_changes_preserved
+    }
+
+    fn add_reason(&mut self, reason: &str) {
+        if self.reasons.len() < MAX_COMPLETION_REVIEW_REASONS {
+            self.reasons.push(BoundedText::new(reason, MAX_WORKFLOW_FIELD_BYTES));
         }
     }
 }
@@ -164,6 +345,24 @@ pub struct WorkflowProgress {
     pub verifications: u16,
     /// Tool results folded into the workflow.
     pub tool_results: u16,
+    /// Deterministic reactions that updated the active working set.
+    #[serde(default)]
+    pub automatic_evidence_reactions: u16,
+    /// Bounded source windows hydrated from structured diagnostics.
+    #[serde(default)]
+    pub diagnostic_hydrations: u16,
+    /// Changed regions refreshed after successful mutations.
+    #[serde(default)]
+    pub mutation_refreshes: u16,
+    /// Inspected observations invalidated by live workspace drift.
+    #[serde(default)]
+    pub stale_invalidations: u16,
+    /// Verification plans that contain a broader escalation after targeted checks.
+    #[serde(default)]
+    pub verification_escalations: u16,
+    /// Completion attempts rejected by the deterministic review gate.
+    #[serde(default)]
+    pub completion_rejections: u16,
 }
 
 impl WorkflowProgress {
@@ -189,6 +388,30 @@ impl WorkflowProgress {
 
     pub fn note_tool_result(&mut self) {
         Self::increment(&mut self.tool_results);
+    }
+
+    pub fn note_automatic_evidence_reaction(&mut self) {
+        Self::increment(&mut self.automatic_evidence_reactions);
+    }
+
+    pub fn note_diagnostic_hydration(&mut self) {
+        Self::increment(&mut self.diagnostic_hydrations);
+    }
+
+    pub fn note_mutation_refresh(&mut self) {
+        Self::increment(&mut self.mutation_refreshes);
+    }
+
+    pub fn note_stale_invalidation(&mut self) {
+        Self::increment(&mut self.stale_invalidations);
+    }
+
+    pub fn note_verification_escalation(&mut self) {
+        Self::increment(&mut self.verification_escalations);
+    }
+
+    pub fn note_completion_rejection(&mut self) {
+        Self::increment(&mut self.completion_rejections);
     }
 }
 
@@ -284,12 +507,124 @@ pub struct WorkflowState {
     /// Unified bounded evidence, candidate, scope, and next-action state.
     #[serde(default)]
     pub decision: DecisionState,
+    /// Runtime-owned recovery state for the latest actionable failure.
+    #[serde(default)]
+    pub recovery: RecoveryState,
+    /// Rich operational phase used by the adaptive turn director.
+    #[serde(default)]
+    pub director: TurnDirectorState,
+    /// Task/constraint revision that completion evidence must match.
+    #[serde(default)]
+    pub task_revision: u32,
+    /// Task revision at which the last completion review succeeded.
+    #[serde(default)]
+    pub completed_task_revision: Option<u32>,
 }
 
 impl WorkflowState {
     /// Return a fresh workflow state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Recompute the operational phase from observed repository state.
+    ///
+    /// This is deliberately a recommendation/state projection, not a scripted workflow. The
+    /// model remains free to choose any safe action; the runtime only records which evidence and
+    /// recovery behavior is currently appropriate.
+    pub fn sync_director(&mut self, modified: &[String], stale_evidence: bool) {
+        let (phase, reason) = if self.recovery.active || !self.unresolved_failures.is_empty() {
+            (TurnPhase::Recover, "an actionable failure needs bounded recovery")
+        } else if self.completed_task_revision == Some(self.task_revision)
+            && self.phase == WorkflowPhase::Complete
+        {
+            (TurnPhase::Done, "current-revision completion review passed")
+        } else if stale_evidence {
+            (TurnPhase::Recover, "observed evidence is stale and must be refreshed")
+        } else if matches!(
+            self.verification,
+            WorkflowVerification::Pending | WorkflowVerification::Failed
+        ) {
+            (TurnPhase::Verify, "current mutations require scoped verification")
+        } else if self.phase == WorkflowPhase::Verify && !modified.is_empty() {
+            (TurnPhase::Review, "verification passed; review the affected scope before finishing")
+        } else if self.phase == WorkflowPhase::Modify {
+            (TurnPhase::Implement, "an authorized implementation action is in progress")
+        } else if self.relevant_files.is_empty() {
+            (TurnPhase::Discover, "no relevant repository path has been observed")
+        } else {
+            (TurnPhase::Understand, "relevant repository evidence is the next decision input")
+        };
+        self.director.transition(phase, self.workspace_revision, reason);
+    }
+
+    /// Return the bounded, deterministic evidence used by the completion gate.
+    pub fn completion_review(
+        &self,
+        modified: &[String],
+        evidence_current: bool,
+        user_changes_preserved: bool,
+    ) -> CompletionReview {
+        let verification_required = !modified.is_empty()
+            || matches!(
+                self.verification,
+                WorkflowVerification::Pending | WorkflowVerification::Failed
+            );
+        let mut review = CompletionReview {
+            objective_present: !self.work.objective.as_str().is_empty(),
+            acceptance_criteria_satisfied: self.work.criteria_satisfied(),
+            work_complete: !self.work.blocks_completion(),
+            blockers_clear: self.unresolved_failures.is_empty() && self.work.blockers.is_empty(),
+            evidence_current,
+            verification_current: self.verification_steps.iter().filter(|step| step.required).all(
+                |step| {
+                    step.revision == self.workspace_revision
+                        && step.status == VerificationStatus::Passed
+                },
+            ) && self
+                .work
+                .verifications
+                .iter()
+                .filter(|verification| verification.revision == self.workspace_revision)
+                .all(|verification| verification.status == VerificationStatus::Passed)
+                && (!verification_required || self.verification == WorkflowVerification::Passed),
+            user_changes_preserved,
+            workspace_revision: self.workspace_revision,
+            task_revision: self.task_revision,
+            reasons: Vec::new(),
+        };
+        if !review.objective_present {
+            review.add_reason("objective is missing from the current task state");
+        }
+        if !review.acceptance_criteria_satisfied {
+            review.add_reason("one or more acceptance criteria remain unsatisfied");
+        }
+        if !review.work_complete {
+            review.add_reason("structured work contains unresolved subgoals or blockers");
+        }
+        if !review.blockers_clear {
+            review.add_reason("unresolved runtime blockers remain");
+        }
+        if !review.evidence_current {
+            review.add_reason("required repository evidence is stale");
+        }
+        if !review.verification_current {
+            review.add_reason(
+                "verification is missing, failed, stale, or scoped to an older revision",
+            );
+        }
+        if !review.user_changes_preserved {
+            review.add_reason("agent-owned paths overlap user-owned dirty paths");
+        }
+        review
+    }
+
+    /// Clear a recovery state after a fresh targeted observation has restored its preconditions.
+    pub fn clear_recovery(&mut self) {
+        self.recovery.clear();
+        if self.unresolved_failures.is_empty() {
+            self.sync_director(&[], false);
+        }
     }
 
     /// Record one repository-derived relevant path and enter inspection when discovering.
@@ -333,6 +668,7 @@ impl WorkflowState {
         if matches!(self.phase, WorkflowPhase::Discover | WorkflowPhase::Complete) {
             self.phase = WorkflowPhase::Inspect;
         }
+        self.sync_director(&[], false);
     }
 
     /// Record a successful targeted repository inspection.
@@ -360,6 +696,7 @@ impl WorkflowState {
         if !matches!(self.phase, WorkflowPhase::Verify) {
             self.phase = WorkflowPhase::Inspect;
         }
+        self.sync_director(&[], false);
     }
 
     /// Record a mutation attempt before execution.
@@ -367,6 +704,7 @@ impl WorkflowState {
         if !matches!(self.phase, WorkflowPhase::Verify) {
             self.phase = WorkflowPhase::Modify;
         }
+        self.sync_director(&[], false);
     }
 
     /// Record a successful mutation and require focused verification.
@@ -383,8 +721,10 @@ impl WorkflowState {
         }
         self.phase = WorkflowPhase::Verify;
         self.verification = WorkflowVerification::Pending;
+        self.completed_task_revision = None;
         self.decision.progress_confidence = self.decision.progress_confidence.min(80);
         self.work.record_mutation(operation, paths, self.workspace_revision);
+        self.sync_director(paths, false);
     }
 
     /// Add deterministic planning output, deduplicated within the current revision.
@@ -430,6 +770,7 @@ impl WorkflowState {
             WorkflowVerification::Failed
         };
         self.phase = WorkflowPhase::Verify;
+        self.sync_director(&[], false);
         true
     }
 
@@ -465,6 +806,7 @@ impl WorkflowState {
                 .collect::<Vec<_>>(),
             affected_paths,
         );
+        self.sync_director(affected_paths, false);
     }
 
     /// Retain verification evidence without changing the aggregate verification gate. This is
@@ -487,10 +829,18 @@ impl WorkflowState {
                 .collect::<Vec<_>>(),
             affected_paths,
         );
+        self.sync_director(affected_paths, false);
     }
 
     /// Fold a bounded failure into the retryable failure set.
     pub fn record_failure(&mut self, failure: WorkflowFailure) {
+        let category = failure.category;
+        let revision = failure.revision;
+        let affected_paths = failure
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.path.as_str().to_owned())
+            .collect::<Vec<_>>();
         if let Some(existing) =
             self.unresolved_failures.iter_mut().find(|existing| existing.key == failure.key)
         {
@@ -538,6 +888,22 @@ impl WorkflowState {
         if self.phase == WorkflowPhase::Complete {
             self.phase = self.phase_when_incomplete();
         }
+        let action = match category {
+            WorkflowFailureCategory::StaleEvidence => RecoveryAction::RefreshEvidence,
+            WorkflowFailureCategory::Permission | WorkflowFailureCategory::Environment => {
+                RecoveryAction::RecordBlocker
+            }
+            WorkflowFailureCategory::PatchConflict
+            | WorkflowFailureCategory::Compiler
+            | WorkflowFailureCategory::Test
+            | WorkflowFailureCategory::Verification
+            | WorkflowFailureCategory::VerificationMismatch
+            | WorkflowFailureCategory::Command
+            | WorkflowFailureCategory::Tool
+            | WorkflowFailureCategory::Backend => RecoveryAction::RequestNewDecision,
+        };
+        self.recovery.begin(category, action, revision, &affected_paths);
+        self.sync_director(&[], false);
     }
 
     /// Clear the failure associated with a successful retry.
@@ -545,10 +911,15 @@ impl WorkflowState {
         self.unresolved_failures.retain(|failure| failure.key.as_str() != key);
         self.work.clear_blocker(key);
         self.decision.clear_question(&format!("failure:{key}"));
+        if self.unresolved_failures.is_empty() {
+            self.recovery.clear();
+        }
+        self.sync_director(&[], false);
     }
 
     /// Reset stale discovery and verification state after workspace drift.
     pub fn reset_for_workspace_change(&mut self) {
+        let affected_paths = self.relevant_files.clone();
         self.phase = WorkflowPhase::Discover;
         self.relevant_files.clear();
         self.verification = WorkflowVerification::NotRequired;
@@ -557,30 +928,50 @@ impl WorkflowState {
         }
         self.decision.reset_for_workspace_change();
         self.work.invalidate_for_workspace_change(self.workspace_revision);
+        self.recovery.begin(
+            WorkflowFailureCategory::StaleEvidence,
+            RecoveryAction::RefreshEvidence,
+            self.workspace_revision,
+            &affected_paths,
+        );
+        self.sync_director(&[], true);
     }
 
     /// Mark the workflow complete only when all bounded completion criteria hold.
     pub fn complete_if_ready(&mut self, modified: &[String]) -> bool {
-        let verification_required = !modified.is_empty()
-            || matches!(
-                self.verification,
-                WorkflowVerification::Pending | WorkflowVerification::Failed
-            );
+        self.complete_if_ready_with_evidence(modified, true, true)
+    }
+
+    /// Run the bounded current-revision completion review with live context facts.
+    pub fn complete_if_ready_with_evidence(
+        &mut self,
+        modified: &[String],
+        evidence_current: bool,
+        user_changes_preserved: bool,
+    ) -> bool {
+        self.director.transition(
+            TurnPhase::Review,
+            self.workspace_revision,
+            "runtime completion review is evaluating current evidence",
+        );
         let ready = !self.relevant_files.is_empty()
             && (!modified.is_empty() || self.progress.inspections > 0)
-            && self.unresolved_failures.is_empty()
-            && self
-                .verification_steps
-                .iter()
-                .filter(|step| step.required && step.revision == self.workspace_revision)
-                .all(|step| step.status == VerificationStatus::Passed)
-            && self.work.criteria_satisfied()
-            && !self.work.blocks_completion()
-            && (!verification_required || self.verification == WorkflowVerification::Passed);
+            && self.completion_review(modified, evidence_current, user_changes_preserved).ready();
         if ready {
             self.phase = WorkflowPhase::Complete;
+            self.completed_task_revision = Some(self.task_revision);
+            self.director.transition(
+                TurnPhase::Done,
+                self.workspace_revision,
+                "current-revision completion review passed",
+            );
         } else if self.phase == WorkflowPhase::Complete {
             self.phase = self.phase_when_incomplete();
+            self.completed_task_revision = None;
+            self.sync_director(modified, !evidence_current);
+        }
+        if !ready {
+            self.progress.note_completion_rejection();
         }
         ready
     }
@@ -633,6 +1024,9 @@ impl WorkflowState {
         }
         self.decision.enforce_bounds();
         self.work.enforce_bounds();
+        self.recovery.enforce_bounds();
+        self.director.enforce_bounds();
+        self.task_revision = self.task_revision.max(self.work.task_revision);
     }
 }
 
@@ -643,6 +1037,7 @@ mod tests {
     #[test]
     fn workflow_transitions_and_completion_are_deterministic() {
         let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("update the library");
         state.record_relevant_file("src/lib.rs");
         assert_eq!(state.phase, WorkflowPhase::Inspect);
         state.record_inspection();
@@ -675,6 +1070,7 @@ mod tests {
     #[test]
     fn pending_verification_and_late_failures_never_complete() {
         let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("update the library");
         state.record_relevant_file("src/lib.rs");
         state.record_inspection();
         assert!(state.complete_if_ready(&[]));
@@ -694,6 +1090,7 @@ mod tests {
     #[test]
     fn discovery_without_inspection_cannot_complete() {
         let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("inspect the library");
         state.record_relevant_file("src/lib.rs");
         assert!(!state.complete_if_ready(&[]));
         state.record_inspection();
@@ -703,6 +1100,7 @@ mod tests {
     #[test]
     fn verification_results_become_stale_after_later_mutation() {
         let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("update the library");
         state.record_relevant_file("src/lib.rs");
         state.record_mutation();
         state.set_verification_plan([VerificationStep::new(
@@ -730,6 +1128,7 @@ mod tests {
     #[test]
     fn all_required_commands_must_pass_before_completion() {
         let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("update the library");
         state.record_relevant_file("src/lib.rs");
         state.record_mutation();
         state.set_verification_plan([
@@ -740,5 +1139,48 @@ mod tests {
         assert!(!state.complete_if_ready(&["src/lib.rs".into()]));
         assert!(state.record_verification_command("cargo check", false));
         assert!(!state.complete_if_ready(&["src/lib.rs".into()]));
+    }
+
+    #[test]
+    fn turn_director_tracks_recovery_review_and_done_from_observations() {
+        let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("repair the library");
+        assert_eq!(state.director.phase, TurnPhase::Discover);
+        state.record_relevant_file("src/lib.rs");
+        assert_eq!(state.director.phase, TurnPhase::Understand);
+        state.record_inspection();
+        state.begin_modification();
+        assert_eq!(state.director.phase, TurnPhase::Implement);
+        state.record_mutation_scope("write", &["src/lib.rs".to_owned()]);
+        assert_eq!(state.director.phase, TurnPhase::Verify);
+        state.record_failure(WorkflowFailure::new_at_revision(
+            "verify",
+            "shell",
+            "verification_failed",
+            "test failed",
+            WorkflowFailureCategory::Test,
+            state.workspace_revision,
+            Vec::new(),
+        ));
+        assert_eq!(state.director.phase, TurnPhase::Recover);
+        assert_eq!(state.recovery.action, RecoveryAction::RequestNewDecision);
+        state.clear_failure("verify");
+        state.record_verification(true);
+        assert!(state.complete_if_ready(&["src/lib.rs".to_owned()]));
+        assert_eq!(state.director.phase, TurnPhase::Done);
+    }
+
+    #[test]
+    fn completion_review_fails_closed_for_stale_revision_and_user_overlap() {
+        let mut state = WorkflowState::new();
+        state.record_relevant_file("src/lib.rs");
+        state.record_inspection();
+        assert!(!state.completion_review(&[], false, true).ready());
+        assert!(!state.completion_review(&[], true, false).ready());
+        let review = state.completion_review(&[], true, true);
+        assert!(!review.objective_present);
+        assert!(review.reasons.iter().any(|reason| reason.as_str().contains("objective")));
+        assert!(!state.complete_if_ready_with_evidence(&[], true, false));
+        assert_eq!(state.director.phase, TurnPhase::Review);
     }
 }

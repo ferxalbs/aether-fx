@@ -64,8 +64,10 @@ pub use work::{
     WorkState, WorkStatus, WorkSubgoal, WorkVerification,
 };
 pub use workflow::{
-    MAX_WORKFLOW_DIAGNOSTICS, MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES,
-    MAX_WORKFLOW_RELEVANT_FILES, MAX_WORKFLOW_VERIFICATIONS, VerificationStatus, VerificationStep,
-    WorkflowDiagnostic, WorkflowFailure, WorkflowFailureCategory, WorkflowPhase, WorkflowProgress,
-    WorkflowState, WorkflowVerification,
+    CompletionReview, MAX_COMPLETION_REVIEW_REASONS, MAX_WORKFLOW_DIAGNOSTICS,
+    MAX_WORKFLOW_FAILURES, MAX_WORKFLOW_FIELD_BYTES, MAX_WORKFLOW_RECOVERY_PATHS,
+    MAX_WORKFLOW_RELEVANT_FILES, MAX_WORKFLOW_VERIFICATIONS, RecoveryAction, RecoveryState,
+    TurnDirectorState, TurnPhase, VerificationStatus, VerificationStep, WorkflowDiagnostic,
+    WorkflowFailure, WorkflowFailureCategory, WorkflowPhase, WorkflowProgress, WorkflowState,
+    WorkflowVerification,
 };

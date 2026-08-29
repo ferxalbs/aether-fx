@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-29 (1) - Adaptive repository orchestration
+
+### Added
+
+- Added a bounded seven-phase Turn Director, operational WorkingSet projection, typed Recovery
+  Controller state, current task revisions, and fail-closed completion review.
+- Added scope-aware verification escalation for public Rust changes in multi-package workspaces,
+  including required dependent checks after targeted/package verification.
+- Added deterministic orchestration coverage and before/after metrics for evidence reactions,
+  diagnostic hydration, mutation refresh, stale invalidation, verification escalation, and
+  completion rejection.
+
+### Changed
+
+- User steering can update bounded task constraints without discarding still-valid repository
+  evidence; changed task revisions invalidate incompatible completion and verification claims.
+- Compiler/test failures, patch conflicts, stale evidence, environment failures, and permission
+  failures now select distinct bounded recovery behavior while preserving model-owned repair
+  decisions.
+
+### Security
+
+- Completion requires current task, evidence, verification, blocker, and user-ownership facts;
+  stale or missing state cannot authorize a mutation result or Done state.
+
 ## Unreleased - 2026-08-28 (1) - Evidence-driven coding loop hardening
 
 ### Added

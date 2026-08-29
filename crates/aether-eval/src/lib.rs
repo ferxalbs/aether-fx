@@ -90,6 +90,13 @@ pub struct ExecutionMetrics {
     pub recovery_attempts: u32,
     pub recovery_successes: u32,
     pub stale_evidence_violations: u32,
+    pub reused_observations: u32,
+    pub automatic_evidence_reactions: u32,
+    pub diagnostic_hydration_events: u32,
+    pub mutation_refresh_events: u32,
+    pub stale_evidence_invalidations: u32,
+    pub verification_escalations: u32,
+    pub completion_rejections: u32,
     pub unresolved_work_at_finish: u32,
     pub process_spawns: u32,
     pub wall_time_ms: u64,
@@ -157,6 +164,13 @@ pub struct TaskResult {
     pub recovery_attempts: u32,
     pub recovery_successes: u32,
     pub stale_evidence_violations: u32,
+    pub reused_observations: u32,
+    pub automatic_evidence_reactions: u32,
+    pub diagnostic_hydration_events: u32,
+    pub mutation_refresh_events: u32,
+    pub stale_evidence_invalidations: u32,
+    pub verification_escalations: u32,
+    pub completion_rejections: u32,
     pub unresolved_work_at_finish: u32,
     pub process_spawns: u32,
     pub agent_wall_time_ms: u64,
@@ -197,6 +211,13 @@ pub struct CapabilityTaskResult {
     pub wall_time_ms: u64,
     pub verification_attempts: u32,
     pub verification_failures: u32,
+    pub reused_observations: u32,
+    pub automatic_evidence_reactions: u32,
+    pub diagnostic_hydration_events: u32,
+    pub mutation_refresh_events: u32,
+    pub stale_evidence_invalidations: u32,
+    pub verification_escalations: u32,
+    pub completion_rejections: u32,
     pub unresolved_work_at_finish: u32,
     pub failure: Option<String>,
 }
@@ -227,6 +248,13 @@ pub struct CapabilityAggregate {
     pub wall_time_ms: u64,
     pub verification_attempts: u32,
     pub verification_failures: u32,
+    pub reused_observations: u32,
+    pub automatic_evidence_reactions: u32,
+    pub diagnostic_hydration_events: u32,
+    pub mutation_refresh_events: u32,
+    pub stale_evidence_invalidations: u32,
+    pub verification_escalations: u32,
+    pub completion_rejections: u32,
     pub unresolved_work_at_finish: u32,
 }
 
@@ -269,6 +297,13 @@ pub struct AggregateMetrics {
     pub recovery_attempts: u32,
     pub recovery_successes: u32,
     pub stale_evidence_violations: u32,
+    pub reused_observations: u32,
+    pub automatic_evidence_reactions: u32,
+    pub diagnostic_hydration_events: u32,
+    pub mutation_refresh_events: u32,
+    pub stale_evidence_invalidations: u32,
+    pub verification_escalations: u32,
+    pub completion_rejections: u32,
     pub unresolved_work_at_finish: u32,
     pub process_spawns: u32,
     pub agent_wall_time_ms: u64,
@@ -296,7 +331,6 @@ pub struct AggregateMetrics {
     pub planner_aborted_ambiguity: u32,
     pub planner_actions: u32,
     pub planner_bytes_read: u64,
-    pub reused_observations: u32,
     pub trajectory_patterns: Vec<TrajectoryPattern>,
 }
 
@@ -479,6 +513,22 @@ pub fn run_capability_suite(output: Option<&Path>) -> Result<CapabilitySuiteResu
         wall_time_ms: tasks.iter().map(|task| task.wall_time_ms).sum(),
         verification_attempts: tasks.iter().map(|task| task.verification_attempts).sum(),
         verification_failures: tasks.iter().map(|task| task.verification_failures).sum(),
+        reused_observations: tasks.iter().map(|task| task.reused_observations).sum(),
+        automatic_evidence_reactions: tasks
+            .iter()
+            .map(|task| task.automatic_evidence_reactions)
+            .sum(),
+        diagnostic_hydration_events: tasks
+            .iter()
+            .map(|task| task.diagnostic_hydration_events)
+            .sum(),
+        mutation_refresh_events: tasks.iter().map(|task| task.mutation_refresh_events).sum(),
+        stale_evidence_invalidations: tasks
+            .iter()
+            .map(|task| task.stale_evidence_invalidations)
+            .sum(),
+        verification_escalations: tasks.iter().map(|task| task.verification_escalations).sum(),
+        completion_rejections: tasks.iter().map(|task| task.completion_rejections).sum(),
         unresolved_work_at_finish: tasks.iter().map(|task| task.unresolved_work_at_finish).sum(),
     };
     let success = aggregate.succeeded > aggregate.baseline_succeeded
@@ -509,7 +559,7 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
     for task in &suite.tasks {
         let mark = if task.resumed_success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} baseline={} checkpoint={} work={} recovery={} user_change={} verify={}/{} stale={} unresolved={}\n",
+            "{mark:4} {:28} baseline={} checkpoint={} work={} recovery={} user_change={} verify={}/{} stale={} auto={} hydrate={} refresh={} escalate={} reject={} unresolved={}\n",
             task.task_id,
             task.baseline_success,
             task.checkpoint_captured,
@@ -519,11 +569,16 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
             task.verification_attempts,
             task.verification_failures,
             task.stale_evidence_violations,
+            task.automatic_evidence_reactions,
+            task.diagnostic_hydration_events,
+            task.mutation_refresh_events,
+            task.verification_escalations,
+            task.completion_rejections,
             task.unresolved_work_at_finish,
         ));
     }
     output.push_str(&format!(
-        "capability: {}/{} ({:.0}%) success_at_1={} baseline={}/{} ({:.0}%) newly_solved={} checkpoint_resume={} recovery={} user_change={}/{} corruptions={} false_completion={} stale={} unresolved={} requests={} tools={} context={}B shown={}B wall={}ms\n",
+        "capability: {}/{} ({:.0}%) success_at_1={} baseline={}/{} ({:.0}%) newly_solved={} checkpoint_resume={} recovery={} user_change={}/{} corruptions={} false_completion={} stale={} auto={} hydrate={} refresh={} escalate={} reject={} unresolved={} requests={} tools={} context={}B shown={}B wall={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
@@ -539,6 +594,11 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
         suite.aggregate.user_change_corruptions,
         suite.aggregate.false_completion_count,
         suite.aggregate.stale_evidence_violations,
+        suite.aggregate.automatic_evidence_reactions,
+        suite.aggregate.diagnostic_hydration_events,
+        suite.aggregate.mutation_refresh_events,
+        suite.aggregate.verification_escalations,
+        suite.aggregate.completion_rejections,
         suite.aggregate.unresolved_work_at_finish,
         suite.aggregate.model_requests,
         suite.aggregate.tool_executions,
@@ -570,7 +630,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
     for result in &suite.tasks {
         let mark = if result.success { "PASS" } else { "FAIL" };
         output.push_str(&format!(
-            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} quality={} read={}B reuse={} patterns={}\n",
+            "{mark:4} {:28} steps={:2} tools={:2}/{:2} before={} verify={} scope={} quality={} read={}B reuse={} auto={} hydrate={} refresh={} stale={} escalate={} reject={} patterns={}\n",
             result.task_id,
             result.model_steps,
             result.executed_tool_calls,
@@ -581,11 +641,17 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
             result.verification_quality,
             result.bytes_read,
             result.after.trajectory.reused_observations,
+            result.after.automatic_evidence_reactions,
+            result.after.diagnostic_hydration_events,
+            result.after.mutation_refresh_events,
+            result.after.stale_evidence_invalidations,
+            result.after.verification_escalations,
+            result.after.completion_rejections,
             result.before.trajectory.patterns.len()
         ));
     }
     output.push_str(&format!(
-        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) requests={}/{} steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} reuse={} context={}B/{}B shown={}B/{}B schema={}B result={}B policy={}B protocol={}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B spawns={} wall={}ms local={}ms overhead={}ms\n",
+        "total: {}/{} ({:.0}%) baseline={}/{} ({:.0}%) requests={}/{} steps={}/{} tools={}/{} baseline_tools={}/{} redundant={} reuse={} auto={} hydrate={} refresh={} stale={} escalate={} reject={} context={}B/{}B shown={}B/{}B schema={}B result={}B policy={}B protocol={}B planner={}/{} ({:.0}%) ambiguous={} actions={} read={}B spawns={} wall={}ms local={}ms overhead={}ms\n",
         suite.aggregate.succeeded,
         suite.aggregate.tasks,
         suite.aggregate.success_rate * 100.0,
@@ -602,6 +668,12 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         suite.aggregate.baseline_executed_tool_calls,
         suite.aggregate.prevented_redundant_calls,
         suite.aggregate.reused_observations,
+        suite.aggregate.automatic_evidence_reactions,
+        suite.aggregate.diagnostic_hydration_events,
+        suite.aggregate.mutation_refresh_events,
+        suite.aggregate.stale_evidence_invalidations,
+        suite.aggregate.verification_escalations,
+        suite.aggregate.completion_rejections,
         suite.aggregate.context_bytes,
         suite.aggregate.baseline_context_bytes,
         suite.aggregate.bytes_shown_to_model,
@@ -701,6 +773,31 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .iter()
             .map(|result| result.after.stale_evidence_violations)
             .sum(),
+        reused_observations: results.iter().map(|result| result.after.reused_observations).sum(),
+        automatic_evidence_reactions: results
+            .iter()
+            .map(|result| result.after.automatic_evidence_reactions)
+            .sum(),
+        diagnostic_hydration_events: results
+            .iter()
+            .map(|result| result.after.diagnostic_hydration_events)
+            .sum(),
+        mutation_refresh_events: results
+            .iter()
+            .map(|result| result.after.mutation_refresh_events)
+            .sum(),
+        stale_evidence_invalidations: results
+            .iter()
+            .map(|result| result.after.stale_evidence_invalidations)
+            .sum(),
+        verification_escalations: results
+            .iter()
+            .map(|result| result.after.verification_escalations)
+            .sum(),
+        completion_rejections: results
+            .iter()
+            .map(|result| result.after.completion_rejections)
+            .sum(),
         unresolved_work_at_finish: results
             .iter()
             .map(|result| result.after.unresolved_work_at_finish)
@@ -752,10 +849,6 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .sum(),
         planner_actions: results.iter().map(|result| result.after.planner_actions).sum(),
         planner_bytes_read: results.iter().map(|result| result.after.planner_bytes_read).sum(),
-        reused_observations: results
-            .iter()
-            .map(|result| result.after.trajectory.reused_observations)
-            .sum(),
         trajectory_patterns: merge_trajectory_patterns(
             results.iter().map(|result| &result.before.trajectory),
         ),
@@ -1170,5 +1263,18 @@ mod tests {
             .preflight(ToolCallId::new("eval-circuit").unwrap(), "read", &input, 0)
             .expect("repeated no-progress action is bounded");
         assert_eq!(repeated.error.unwrap().code.as_str(), "repeated_failure");
+    }
+
+    #[test]
+    fn capability_cases_exercise_runtime_recovery_and_bounded_reuse() {
+        let suite = run_capability_suite(None).expect("capability suite runs offline");
+        assert_eq!(suite.aggregate.succeeded, suite.aggregate.tasks);
+        assert_eq!(suite.aggregate.checkpoint_resume_successes, suite.aggregate.tasks);
+        assert!(suite.aggregate.recovery_successes >= 2);
+        assert!(suite.aggregate.user_change_tests > 0);
+        assert_eq!(suite.aggregate.user_change_corruptions, 0);
+        assert!(suite.aggregate.automatic_evidence_reactions > 0);
+        assert!(suite.aggregate.mutation_refresh_events > 0);
+        assert_eq!(suite.aggregate.false_completion_count, 0);
     }
 }

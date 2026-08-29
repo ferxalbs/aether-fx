@@ -19,6 +19,7 @@ mod session_fs;
 mod state;
 mod symbol_index;
 mod verification;
+mod working_set;
 
 pub use aether_core::{CommandClass, CommandEffects};
 pub use agent::{Agent, AgentError, AgentMetrics, AgentRequest, AgentRunResult};
@@ -70,4 +71,8 @@ pub use symbol_index::{
 pub use verification::{
     CommandIntent, PlannedCommand, VerificationPlan, classify_command, command_effects,
     plan_verification,
+};
+pub use working_set::{
+    MAX_WORKING_SET_BLOCKERS, MAX_WORKING_SET_ITEMS, MAX_WORKING_SET_RENDER_BYTES, WorkingSet,
+    WorkingSetItem, WorkingSetRole,
 };

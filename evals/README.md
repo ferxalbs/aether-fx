@@ -53,11 +53,22 @@ a live content-hash recheck; stale or partial evidence falls back to the real to
 updates are capped separately from the full context packet so the optimization does not trade
 fewer tool/model turns for unbounded prompt growth.
 
+The focused orchestration coverage is split between the real capability replay and deterministic
+component tests. It covers compiler diagnostics with automatic source hydration, post-mutation
+changed-region refresh, external stale evidence, patch-conflict and environment taxonomy,
+multi-file WorkingSet ranking, nested scoped-instruction precedence, targeted-to-package
+verification ordering, public/workspace-dependent verification escalation, fail-closed completion
+for stale verification and unsatisfied work, dirty user-owned path preservation, checkpoint
+resume, and task-revision invalidation. The capability replay runs against copied fixture
+repositories; the component cases assert bounded runtime state and do not mock successful
+completion.
+
 JSON output includes per-task correctness, model requests, tokens when the provider reports them,
 requested and executed calls, prevented/reused observations, bytes read, bytes shown to the model,
 context bytes, static-prefix/tool-schema/context/tool-result/policy-feedback/protocol byte
-categories, process spawns, verification attempts, wall/provider/local time, and platform probes
-for RSS and allocations. Each task also contains a bounded trajectory report that classifies
+categories, process spawns, automatic evidence reactions, diagnostic hydration, stale invalidations,
+verification escalation, completion rejections, verification attempts, wall/provider/local time,
+and platform probes for RSS and allocations. Each task also contains a bounded trajectory report that classifies
 repeated observations, search-to-read chains, verification recovery, and mutation-before-
 inspection candidates. The aggregate report merges those pattern counts for the baseline traces.
 The `relationship-heavy-exploration` scenario requires repeated search-to-read navigation in

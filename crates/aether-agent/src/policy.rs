@@ -388,6 +388,19 @@ impl AutonomousCodingPolicy {
             ));
             return ranked;
         }
+        if workflow.director.phase == aether_core::TurnPhase::Recover {
+            let target = workflow.recovery.affected_paths.first().map(|path| path.as_str());
+            ranked.push(RankedAction {
+                action: DecisionAction::Escalate,
+                score: 102,
+                target: target.map(str::to_owned),
+                reason: format!(
+                    "recover from {} with {} before attempting another mutation",
+                    workflow.recovery.category.as_str(),
+                    workflow.recovery.action.as_str()
+                ),
+            });
+        }
         if decision.low_value_observations >= 3 {
             ranked.push(action(
                 DecisionAction::Escalate,
@@ -724,7 +737,9 @@ impl AutonomousCodingPolicy {
             )
         });
         format!(
-            "decision: action={} target={} confidence={} candidates={} questions={} scope={} blocker={}{}",
+            "dir={} rec={} decision: action={} target={} confidence={} candidates={} questions={} scope={} blocker={}{}",
+            snapshot.workflow.director.phase.as_str(),
+            snapshot.workflow.recovery.action.as_str(),
             decision.next_action.as_str(),
             target,
             decision.progress_confidence,
