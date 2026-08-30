@@ -1328,18 +1328,18 @@ impl ContextEngine {
             let Some(path) = file.get("path").and_then(Value::as_str) else {
                 continue;
             };
-            if !path_is_workspace_relative(path) {
+            let Some(path) = portable_workspace_path(path) else {
                 continue;
-            }
+            };
             let hash = file.get("content_hash").and_then(Value::as_str).map(str::to_owned);
             let lines = file.get("lines").and_then(Value::as_array);
             let range = lines.and_then(|lines| line_range_from_read(lines));
-            self.upsert_inspected(path, hash.clone(), range, ObservedFileState::Present);
+            self.upsert_inspected(&path, hash.clone(), range, ObservedFileState::Present);
             if let (Some(range), Some(lines)) = (range, lines)
                 && let Some(text) = excerpt_from_lines(lines)
             {
                 self.push_excerpt(FileExcerpt {
-                    path: path.to_owned(),
+                    path,
                     start_line: range.start,
                     end_line: range.end,
                     text: BoundedText::new(text, MAX_EXCERPT_BYTES),
@@ -1424,6 +1424,9 @@ impl ContextEngine {
         range: Option<LineRange>,
         last_state: ObservedFileState,
     ) {
+        let Some(path) = portable_workspace_path(path) else {
+            return;
+        };
         if let Some(existing) = self.snapshot.inspected.iter_mut().find(|file| file.path == path) {
             let hash_changed = hash.as_ref().is_some_and(|new_hash| {
                 existing.content_hash.as_ref().is_some_and(|old| old != new_hash)
@@ -1447,7 +1450,7 @@ impl ContextEngine {
             ranges.push(range);
         }
         self.snapshot.inspected.push(InspectedFile {
-            path: path.to_owned(),
+            path,
             content_hash: hash,
             ranges,
             last_state,
@@ -1507,6 +1510,10 @@ impl ContextEngine {
 
 fn path_is_workspace_relative(path: &str) -> bool {
     WorkspacePath::new(path).is_ok()
+}
+
+fn portable_workspace_path(path: &str) -> Option<String> {
+    WorkspacePath::new(path).ok().map(|path| path.display())
 }
 
 fn paths_overlap(left: &str, right: &str) -> bool {
@@ -1882,7 +1889,7 @@ fn read_auto_excerpt(root: &Path, relative: &str, focus: Option<LineRange>) -> O
     let bounded_text = BoundedText::new(excerpt_text, MAX_EXCERPT_BYTES);
     let selected_end = start.saturating_add(lines[(start - 1)..end].len()).saturating_sub(1);
     Some(FileExcerpt {
-        path: relative_path.as_path().to_string_lossy().into_owned(),
+        path: relative_path.display(),
         start_line: start,
         end_line: selected_end,
         truncated: bounded_text.is_truncated() || selected_end < lines.len(),
@@ -2058,6 +2065,10 @@ mod tests {
             }),
             &success(serde_json::json!({"success": true})),
         );
+        assert_eq!(
+            engine.snapshot().inspected.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
+        );
         assert!(!engine.snapshot().workspace_changed);
         assert!(engine.snapshot().inspected.iter().all(|file| !file.stale));
 
@@ -2107,9 +2118,55 @@ mod tests {
             }),
             &success(serde_json::json!({"success": true})),
         );
+        assert_eq!(
+            engine.snapshot().inspected.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
+        );
         assert!(engine.snapshot().workspace_changed);
         assert!(engine.snapshot().inspected.iter().all(|file| !file.stale));
         assert!(!engine.finish_turn());
+    }
+
+    #[test]
+    fn known_shell_refresh_matches_native_separator_inspected_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "aether-context-native-sep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = b"fn main() {}\n";
+        std::fs::write(root.join("src").join("lib.rs"), source).unwrap();
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.set_task("format the source and verify the change");
+        let native_path = format!("src{}lib.rs", std::path::MAIN_SEPARATOR);
+        engine.observe_tool(
+            "read",
+            &serde_json::json!({
+                "files": [{"path": native_path, "start_line": 1, "end_line": 1}]
+            }),
+            &success(serde_json::json!({
+                "files": [{
+                    "path": native_path,
+                    "content_hash": blake3::hash(source).to_hex().to_string(),
+                    "lines": [{"number": 1, "text": "fn main() {}"}]
+                }]
+            })),
+        );
+
+        engine.observe_tool(
+            "shell",
+            &serde_json::json!({
+                "program": "rustfmt",
+                "args": ["src/lib.rs"]
+            }),
+            &success(serde_json::json!({"success": true})),
+        );
+        assert_eq!(engine.snapshot().inspected.len(), 1);
+        assert_eq!(engine.snapshot().inspected[0].path, "src/lib.rs");
+        assert!(!engine.snapshot().inspected[0].stale);
+        assert!(!engine.snapshot().workspace_changed);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

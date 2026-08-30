@@ -1,6 +1,12 @@
 # CHANGELOG
 
-## Unreleased - 2026-08-29 (5) - Pending public changes
+## Unreleased - 2026-08-29 (5) - Agent runtime phase baseline and control loop closure
+
+### Documentation
+
+- Established the immutable end-of-phase agent runtime baseline across deterministic regression, capability, and Zero-Waste control-loop evaluation suites.
+- Confirmed single-source-of-truth invariants across operational phase, workspace revisions, WorkState subgoals, evidence freshness, verification coverage, and dirty worktree preservation.
+
 
 ## v0.1.0-alpha-02 - 2026-08-29 (4) - Adaptive orchestration and evidence-fresh completion
 
@@ -10,6 +16,16 @@
 
 - Published the second installable alpha contract with `aether --version` reporting
   `0.1.0-alpha-02`; installers and GitHub Release archives remain version-pinned to this tag.
+
+#### Fixed
+
+- Release packaging generates the CycloneDX binary SBOM without combining `--describe binaries`
+  with `--override-filename`, which cargo-cyclonedx 0.5.9 rejects.
+
+### Fixed
+
+- Automatic live-source refresh stores portable `/` inspected paths, so Windows known-shell
+  mutations refresh `src/lib.rs` instead of leaving it stale beside a native `src\lib.rs` entry.
 
 ### 2026-08-29 — Evidence freshness and completion reliability
 

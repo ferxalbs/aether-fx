@@ -175,9 +175,13 @@ jobs:
         run: cargo build --locked --release --package aether --target ${{ matrix.target }}
 
       - name: Generate CycloneDX SBOM
+        shell: bash
         run: |
+          set -euo pipefail
           cargo install --locked --version 0.5.9 cargo-cyclonedx
-          cargo cyclonedx --manifest-path crates/aether/Cargo.toml --format json --describe binaries --override-filename bom.json
+          cargo cyclonedx --manifest-path crates/aether/Cargo.toml --format json --describe binaries
+          test -f crates/aether/aether.cdx.json
+          mv crates/aether/aether.cdx.json crates/aether/bom.json
 
       - name: Native smoke tests
         if: runner.os != 'Windows'
