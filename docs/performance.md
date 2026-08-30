@@ -149,3 +149,34 @@ orchestration changes: +98,432 bytes (+1.65%) versus the 5,963,440-byte post-che
 A direct `/usr/bin/time -l target/release/aether --version` probe reported 7,352,320 bytes peak
 RSS and 0.06 seconds wall time on this host. The binary-size increase is bounded state and
 policy machinery; these figures are local diagnostics, not cross-platform guarantees.
+
+## Agent-runtime phase closure baseline — 2026-08-30
+
+This is the frozen single-host reference for the closed agent-runtime phase. The release
+deterministic regression suite passed 9/9 fixtures in both baseline and optimized traces. The
+optimized trace used 49/55 model requests, 40/46 requested tool calls, and 39/45 executed tool
+calls (optimized/baseline), with one reused observation. Context input was 39,995/50,147 bytes,
+so the 40,000-byte optimized gate passed with 5 bytes of headroom. Total model-visible bytes were
+199,384/338,842 and tool-schema bytes were 159,389/288,695, a 44.8% schema reduction. It
+recorded 12 automatic evidence reactions, 12 mutation-refresh events, 10 verification attempts,
+one verification failure, one recovery attempt, two observed failure-state reductions, one expected
+stale-evidence guardrail rejection, zero completion rejections, zero unresolved work items, and a
+9/9 planner hit rate. Aggregate agent wall time was 18,678 ms.
+
+The capability suite passed 5/5: checkpoint/resume 5/5, recovery 2, dirty-user-change
+preservation 1/1, stale-observation handling 1, corruptions 0, false completions 0, and
+unresolved work 0. The Git-backed Zero-Waste/control-loop ablation passed 2/2: the optimized
+runtime preserved correctness and performed one runtime-owned automatic verification, while the
+negative premature-completion case remained rejected three times in both control paths. A fresh
+external `/usr/bin/time -l` run measured 91,807,744 bytes peak RSS and 19.55 seconds for the
+regression evaluator, and 93,708,288 bytes peak RSS and 21.06 seconds for the capability
+evaluator.
+
+The stripped release binaries measured 6,123,416 bytes (`aether`) and 3,355,160 bytes
+(`aether-eval`). Direct `aether --version` and `--help` probes completed in approximately 0.06
+seconds; `--version` peaked at 7,458,816 bytes RSS and EOF/minimal startup peaked at 7,663,616
+bytes. LCOV from the full workspace test run measured 20,136 of 24,886 lines covered (80.91%).
+These are deterministic, local diagnostics rather than cross-platform guarantees. Reproduce the
+reference with the release build, the two `aether-eval` commands in `evals/README.md`,
+`cargo llvm-cov --workspace --all-features --locked --lcov`, and the preflight commands in
+`AGENTS.md`.

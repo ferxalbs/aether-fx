@@ -37,7 +37,7 @@ pub use context::{
 pub use decision::{
     DecisionAction, DecisionCandidate, DecisionEvidence, DecisionEvidenceKind, DecisionQuestion,
     DecisionState, MAX_DECISION_CANDIDATES, MAX_DECISION_EVIDENCE, MAX_DECISION_FIELD_BYTES,
-    MAX_DECISION_QUESTIONS, MAX_DECISION_SCOPE,
+    MAX_DECISION_QUESTIONS, MAX_DECISION_SCOPE, ProgressEffect,
 };
 pub use error::{CoreError, CoreResult};
 pub use events::{AgentEvent, EventSequence, UsageMetadata};

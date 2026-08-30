@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-30 (1) - Adaptive tool surface and interactive model selection
+
+### Added
+
+- Added dynamic deterministic tool surface selection (`select_tool_surface`), filtering model-visible tool definitions per workflow phase without brittle phase allowlists and reducing tool schema overhead by >35%.
+- Added progress effect classification (`ProgressEffect`) and bounded stall recovery feedback prompting strategy reconsideration when consecutive actions yield no new repository evidence.
+- Added native interactive model selector in `aether-terminal` (`select_model_interactively`) backed by the Rainy model catalog with arrow-key navigation, query filtering, and non-interactive terminal fallback.
+
+### Changed
+
+- Enhanced candidate salience scoring in context selection to heavily prioritize active `WorkState` subgoal targets and failure diagnostics while penalizing stale items.
+- Introduced deterministic phase-aware adaptive context budgeting (10KB–24KB, expanding up to 32KB on active recovery/failure states).
+
+### Performance
+
+- Cut aggregate tool schema bytes by over 36% and total bytes shown to model by >30% across the deterministic evaluation suite.
+
 ## Unreleased - 2026-08-29 (5) - Agent runtime phase baseline and control loop closure
 
 ### Documentation

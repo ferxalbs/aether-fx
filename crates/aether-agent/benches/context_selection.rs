@@ -17,6 +17,8 @@ fn benchmark_size(c: &mut Criterion, count: usize) {
             start_line: index,
             end_line: index + 8,
             recency: index,
+            targeted_subgoal: index % 5 == 0,
+            diagnostic_path: index % 7 == 0,
             modified: index % 97 == 0,
             stale: index % 211 == 0,
             phase: aether_core::WorkflowPhase::Inspect,

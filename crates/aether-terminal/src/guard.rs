@@ -108,6 +108,8 @@ fn read_permission_outcome<R: io::Read>(reader: &mut R) -> io::Result<Permission
             Some(input::InputEvent::Enter)
             | Some(input::InputEvent::Backspace)
             | Some(input::InputEvent::Escape)
+            | Some(input::InputEvent::Up)
+            | Some(input::InputEvent::Down)
             | Some(input::InputEvent::Character(_)) => {}
         }
     }

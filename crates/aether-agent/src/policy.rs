@@ -12,8 +12,9 @@ use std::{
 
 use aether_core::{
     ActionClassification, CommandEffects, ContextSnapshot, DecisionAction, DecisionEvidenceKind,
-    EvidenceProvenance, LineRange, ObservedFileState, PreparedAction, ToolCallId, ToolResult,
-    WorkflowPhase, WorkflowVerification, WorkspacePath, analyze_command,
+    EvidenceProvenance, LineRange, ObservedFileState, PreparedAction, ProgressEffect, ToolCallId,
+    ToolDefinition, ToolResult, WorkflowPhase, WorkflowVerification, WorkspacePath,
+    analyze_command,
 };
 use serde_json::Value;
 
@@ -58,6 +59,7 @@ pub struct AutonomousCodingPolicy {
     candidate_key: Option<[u8; 16]>,
     planner: RepositoryActionPlanner,
     optimizations_enabled: bool,
+    consecutive_no_progress: u8,
 }
 
 impl AutonomousCodingPolicy {
@@ -241,6 +243,57 @@ impl AutonomousCodingPolicy {
             .or_else(|| self.mutation_preflight_prepared(snapshot, action))
     }
 
+    pub fn consecutive_no_progress(&self) -> u8 {
+        self.consecutive_no_progress
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.consecutive_no_progress >= 2
+    }
+
+    /// Dynamically select a bounded, deterministic tool surface for the current step.
+    pub fn select_tool_surface(
+        &self,
+        snapshot: &ContextSnapshot,
+        all_tools: &[ToolDefinition],
+    ) -> Vec<ToolDefinition> {
+        if !self.optimizations_enabled || self.consecutive_no_progress >= 2 {
+            return all_tools.to_vec();
+        }
+        let active = determine_active_tool_names(snapshot);
+        all_tools.iter().filter(|tool| active.contains(&tool.name.as_str())).cloned().collect()
+    }
+
+    /// Generate structured feedback when repeated no-progress actions are detected.
+    pub fn stall_feedback(&self, snapshot: &ContextSnapshot) -> Option<String> {
+        if self.consecutive_no_progress == 2 || self.consecutive_no_progress == 4 {
+            let subgoals = snapshot
+                .workflow
+                .work
+                .active_subgoal
+                .as_ref()
+                .map(|s| format!("active subgoal '{}'", s.as_str()))
+                .unwrap_or_else(|| "explore relevant repository files".to_owned());
+            let failures = if snapshot.workflow.unresolved_failures.is_empty() {
+                "none".to_owned()
+            } else {
+                snapshot
+                    .workflow
+                    .unresolved_failures
+                    .iter()
+                    .map(|f| format!("{}: {}", f.tool, f.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            Some(format!(
+                "progress stall detected: recent actions produced no new repository evidence or state changes (stall_count={}).\nActive work: {subgoals}\nUnresolved failures: {failures}\nGuidance: Reconsider current strategy: inspect target source files, apply the required minimal mutation, or verify the fix.",
+                self.consecutive_no_progress
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Fold one completed observation into the shared context and decision state.
     pub fn observe(
         &mut self,
@@ -257,6 +310,23 @@ impl AutonomousCodingPolicy {
         let after = WorkflowObservation::from(&engine.snapshot().workflow);
         let guard_feedback = self.guardrails.observe_snapshot(name, input, result, &before, &after);
         let advanced = before != after;
+
+        let progress = classify_action_progress(
+            name,
+            classify_direct_action(name, input),
+            result,
+            executed,
+            &before,
+            &after,
+        );
+        if progress.is_meaningful_progress() {
+            self.consecutive_no_progress = 0;
+            engine.snapshot_mut().workflow.progress.note_meaningful_progress();
+        } else {
+            self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
+            engine.snapshot_mut().workflow.progress.note_no_progress();
+        }
+
         let decision = &mut engine.snapshot_mut().workflow.decision;
         decision.note_observation_value(advanced && executed);
         if decision.low_value_observations >= 3 {
@@ -291,6 +361,23 @@ impl AutonomousCodingPolicy {
         let guard_feedback =
             self.guardrails.observe_snapshot_prepared(action, result, &before, &after);
         let advanced = before != after;
+
+        let progress = classify_action_progress(
+            action.tool.as_str(),
+            action.classification,
+            result,
+            executed,
+            &before,
+            &after,
+        );
+        if progress.is_meaningful_progress() {
+            self.consecutive_no_progress = 0;
+            engine.snapshot_mut().workflow.progress.note_meaningful_progress();
+        } else {
+            self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
+            engine.snapshot_mut().workflow.progress.note_no_progress();
+        }
+
         let decision = &mut engine.snapshot_mut().workflow.decision;
         decision.note_observation_value(advanced && executed);
         if decision.low_value_observations >= 3 {
@@ -1211,11 +1298,155 @@ fn action(action: DecisionAction, score: u16, target: Option<&str>, reason: &str
     RankedAction { action, score, target: target.map(str::to_owned), reason: reason.to_owned() }
 }
 
+fn classify_action_progress(
+    tool: &str,
+    classification: ActionClassification,
+    result: &ToolResult,
+    executed: bool,
+    before: &WorkflowObservation,
+    after: &WorkflowObservation,
+) -> ProgressEffect {
+    if !executed {
+        if result.error.is_some() {
+            return ProgressEffect::NoProgress;
+        }
+        return ProgressEffect::ReusedObservation;
+    }
+    if result.ok && before.failure_state_changed(after) {
+        return ProgressEffect::RecoveredFailure;
+    }
+    if !result.ok {
+        if classification == ActionClassification::Verification {
+            return ProgressEffect::Verification;
+        }
+        if result.error.as_ref().is_some_and(|e| e.retryable) {
+            return ProgressEffect::RefinedEvidence;
+        }
+        return ProgressEffect::NoProgress;
+    }
+    if classification == ActionClassification::Mutation {
+        return ProgressEffect::WorkMutation;
+    }
+    if classification == ActionClassification::Verification {
+        return ProgressEffect::Verification;
+    }
+    if before != after {
+        return ProgressEffect::NewRepositoryEvidence;
+    }
+    if tool == "read" {
+        return ProgressEffect::RefinedEvidence;
+    }
+    if tool == "git" {
+        return ProgressEffect::RefinedEvidence;
+    }
+    if tool == "search" || tool == "find" || tool == "list" {
+        let output = result.output.as_str().trim();
+        if !output.is_empty() {
+            return ProgressEffect::NewRepositoryEvidence;
+        }
+        return ProgressEffect::NoProgress;
+    }
+    if tool == "shell" || tool == "process" {
+        let output = result.output.as_str().trim();
+        if !output.is_empty() {
+            return ProgressEffect::RefinedEvidence;
+        }
+    }
+    ProgressEffect::NoProgress
+}
+
+fn classify_direct_action(name: &str, input: &Value) -> ActionClassification {
+    if matches!(name, "write" | "patch") {
+        return ActionClassification::Mutation;
+    }
+    if let Some(effects) = command_effects(input) {
+        if effects.class.is_verification() {
+            ActionClassification::Verification
+        } else if effects.class.is_mutation() || effects.mutates_workspace() {
+            ActionClassification::Mutation
+        } else if effects.class.is_read_only() {
+            ActionClassification::Read
+        } else {
+            ActionClassification::Other
+        }
+    } else if matches!(name, "read" | "list" | "find" | "search" | "git") {
+        ActionClassification::Read
+    } else {
+        ActionClassification::Other
+    }
+}
+
+fn determine_active_tool_names(snapshot: &ContextSnapshot) -> Vec<&'static str> {
+    if snapshot.workflow.has_unresolved_failures()
+        || snapshot.workflow.recovery.active
+        || snapshot.workspace_changed
+    {
+        return vec!["read", "list", "find", "search", "write", "patch", "shell", "process", "git"];
+    }
+
+    let mut names = match snapshot.workflow.phase {
+        WorkflowPhase::Discover => {
+            let mut list = vec!["read", "list", "find", "search", "git"];
+            let task_lower = snapshot.current_task.as_str().to_ascii_lowercase();
+            if task_lower.contains("cargo")
+                || task_lower.contains("test")
+                || task_lower.contains("build")
+                || task_lower.contains("run")
+                || (snapshot.inspected.is_empty() && snapshot.modified.is_empty())
+            {
+                list.push("shell");
+            }
+            list
+        }
+        WorkflowPhase::Inspect => {
+            let mut list = vec!["read", "list", "find", "search"];
+            // Inspection is the hand-off point between evidence acquisition and a possible
+            // mutation. Keep writes hidden until at least one current observation exists, but
+            // expose them once the mutation gate has a chance to accept an exact target.
+            if !snapshot.inspected.is_empty() || !snapshot.modified.is_empty() {
+                list.extend(["write", "patch"]);
+            }
+            if snapshot.workflow.verification == WorkflowVerification::Pending {
+                list.push("shell");
+            }
+            list
+        }
+        WorkflowPhase::Modify => {
+            let mut list = vec!["read", "search", "write", "patch", "shell"];
+            if !snapshot.modified.is_empty() || !snapshot.user_modified.is_empty() {
+                list.push("git");
+            }
+            list
+        }
+        WorkflowPhase::Verify => vec!["read", "search", "shell", "process", "git"],
+        WorkflowPhase::Complete => vec!["read", "shell", "git"],
+    };
+
+    if !snapshot.modified.is_empty() && !names.contains(&"git") {
+        names.push("git");
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether_core::{BoundedText, ContextSnapshot, InspectedFile, LineRange};
+    use aether_core::{
+        BoundedText, ContextSnapshot, InspectedFile, LineRange, PermissionClass, ToolDefinition,
+    };
     use serde_json::json;
+
+    fn tool_definitions() -> Vec<ToolDefinition> {
+        ["read", "list", "find", "search", "write", "patch", "shell", "process", "git"]
+            .into_iter()
+            .map(|name| ToolDefinition {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: json!({}),
+                permission: PermissionClass::ReadOnly,
+            })
+            .collect()
+    }
 
     fn inspected_snapshot() -> ContextSnapshot {
         let mut snapshot = ContextSnapshot::new("/workspace", None);
@@ -1230,6 +1461,21 @@ mod tests {
         });
         snapshot.workflow.decision.progress_confidence = MIN_MUTATION_CONFIDENCE;
         snapshot
+    }
+
+    #[test]
+    fn mutation_tools_follow_first_current_inspection() {
+        let policy = AutonomousCodingPolicy::new();
+        let definitions = tool_definitions();
+        let undiscovered = ContextSnapshot::new("/workspace", None);
+        let initial = policy.select_tool_surface(&undiscovered, &definitions);
+        assert!(!initial.iter().any(|tool| tool.name == "write"));
+        assert!(!initial.iter().any(|tool| tool.name == "patch"));
+
+        let inspected = inspected_snapshot();
+        let after_inspection = policy.select_tool_surface(&inspected, &definitions);
+        assert!(after_inspection.iter().any(|tool| tool.name == "write"));
+        assert!(after_inspection.iter().any(|tool| tool.name == "patch"));
     }
 
     #[test]

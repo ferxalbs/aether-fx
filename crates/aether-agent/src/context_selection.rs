@@ -35,6 +35,10 @@ pub struct ContextCandidate<'a> {
     pub delta: bool,
     /// Stable content fingerprint used for delta-aware selection.
     pub fingerprint: [u8; 16],
+    /// Whether this item belongs to an active work subgoal or target scope.
+    pub targeted_subgoal: bool,
+    /// Whether this item corresponds to an unresolved diagnostic or failure path.
+    pub diagnostic_path: bool,
 }
 
 /// A symbol hit supplied by a targeted repository lookup.
@@ -68,6 +72,8 @@ impl<'a> ContextCandidate<'a> {
             phase: WorkflowPhase::Discover,
             delta: true,
             fingerprint: [0; 16],
+            targeted_subgoal: false,
+            diagnostic_path: false,
         }
     }
 
@@ -286,8 +292,14 @@ fn score_candidate(candidate: ContextCandidate<'_>, terms: &[&str], newest: usiz
     if candidate.modified {
         score += 80;
     }
+    if candidate.targeted_subgoal {
+        score += 65;
+    }
+    if candidate.diagnostic_path {
+        score += 75;
+    }
     if candidate.stale {
-        score -= 180;
+        score -= 220;
     } else if matches!(candidate.kind, ContextKind::Excerpt | ContextKind::InspectedFile) {
         score += 25;
     }
@@ -312,7 +324,7 @@ fn delta_bonus(candidate: ContextCandidate<'_>) -> i32 {
 }
 
 fn phase_bonus(candidate: ContextCandidate<'_>) -> i32 {
-    match candidate.phase {
+    let mut bonus = match candidate.phase {
         WorkflowPhase::Discover => match candidate.kind {
             ContextKind::RepositoryMetadata
             | ContextKind::ScopedInstructions
@@ -351,7 +363,14 @@ fn phase_bonus(candidate: ContextCandidate<'_>) -> i32 {
             ContextKind::UserModifiedPath => 20,
             ContextKind::RepositoryMetadata | ContextKind::ScopedInstructions => 4,
         },
+    };
+    if candidate.diagnostic_path && candidate.phase == WorkflowPhase::Inspect {
+        bonus += 30;
     }
+    if candidate.targeted_subgoal && candidate.phase == WorkflowPhase::Modify {
+        bonus += 25;
+    }
+    bonus
 }
 
 fn symbol_matches(path: &str, term: &str) -> bool {

@@ -612,6 +612,47 @@ impl ContextEngine {
                 ambiguous: *ambiguous,
             })
             .collect::<Vec<_>>();
+        let active_subgoal_paths = {
+            let mut paths = Vec::new();
+            if let Some(active_id) = self.snapshot.workflow.work.active_subgoal.as_ref()
+                && let Some(subgoal) =
+                    self.snapshot.workflow.work.subgoals.iter().find(|s| &s.id == active_id)
+            {
+                for path in &subgoal.paths {
+                    let path_str = path.as_str().to_owned();
+                    if !path_str.is_empty() && !paths.contains(&path_str) {
+                        paths.push(path_str);
+                    }
+                }
+            }
+            for subgoal in &self.snapshot.workflow.work.subgoals {
+                for path in &subgoal.paths {
+                    let path_str = path.as_str().to_owned();
+                    if !path_str.is_empty() && !paths.contains(&path_str) {
+                        paths.push(path_str);
+                    }
+                }
+            }
+            paths
+        };
+        let failure_diagnostic_paths = {
+            let mut paths = Vec::new();
+            for failure in &self.snapshot.workflow.unresolved_failures {
+                for diagnostic in &failure.diagnostics {
+                    let path = diagnostic.path.as_str().to_owned();
+                    if !path.is_empty() && !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+            for recovery_path in &self.snapshot.workflow.recovery.affected_paths {
+                let path = recovery_path.as_str().to_owned();
+                if !path.is_empty() && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            paths
+        };
         let mut candidates = Vec::with_capacity(
             self.snapshot.inspected.len()
                 + self.snapshot.modified.len()
@@ -634,6 +675,8 @@ impl ContextEngine {
                 self.snapshot.modified.iter().any(|path| path == &file.path),
                 file.stale,
             );
+            let targeted_subgoal = active_subgoal_paths.iter().any(|p| p == &file.path);
+            let diagnostic_path = failure_diagnostic_paths.iter().any(|p| p == &file.path);
             candidates.push(ContextCandidate {
                 kind: ContextKind::InspectedFile,
                 path: Some(&file.path),
@@ -647,6 +690,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal,
+                diagnostic_path,
             });
             recency += 1;
         }
@@ -660,6 +705,8 @@ impl ContextEngine {
                 true,
                 false,
             );
+            let targeted_subgoal = active_subgoal_paths.iter().any(|p| p == path);
+            let diagnostic_path = failure_diagnostic_paths.iter().any(|p| p == path);
             candidates.push(ContextCandidate {
                 kind: ContextKind::ModifiedPath,
                 path: Some(path),
@@ -673,6 +720,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal,
+                diagnostic_path,
             });
             recency += 1;
         }
@@ -686,6 +735,8 @@ impl ContextEngine {
                 false,
                 false,
             );
+            let targeted_subgoal = active_subgoal_paths.iter().any(|p| p == path);
+            let diagnostic_path = failure_diagnostic_paths.iter().any(|p| p == path);
             candidates.push(ContextCandidate {
                 kind: ContextKind::UserModifiedPath,
                 path: Some(path),
@@ -699,6 +750,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal,
+                diagnostic_path,
             });
             recency += 1;
         }
@@ -725,6 +778,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal: false,
+                diagnostic_path: false,
             });
             recency += 1;
         }
@@ -746,6 +801,8 @@ impl ContextEngine {
                 modified,
                 stale,
             );
+            let targeted_subgoal = active_subgoal_paths.iter().any(|p| p == &excerpt.path);
+            let diagnostic_path = failure_diagnostic_paths.iter().any(|p| p == &excerpt.path);
             candidates.push(ContextCandidate {
                 kind: ContextKind::Excerpt,
                 path: Some(&excerpt.path),
@@ -759,6 +816,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal,
+                diagnostic_path,
             });
             recency += 1;
         }
@@ -785,6 +844,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal: false,
+                diagnostic_path: false,
             });
             recency += 1;
         }
@@ -811,6 +872,8 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal: false,
+                diagnostic_path: false,
             });
             recency += 1;
         }
@@ -837,13 +900,30 @@ impl ContextEngine {
                 delta: !delta_only
                     || !previous_fingerprints.contains(&fingerprint_hex(fingerprint)),
                 fingerprint,
+                targeted_subgoal: false,
+                diagnostic_path: false,
             });
         }
         let fixed_bytes = out.len() + CONTEXT_GUIDANCE.len() + 32;
+        let base_budget = match self.snapshot.workflow.phase {
+            WorkflowPhase::Discover => 12 * 1024,
+            WorkflowPhase::Inspect => 16 * 1024,
+            WorkflowPhase::Modify => 18 * 1024,
+            WorkflowPhase::Verify => 14 * 1024,
+            WorkflowPhase::Complete => 10 * 1024,
+        };
+        let effective_budget = if self.snapshot.workflow.has_unresolved_failures()
+            || self.snapshot.workspace_changed
+            || self.snapshot.workflow.recovery.active
+        {
+            MAX_CONTEXT_RENDER_BYTES
+        } else {
+            base_budget.min(MAX_CONTEXT_RENDER_BYTES)
+        };
         let selection = select_context_with_relationships(
             self.snapshot.current_task.as_str(),
             &candidates,
-            MAX_CONTEXT_RENDER_BYTES.saturating_sub(fixed_bytes),
+            effective_budget.saturating_sub(fixed_bytes),
             MAX_CONTEXT_ITEMS,
             &symbol_hints,
             &relationship_hints,

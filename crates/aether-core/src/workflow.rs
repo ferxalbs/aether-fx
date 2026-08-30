@@ -363,6 +363,12 @@ pub struct WorkflowProgress {
     /// Completion attempts rejected by the deterministic review gate.
     #[serde(default)]
     pub completion_rejections: u16,
+    /// Consecutive actions with no meaningful progress in the current turn.
+    #[serde(default)]
+    pub consecutive_no_progress: u16,
+    /// Number of stall recovery feedback messages emitted.
+    #[serde(default)]
+    pub stall_recovery_events: u16,
 }
 
 impl WorkflowProgress {
@@ -412,6 +418,18 @@ impl WorkflowProgress {
 
     pub fn note_completion_rejection(&mut self) {
         Self::increment(&mut self.completion_rejections);
+    }
+
+    pub fn note_meaningful_progress(&mut self) {
+        self.consecutive_no_progress = 0;
+    }
+
+    pub fn note_no_progress(&mut self) {
+        Self::increment(&mut self.consecutive_no_progress);
+    }
+
+    pub fn note_stall_recovery_event(&mut self) {
+        Self::increment(&mut self.stall_recovery_events);
     }
 }
 

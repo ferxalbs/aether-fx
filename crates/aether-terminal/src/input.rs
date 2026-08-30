@@ -7,6 +7,10 @@ use unicode_segmentation::UnicodeSegmentation;
 pub enum InputEvent {
     /// A decoded Unicode scalar.
     Character(char),
+    /// Arrow up.
+    Up,
+    /// Arrow down.
+    Down,
     /// Enter/return.
     Enter,
     /// Backspace/delete backwards.
@@ -30,7 +34,9 @@ pub fn read_event<R: Read>(reader: &mut R) -> io::Result<Option<InputEvent>> {
         0x03 => InputEvent::CtrlC,
         0x04 => InputEvent::CtrlD,
         0x08 | 0x7F => InputEvent::Backspace,
-        0x1B => InputEvent::Escape,
+        0x1B => decode_escape(reader)?,
+        0x0E => InputEvent::Down,
+        0x10 => InputEvent::Up,
         byte if byte.is_ascii() && byte >= 0x20 => InputEvent::Character(byte as char),
         byte @ 0xC2..=0xDF => decode_utf8(reader, byte, 2)?,
         byte @ 0xE0..=0xEF => decode_utf8(reader, byte, 3)?,
@@ -38,6 +44,24 @@ pub fn read_event<R: Read>(reader: &mut R) -> io::Result<Option<InputEvent>> {
         _ => InputEvent::Escape,
     };
     Ok(Some(event))
+}
+
+fn decode_escape<R: Read>(reader: &mut R) -> io::Result<InputEvent> {
+    let mut seq = [0_u8; 2];
+    if reader.read(&mut seq[..1])? == 0 {
+        return Ok(InputEvent::Escape);
+    }
+    if seq[0] == b'[' || seq[0] == b'O' {
+        if reader.read(&mut seq[1..2])? == 0 {
+            return Ok(InputEvent::Escape);
+        }
+        return Ok(match seq[1] {
+            b'A' => InputEvent::Up,
+            b'B' => InputEvent::Down,
+            _ => InputEvent::Escape,
+        });
+    }
+    Ok(InputEvent::Escape)
 }
 
 fn decode_utf8<R: Read>(reader: &mut R, first: u8, width: usize) -> io::Result<InputEvent> {
@@ -75,7 +99,7 @@ pub fn read_line_from<R: Read, W: Write>(
                 }
             }
             InputEvent::CtrlC | InputEvent::CtrlD => return Ok(None),
-            InputEvent::Escape => {}
+            InputEvent::Escape | InputEvent::Up | InputEvent::Down => {}
         }
         writer.flush()?;
     }
@@ -96,5 +120,16 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(read_line_from(&mut input, &mut output).unwrap(), Some(String::new()));
         assert_eq!(output, "é\x08 \x08".as_bytes());
+    }
+
+    #[test]
+    fn parses_arrow_keys_and_control_sequences() {
+        let mut input = b"\x1b[A\x1b[B\x10\x0e\x1b".as_slice();
+        assert_eq!(read_event(&mut input).unwrap(), Some(InputEvent::Up));
+        assert_eq!(read_event(&mut input).unwrap(), Some(InputEvent::Down));
+        assert_eq!(read_event(&mut input).unwrap(), Some(InputEvent::Up));
+        assert_eq!(read_event(&mut input).unwrap(), Some(InputEvent::Down));
+        assert_eq!(read_event(&mut input).unwrap(), Some(InputEvent::Escape));
+        assert_eq!(read_event(&mut input).unwrap(), None);
     }
 }

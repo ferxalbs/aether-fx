@@ -43,6 +43,45 @@ impl DecisionEvidenceKind {
     }
 }
 
+/// The deterministic classification of progress produced by an action.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressEffect {
+    #[default]
+    NoProgress,
+    NewRepositoryEvidence,
+    RefinedEvidence,
+    WorkMutation,
+    Verification,
+    RecoveredFailure,
+    ReusedObservation,
+}
+
+impl ProgressEffect {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProgress => "no_progress",
+            Self::NewRepositoryEvidence => "new_repository_evidence",
+            Self::RefinedEvidence => "refined_evidence",
+            Self::WorkMutation => "work_mutation",
+            Self::Verification => "verification",
+            Self::RecoveredFailure => "recovered_failure",
+            Self::ReusedObservation => "reused_observation",
+        }
+    }
+
+    pub const fn is_meaningful_progress(self) -> bool {
+        matches!(
+            self,
+            Self::NewRepositoryEvidence
+                | Self::RefinedEvidence
+                | Self::WorkMutation
+                | Self::Verification
+                | Self::RecoveredFailure
+        )
+    }
+}
+
 /// The bounded actions that the runtime can recommend to the model.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -47,6 +47,12 @@ pub(crate) struct WorkflowObservation {
     candidate_files: [u8; 16],
 }
 
+impl WorkflowObservation {
+    pub(crate) fn failure_state_changed(&self, after: &Self) -> bool {
+        self.unresolved_failures != [0; 16] && self.unresolved_failures != after.unresolved_failures
+    }
+}
+
 impl From<&WorkflowState> for WorkflowObservation {
     fn from(workflow: &WorkflowState) -> Self {
         Self {

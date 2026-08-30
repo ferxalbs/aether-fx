@@ -285,19 +285,8 @@ async fn run_interactive(
     } else {
         None
     };
-    let model = match &resume {
-        Some(session) => {
-            configured_model(model.or_else(|| session.model.clone())).or_else(|_| {
-                session.model.clone().ok_or_else(|| {
-                    AppError::Message(
-                        "no model selected; pass --model <id> or set AETHER_MODEL".to_owned(),
-                    )
-                })
-            })?
-        }
-        None => configured_model(model)?,
-    };
     let backend = RainyBackend::from_env().map_err(|error| AppError::Message(error.to_string()))?;
+    let model = resolve_model_interactively(model, resume.as_ref(), &backend).await?;
     let requested_root =
         resume.as_ref().map(|session| session.workspace_root.clone()).unwrap_or(root);
     let live_root = SessionStore::canonical_workspace(requested_root)?;
@@ -512,8 +501,46 @@ async fn new_tool_registry(root: PathBuf) -> Result<ToolRegistry, AppError> {
         .map_err(AppError::Message)
 }
 
-fn configured_model(cli_model: Option<String>) -> Result<String, AppError> {
-    configured_model_from(cli_model, std::env::var("AETHER_MODEL").ok())
+async fn resolve_model_interactively(
+    cli_model: Option<String>,
+    resume: Option<&aether_agent::ResumableSession>,
+    backend: &RainyBackend,
+) -> Result<String, AppError> {
+    let explicit = cli_model
+        .or_else(|| std::env::var("AETHER_MODEL").ok())
+        .or_else(|| resume.and_then(|session| session.model.clone()))
+        .filter(|m| !m.trim().is_empty());
+    if let Some(model) = explicit {
+        return Ok(model);
+    }
+
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && let Ok(catalog) = backend.discover_models().await
+        && !catalog.is_empty()
+    {
+        let items = catalog
+            .into_iter()
+            .map(|item| {
+                let label = item.display_name.clone().unwrap_or_else(|| item.id.clone());
+                let detail = item.context_window.map(|w| format!("{}k context", w / 1024));
+                aether_terminal::ModelSelectionItem::new(item.id, label, detail)
+            })
+            .collect::<Vec<_>>();
+        let default_id = "claude-3-7-sonnet";
+        let selected = tokio::task::spawn_blocking(move || {
+            aether_terminal::select_model_interactively(&items, Some(default_id))
+        })
+        .await
+        .map_err(|error| AppError::Message(format!("model selector worker failed: {error}")))?
+        .map_err(AppError::Io)?;
+        if let Some(selected) = selected {
+            return Ok(selected);
+        }
+    }
+
+    configured_model_from(None, None)
 }
 
 fn configured_model_from(

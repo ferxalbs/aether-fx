@@ -70,7 +70,6 @@ pub struct ExecutionMetrics {
     pub model_steps: u32,
     pub model_requests: u32,
     pub requested_tool_calls: u32,
-    pub tool_calls: u32,
     pub executed_tool_calls: u32,
     pub prevented_redundant_calls: u32,
     pub input_tokens: Option<u64>,
@@ -145,7 +144,6 @@ pub struct TaskResult {
     pub model_steps: u32,
     pub model_requests: u32,
     pub requested_tool_calls: u32,
-    pub tool_calls: u32,
     pub executed_tool_calls: u32,
     pub prevented_redundant_calls: u32,
     pub input_tokens: Option<u64>,
@@ -312,7 +310,6 @@ pub struct AggregateMetrics {
     pub model_steps: u32,
     pub model_requests: u32,
     pub requested_tool_calls: u32,
-    pub tool_calls: u32,
     pub executed_tool_calls: u32,
     pub prevented_redundant_calls: u32,
     pub input_tokens: u64,
@@ -355,7 +352,6 @@ pub struct AggregateMetrics {
     pub baseline_model_steps: u32,
     pub baseline_model_requests: u32,
     pub baseline_requested_tool_calls: u32,
-    pub baseline_tool_calls: u32,
     pub baseline_executed_tool_calls: u32,
     pub baseline_bytes_read: u64,
     pub baseline_context_bytes: u64,
@@ -445,7 +441,7 @@ pub fn run_suite(output: Option<&Path>) -> Result<SuiteResult, String> {
         && aggregate.executed_tool_calls <= thresholds.maximum_executed_tool_calls
         && aggregate.context_bytes <= thresholds.maximum_context_bytes;
     let suite = SuiteResult {
-        schema_version: 1,
+        schema_version: 2,
         backend: "deterministic-fake".to_owned(),
         success,
         thresholds,
@@ -721,7 +717,7 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
             result.task_id,
             result.model_steps,
             result.executed_tool_calls,
-            result.tool_calls,
+            result.requested_tool_calls,
             result.before.executed_tool_calls,
             result.verification_attempts,
             result.after.automatic_verification_attempts,
@@ -751,8 +747,8 @@ pub fn compact_summary(suite: &SuiteResult) -> String {
         suite.aggregate.model_steps,
         suite.aggregate.baseline_model_steps,
         suite.aggregate.executed_tool_calls,
-        suite.aggregate.tool_calls,
-        suite.aggregate.baseline_tool_calls,
+        suite.aggregate.requested_tool_calls,
+        suite.aggregate.baseline_requested_tool_calls,
         suite.aggregate.baseline_executed_tool_calls,
         suite.aggregate.prevented_redundant_calls,
         suite.aggregate.reused_observations,
@@ -824,7 +820,6 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
         model_steps: results.iter().map(|result| result.model_steps).sum(),
         model_requests: results.iter().map(|result| result.after.model_requests).sum(),
         requested_tool_calls: results.iter().map(|result| result.after.requested_tool_calls).sum(),
-        tool_calls: results.iter().map(|result| result.tool_calls).sum(),
         executed_tool_calls: results.iter().map(|result| result.executed_tool_calls).sum(),
         prevented_redundant_calls: results
             .iter()
@@ -914,7 +909,6 @@ fn aggregate(results: &[TaskResult]) -> AggregateMetrics {
             .iter()
             .map(|result| result.before.requested_tool_calls)
             .sum(),
-        baseline_tool_calls: results.iter().map(|result| result.before.tool_calls).sum(),
         baseline_executed_tool_calls: results
             .iter()
             .map(|result| result.before.executed_tool_calls)

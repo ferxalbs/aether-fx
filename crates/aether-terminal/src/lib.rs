@@ -7,10 +7,12 @@ mod guard;
 mod input;
 mod platform;
 mod renderer;
+mod select_model;
 mod style;
 
 pub use buffer::{TerminalBuffer, display_width};
 pub use guard::{PermissionPromptOutcome, TerminalGuard, prompt_permission, run_minimal_shell};
-pub use input::{InputEvent, read_line_from};
+pub use input::{InputEvent, read_event, read_line_from};
 pub use renderer::Renderer;
+pub use select_model::{ModelSelectionItem, select_model_from_items, select_model_interactively};
 pub use style::{Intensity, Style};

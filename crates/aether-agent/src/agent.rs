@@ -317,13 +317,19 @@ where
             steps = steps.saturating_add(1);
             let step_id = StepId::new(format!("{}.{}", request.turn_id, steps))
                 .map_err(|error| AgentError::Tool(error.to_string()))?;
+            let current_snapshot = self.current_context();
+            let active_tools = if request.optimize {
+                Arc::new(policy.select_tool_surface(&current_snapshot, &self.tool_definitions))
+            } else {
+                Arc::clone(&self.tool_definitions)
+            };
             let model_request = ModelRequest {
                 session_id: request.session_id.clone(),
                 turn_id: request.turn_id.clone(),
                 step_id,
                 model: request.model.clone(),
                 input: input.clone(),
-                tools: Arc::clone(&self.tool_definitions),
+                tools: Arc::clone(&active_tools),
                 continuation: continuation.clone(),
             };
             if let Some(metrics) = &mut metrics {
@@ -331,7 +337,11 @@ where
                 metrics.value.model_requests = metrics.value.model_requests.saturating_add(1);
                 let input_bytes =
                     serde_json::to_vec(&input).map_or(u64::MAX, |value| value.len() as u64);
-                let schema_bytes = self.tool_definition_bytes();
+                let schema_bytes = if request.optimize {
+                    serde_json::to_vec(active_tools.as_ref()).map_or(0, |value| value.len() as u64)
+                } else {
+                    self.tool_definition_bytes()
+                };
                 let input_breakdown = classify_model_input(&input, input_bytes);
                 metrics.value.context_bytes =
                     metrics.value.context_bytes.saturating_add(input_bytes);
@@ -628,6 +638,42 @@ where
                     }));
                 }
             }
+            if let Some(stall_message) =
+                self.with_context(|engine| policy.stall_feedback(engine.snapshot()))
+            {
+                self.with_context(|engine| {
+                    engine.snapshot_mut().workflow.progress.note_stall_recovery_event()
+                });
+                outputs.push(json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": stall_message
+                }));
+            }
+            if policy.consecutive_no_progress() >= 6 {
+                let diagnostic = self.with_context(|engine| {
+                    let workflow = &engine.snapshot().workflow;
+                    format!(
+                        "agent progress stall limit: consecutive_no_progress={} phase={} failures={:?} steps={}",
+                        policy.consecutive_no_progress(),
+                        workflow.phase.as_str(),
+                        workflow
+                            .unresolved_failures
+                            .iter()
+                            .map(|f| f.key.as_str())
+                            .collect::<Vec<_>>(),
+                        steps,
+                    )
+                });
+                let _ = send_event(
+                    &events,
+                    AgentEvent::Error {
+                        message: BoundedText::new(diagnostic, DEFAULT_MAX_OUTPUT_BYTES),
+                    },
+                )
+                .await;
+                return Err(AgentError::StepLimit);
+            }
             input = serde_json::Value::Array(outputs);
         }
     }
@@ -643,8 +689,8 @@ where
     ) -> bool {
         let action = completed.action;
         let result = completed.result;
-        let had_failure =
-            self.with_context(|engine| engine.snapshot().workflow.has_unresolved_failures());
+        let failures_before =
+            self.with_context(|engine| engine.snapshot().workflow.unresolved_failures.len());
         let verification_action =
             action.classification == aether_core::ActionClassification::Verification;
         let verification_failed = verification_action
@@ -690,7 +736,9 @@ where
                             metrics.value.verification_failures.saturating_add(1);
                     }
                 }
-                if had_failure {
+                let failures_after = self
+                    .with_context(|engine| engine.snapshot().workflow.unresolved_failures.len());
+                if failures_after < failures_before {
                     metrics.value.recovery_successes =
                         metrics.value.recovery_successes.saturating_add(1);
                 }
