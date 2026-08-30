@@ -23,6 +23,28 @@ terminal input → aether-agent → ModelBackend → aether-rainy → Rainy SDK 
 agent events ───────────────────────────────────────→ aether-terminal
 ```
 
+## Interactive boundary and model presentation
+
+The binary has one stateful shell path and one headless path. The shell is enabled only when both
+standard streams are TTYs and the invocation is not JSON, one-shot, or explicitly
+`--non-interactive`. It prints a compact identity line without contacting Rainy, then reuses the
+same bounded terminal substrate for the prompt, slash-command palette, model/session selectors,
+confirmations, secret input, permission decisions, and incremental event rendering. Pipe, JSON,
+and one-shot paths use plain newline-delimited input/output and a fail-closed permission broker;
+they never inherit selector or raw-mode behavior.
+
+Leading slash input is recognized only at the beginning of a shell line. The palette is local and
+does not become model input. `/status`, `/context`, `/config`, `/doctor`, `/help`, `/clear`, and
+`/exit` remain offline/local operations; `/model` is the explicit live catalog boundary.
+
+`aether-rainy` owns one normalized `ModelView` projection of each SDK catalog entry. It preserves
+unknowns instead of guessing from model names, distinguishes model, plan, and effective context,
+records tools/reasoning/modalities and access state, and carries only bounded data-policy
+disclosure fields. `/model`, `aether models`, `/status`, and the JSON model surface consume this
+projection. A selected model is applied to future turns, while its Rainy continuation and seeded
+context continuation are cleared before the next request so a provider response from one model is
+never sent to another.
+
 The autonomous work loop is deliberately evidence-driven rather than a second planner:
 
 ```text

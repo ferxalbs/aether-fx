@@ -6,7 +6,7 @@ use aether_core::{
     PermissionEngine, PermissionPolicy, PermissionRequest, SessionId, SessionLine, SessionRecord,
     ToolCallId, ToolInvocation,
 };
-use aether_terminal::Renderer;
+use aether_terminal::{Renderer, SelectorItem, select_from_items};
 use aether_tools::{ToolRegistry, apply_patch_text};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use serde_json::json;
@@ -99,6 +99,55 @@ fn event_dispatch(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         )
+    });
+}
+
+fn terminal_selectors(c: &mut Criterion) {
+    let commands = [
+        ("/model", "Model"),
+        ("/status", "Status"),
+        ("/context", "Context"),
+        ("/config", "Config"),
+        ("/auth", "Auth"),
+        ("/sessions", "Sessions"),
+        ("/resume", "Resume"),
+        ("/doctor", "Doctor"),
+        ("/help", "Help"),
+        ("/clear", "Clear"),
+        ("/exit", "Exit"),
+    ]
+    .into_iter()
+    .map(|(value, label)| SelectorItem::new(value.to_owned(), label, None))
+    .collect::<Vec<_>>();
+    c.bench_function("slash_palette_open_filter", |b| {
+        b.iter(|| {
+            let mut input: &[u8] = b"model\r";
+            let mut output = Vec::new();
+            black_box(
+                select_from_items(&mut input, &mut output, "Commands", &commands, None)
+                    .expect("selector"),
+            );
+        })
+    });
+
+    let models = (0..1000)
+        .map(|index| {
+            SelectorItem::new(
+                format!("model-{index:04}"),
+                format!("Model {index:04}"),
+                Some("tools · text".to_owned()),
+            )
+        })
+        .collect::<Vec<_>>();
+    c.bench_function("model_selector_filter_1000", |b| {
+        b.iter(|| {
+            let mut input: &[u8] = b"model-0999\r";
+            let mut output = Vec::new();
+            black_box(
+                select_from_items(&mut input, &mut output, "Models", &models, None)
+                    .expect("selector"),
+            );
+        })
     });
 }
 
@@ -450,6 +499,7 @@ criterion_group!(
     argument_parsing,
     terminal_renderer,
     event_dispatch,
+    terminal_selectors,
     tool_operations,
     cancellation_permission_and_continuation,
     atomic_and_staged_writes,

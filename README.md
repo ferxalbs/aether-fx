@@ -57,18 +57,49 @@ aether --help
 aether doctor
 ```
 
-Inference and model discovery require a Rainy API key. The key is read from the environment only
-for those operations and is never printed or persisted:
+Inference and model discovery require a Rainy API key. The key is read only when a Rainy
+operation is requested and is never printed, persisted, placed in command arguments, or sent to
+the model. The simplest setup is an environment variable:
 
 ```sh
 export RAINY_API_KEY='your-key'
 aether models
-export AETHER_MODEL='model-id-from-the-catalog'
 ```
 
-`--model <id>` overrides `AETHER_MODEL` for one invocation. AETHER does not require Rust, Cargo,
-Bun, the Rainy SDK, or a Rainy API deployment after installation. `rainy-sdk` is compiled into
-AETHER; the Rainy API is the hosted remote inference service.
+For a persistent non-secret default, use the private application configuration layer rather than
+editing environment state:
+
+```sh
+aether config path
+aether config show
+aether config edit
+```
+
+The configuration file is JSON and may contain `default_model` plus an optional direct
+`auth.credential_helper` argv array. It never stores an API key. `aether config show` reports only
+whether a helper is configured, so its output is safe to paste into an issue. The editor is
+invoked directly, without a shell; helper output is bounded and used only for the current
+process.
+
+Model resolution is deterministic: explicit `--model`, then the model stored with a resumed
+session, then `default_model` from config, then the compatibility `AETHER_MODEL` environment
+variable, then interactive `/model` selection when a TTY is available. `/model` changes only
+future turns and never edits environment variables. `--model <id>` therefore overrides every
+stored or environment default for that invocation.
+
+Use the separate authentication surface when guided setup is preferable:
+
+```sh
+aether auth
+```
+
+On a TTY, `aether auth` can accept a key without echoing it and keeps it in process memory only.
+In a pipe, CI job, or `--non-interactive` invocation it reports status without attempting a
+secret prompt. An environment variable or configured helper is preferred for automation.
+
+AETHER does not require Rust, Cargo, Bun, the Rainy SDK, or a Rainy API deployment after
+installation. `rainy-sdk` is compiled into AETHER; the Rainy API is the hosted remote inference
+service.
 
 ## Run
 
@@ -84,6 +115,18 @@ For one-shot use:
 ```sh
 aether --model <id> "inspect this repository and explain the highest-risk issue"
 ```
+
+The bare `aether` command opens the stateful shell only when stdin and stdout are terminals. A
+leading `/` opens the local command palette; slash commands such as `/model`, `/status`,
+`/context`, `/config`, `/auth`, `/sessions`, `/resume`, `/doctor`, `/help`, `/clear`, and `/exit`
+are handled locally and are never sent to Rainy. Natural text containing `/` remains ordinary
+prompt text. Arrow keys or `j`/`k` navigate selectors, Enter confirms, and Escape or Ctrl-C
+cancels.
+
+For scripts and CI, use `--non-interactive` or a pipe. `--json` emits structured records without
+a startup banner, prompt, selector, or ANSI decoration; local slash commands still remain local.
+The default `aether doctor` is offline. `aether models` explicitly retrieves the live Rainy
+catalog, while `aether doctor --network` adds an explicit catalog/reachability probe.
 
 ## Resume
 

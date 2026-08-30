@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 
 use aether_core::{PermissionDecision, PermissionRequest};
 
-use crate::{input, platform};
+use crate::{input, platform, sanitize_terminal_text, truncate_display};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PermissionPromptOutcome {
@@ -48,17 +48,15 @@ impl Drop for TerminalGuard {
 
 /// Run the intentionally small initial terminal shell and return one entered line.
 pub fn run_minimal_shell() -> io::Result<Option<String>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return crate::shell::read_plain_line_from(&mut io::stdin().lock());
+    }
     let mut guard = TerminalGuard::enter()?;
     let mut stdout = io::stdout().lock();
-    stdout.write_all("\x1b[2K\r› ".as_bytes())?;
+    crate::selector::clear_line(&mut stdout)?;
+    stdout.write_all("\r› ".as_bytes())?;
     stdout.flush()?;
-    let line = if guard.is_interactive() {
-        input::read_line_from(&mut io::stdin().lock(), &mut stdout)?
-    } else {
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        Some(line.trim_end_matches(['\r', '\n']).to_owned())
-    };
+    let line = input::read_line_from(&mut io::stdin().lock(), &mut stdout)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     guard.restore()?;
@@ -72,13 +70,13 @@ pub fn prompt_permission(request: &PermissionRequest) -> io::Result<PermissionPr
     }
     let mut guard = TerminalGuard::enter()?;
     let mut stdout = io::stdout().lock();
-    write!(stdout, "\n{}", request.operation)?;
+    write!(stdout, "\n{}", truncate_display(&sanitize_terminal_text(&request.operation), 160))?;
     if let Some(target) = request.target.as_deref() {
-        write!(stdout, " {}", target)?;
+        write!(stdout, " {}", truncate_display(&sanitize_terminal_text(target), 240))?;
     }
     if !request.details.is_null() {
         let details = serde_json::to_string(&request.details).unwrap_or_else(|_| "{}".to_owned());
-        write!(stdout, "\n  {}", details)?;
+        write!(stdout, "\n  {}", truncate_display(&sanitize_terminal_text(&details), 1024))?;
     }
     stdout.write_all(b"\n\n[y] allow once\n[s] allow session\n[n] deny\n")?;
     stdout.flush()?;
@@ -107,6 +105,7 @@ fn read_permission_outcome<R: io::Read>(reader: &mut R) -> io::Result<Permission
             }
             Some(input::InputEvent::Enter)
             | Some(input::InputEvent::Backspace)
+            | Some(input::InputEvent::Tab)
             | Some(input::InputEvent::Escape)
             | Some(input::InputEvent::Up)
             | Some(input::InputEvent::Down)

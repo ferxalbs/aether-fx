@@ -1,5 +1,41 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-30 (2) - Interactive shell and model experience
+
+### Added
+
+- Added a TTY-gated stateful shell with a local slash-command palette, shared selectors,
+  confirmations, secret input, status/context views, session controls, and terminal restoration.
+- Added live Rainy catalog normalization for capability, access, context, reasoning modes and
+  numeric budgets, modality, and data-policy presentation across `/model`, `aether models`,
+  `/status`, and JSON output.
+- Added non-secret configuration commands (`config path|show|edit`), a separate authentication
+  surface, bounded direct credential-helper support, and offline/network-separated diagnostics.
+
+### Changed
+
+- Unified interactive, one-shot, piped, JSON, and headless behavior behind explicit TTY and
+  non-interactive boundaries; local slash commands are never sent to the model.
+- Added deterministic model precedence and model-switch continuation invalidation while keeping
+  the existing backend-neutral agent runtime and permission authority intact.
+
+### Performance
+
+- Added bounded shell-selector benchmarks; the full local run measured 18.025 µs for slash-palette
+  filtering and 395.74 µs for filtering a 1,000-entry model catalog.
+
+### Security
+
+- Kept API keys out of configuration, argv, history, sessions, logs, JSON output, and model
+  context; bounded helper output and direct editor/helper invocation do not use a shell.
+- Added terminal-safe catalog/session rendering, private configuration permissions, and adversarial
+  coverage for symlink, redaction, malformed-catalog, and machine-output boundaries.
+
+### Documentation
+
+- Documented the interactive/headless architecture, normalized catalog contract, model precedence,
+  configuration/authentication behavior, and terminal trust boundaries.
+
 ## Unreleased - 2026-08-30 (1) - Adaptive tool surface and interactive model selection
 
 ### Added

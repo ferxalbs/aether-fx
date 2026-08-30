@@ -29,6 +29,13 @@ The verified Rainy SDK is `rainy-sdk 0.6.16`. No `6.5.x` release was available, 
 
 No new crate is added. `aether-agent` uses the existing `blake3` crate for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, or unpublished Rainy SDK version is used.
 
+The interactive shell/model work adds no package to the resolved dependency graph. The existing
+workspace `serde` dependency is now declared directly by `aether` for bounded config and machine
+output, and by `aether-rainy` for the normalized catalog projection; this is serialization on
+control/catalog paths, not a new provider transport or an additional hot-path framework. The
+provider stream remains the existing `rainy-sdk`/`futures-util` boundary, and all UI filtering is
+local over the already-loaded bounded catalog.
+
 ## Tooling baseline
 
 The CI/release plan also verifies `cargo-deny 0.20.2`, `cargo-audit 0.22.2`, `cargo-llvm-cov 0.9.0`, `cargo-nextest 0.9.143`, `cargo-bloat 0.12.1` (optional report), and `cargo-cyclonedx 0.5.9`.

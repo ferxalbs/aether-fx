@@ -8,6 +8,7 @@ pub(crate) const STATE_DIR_ENV: &str = "AETHER_FX_STATE_DIR";
 pub(crate) const STATE_ROOT_NAME: &str = "aether-fx";
 pub(crate) const WORKSPACES_DIR: &str = "workspaces";
 pub(crate) const SESSION_DIR: &str = "sessions";
+pub(crate) const CONFIG_FILE: &str = "config.json";
 pub(crate) const WORKSPACE_METADATA: &str = "workspace.json";
 pub(crate) const WORKSPACE_METADATA_VERSION: u32 = 1;
 pub(crate) const MAX_WORKSPACE_METADATA_BYTES: usize = 16 * 1024;

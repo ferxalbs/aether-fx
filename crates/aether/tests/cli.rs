@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aether_agent::SessionStore;
@@ -34,6 +35,27 @@ fn run_with_state(root: &Path, arguments: &[&str], state_dir: &Path) -> std::pro
         .env_remove("AETHER_MODEL")
         .output()
         .unwrap()
+}
+
+fn run_piped(
+    root: &Path,
+    arguments: &[&str],
+    state_dir: &Path,
+    input: &[u8],
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aether"))
+        .args(arguments)
+        .args(["--root", root.to_str().unwrap()])
+        .env("AETHER_FX_STATE_DIR", state_dir)
+        .env_remove("RAINY_API_KEY")
+        .env_remove("AETHER_MODEL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn run_doctor_with_configuration(root: &Path, state_dir: &Path) -> std::process::Output {
@@ -215,6 +237,29 @@ fn version_reports_exact_package_version() {
     let output = run(&root, ["--version"].as_slice());
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stdout), concat!(env!("CARGO_PKG_VERSION"), "\n"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn json_version_is_one_structured_machine_record() {
+    let root = temp_root("json-version");
+    let output = run(&root, ["--json", "--version"].as_slice());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert!(!output.stdout.contains(&0x1b));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn invalid_explicit_model_is_rejected_instead_of_falling_back() {
+    let root = temp_root("invalid-model");
+    let output = run(&root, ["--model", "model with spaces", "prompt"].as_slice());
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--model"));
+    assert!(output.stdout.is_empty());
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(state_root(&root));
 }
@@ -452,4 +497,112 @@ fn state_session_file_links_are_rejected() {
     let _ = fs::remove_dir_all(&outside);
     let _ = fs::remove_dir_all(state_root(&root));
     let _ = fs::remove_dir_all(state_root(&outside));
+}
+
+#[test]
+fn piped_shell_has_no_banner_prompt_or_ansi_and_keeps_slash_commands_local() {
+    let root = temp_root("piped-shell");
+    let output = run_piped(&root, &[], &state_root(&root), b"/help\n/exit\n");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Interactive commands:"), "{stdout}");
+    assert!(!stdout.contains('\x1b'), "{stdout:?}");
+    assert!(!stdout.contains("›"), "{stdout:?}");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn piped_json_shell_emits_structured_local_help_without_decoration() {
+    let root = temp_root("piped-json");
+    let output = run_piped(&root, ["--json"].as_slice(), &state_root(&root), b"/help\n/exit\n");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains('\x1b'), "{stdout:?}");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["topic"], serde_json::Value::Null);
+    assert!(value["commands"].as_array().is_some());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn one_shot_execution_suppresses_identity_even_when_attached_to_a_tty_contract() {
+    let root = temp_root("one-shot");
+    let output = run(&root, ["--model", "test-model", "inspect"].as_slice());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "{}", String::from_utf8_lossy(&output.stdout));
+    assert!(!output.stdout.contains(&0x1b), "{}", String::from_utf8_lossy(&output.stdout));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("workspace"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn config_show_redacts_credential_helper_arguments() {
+    let root = temp_root("config-redaction");
+    let state = state_root(&root);
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "default_model": "catalog-model",
+            "auth": {"credential_helper": ["credential-tool", "secret-token"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&root, ["config", "show", "--json"].as_slice());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("secret-token"), "{stdout}");
+    assert!(stdout.contains("credential_helper_configured"), "{stdout}");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn config_symlink_is_rejected_without_reading_the_target() {
+    let root = temp_root("config-link");
+    let state = state_root(&root);
+    fs::create_dir_all(&state).unwrap();
+    let target = temp_root("config-link-target").join("secret-config.json");
+    fs::write(&target, br#"{"default_model":"secret-model"}"#).unwrap();
+    let link = state.join("config.json");
+    if try_file_symlink(&target, &link) {
+        let output = run(&root, ["config", "show"].as_slice());
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("symbolic link"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-model"));
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(target.parent().unwrap());
+    let _ = fs::remove_dir_all(state);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_edit_creates_private_state_with_a_direct_editor_invocation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root("config-edit");
+    let state = state_root(&root);
+    let output = Command::new(env!("CARGO_BIN_EXE_aether"))
+        .args(["config", "edit", "--root", root.to_str().unwrap()])
+        .env("AETHER_FX_STATE_DIR", &state)
+        .env_remove("RAINY_API_KEY")
+        .env_remove("AETHER_MODEL")
+        .env("VISUAL", "/usr/bin/true")
+        .env_remove("EDITOR")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let config = state.join("config.json");
+    assert!(config.is_file());
+    assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state);
 }

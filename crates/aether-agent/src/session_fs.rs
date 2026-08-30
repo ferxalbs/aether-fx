@@ -154,6 +154,22 @@ pub(crate) fn state_root() -> Result<PathBuf, SessionStoreError> {
     state::resolve_state_root()
 }
 
+pub(crate) fn config_path(
+    workspace: impl AsRef<Path>,
+    create: bool,
+) -> Result<PathBuf, SessionStoreError> {
+    let workspace = state::canonical_workspace(workspace.as_ref())?;
+    let state_root = state::validated_state_root(&workspace)?;
+    if create {
+        ensure_state_root_path(&state_root)?;
+    } else if !real_directory_exists(&state_root, "AETHER Fx state root")? {
+        return Ok(state_root.join(state::CONFIG_FILE));
+    }
+    let path = state_root.join(state::CONFIG_FILE);
+    reject_indirect_file(&path, "AETHER Fx config file")?;
+    Ok(path)
+}
+
 #[derive(Deserialize, Serialize)]
 struct WorkspaceMetadata {
     version: u32,

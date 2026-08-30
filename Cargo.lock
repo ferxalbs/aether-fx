@@ -12,6 +12,7 @@ dependencies = [
  "aether-terminal",
  "aether-tools",
  "lexopt",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -63,6 +64,7 @@ dependencies = [
  "aether-core",
  "futures-util",
  "rainy-sdk",
+ "serde",
  "serde_json",
  "tokio",
 ]

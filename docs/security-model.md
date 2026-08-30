@@ -90,6 +90,43 @@ premature finish claim cannot establish completion. The deterministic negative c
 asserts that such a claim is rejected. The extra re-execution under uncertain freshness is an
 intentional bounded cost for fail-closed evidence handling.
 
+## Interactive, headless, and terminal-integrity boundaries
+
+Raw terminal mode is entered only after both standard streams have been identified as terminals.
+The RAII terminal guard restores modes on normal return and unwind. Pipe, JSON, one-shot, and
+`--non-interactive` invocations use bounded plain-line input, no prompt/banner/ANSI output, and a
+`NoPermissionBroker` unless the user explicitly selected the existing `--yolo` authority mode.
+Interactive selectors and the slash palette are presentation only: choosing an entry never
+authorizes a tool, bypasses expected-hash checks, or changes the typed permission policy.
+
+Catalog, session, and model strings are untrusted display data. They are bounded, sanitized for
+control characters, truncated by terminal display cells without splitting graphemes, and ordered
+deterministically before rendering. Catalog fields that are absent remain `unknown`; AETHER does
+not infer capabilities, access, context, tier, or reasoning support from a model name. Raw catalog
+JSON is not sent through the renderer.
+
+## Configuration and authentication
+
+Non-secret preferences live in `config.json` at the private application-state root, never in a
+repository. AETHER creates state directories with user-only `0700` permissions and configuration
+files with `0600` permissions on Unix, writes through a same-directory temporary file, and rejects
+symbolic links/reparse points at the state and configuration boundaries. The configuration schema
+is deliberately small: a bounded default model and an optional bounded direct argv credential
+helper. `config show` exposes the default model and a helper configured/not-configured boolean,
+never helper arguments or secret output.
+
+Credential precedence is environment first, then the configured helper. A helper is started with
+direct `Command` argv semantics, no shell, null stdin/stderr, a 16 KiB stdout ceiling, and a
+five-second deadline. Its output is accepted only as a bounded UTF-8 key for the current process;
+it is not written to config, sessions, logs, JSON output, or model context. Interactive secret
+input has no echo or masking bytes, accepts Ctrl-C/Escape as cancellation, and restores the
+terminal before returning. There is intentionally no `--key` option because secrets in argv can
+leak through process listings, shell history, CI diagnostics, and crash reports.
+
+The default doctor is offline and reports only presence/configuration facts. Network catalog
+diagnostics require an explicit `--network`; neither path prints authorization headers, raw keys,
+helper output, or other credential material.
+
 ## Dangerous operations
 
 The v0.1 Git contract exposes status, diff, show, log, and branch inspection. Push, remote mutation, hard reset, rebase, filter-branch, and automatic commit are absent. Shell execution is direct argv by default and is permission-gated.

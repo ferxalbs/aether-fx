@@ -16,6 +16,7 @@ aether-rainy.workspace = true
 aether-terminal.workspace = true
 aether-tools.workspace = true
 lexopt.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }

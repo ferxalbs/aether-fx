@@ -2,6 +2,9 @@ use std::io::{self, Read, Write};
 
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Maximum bytes retained by one line-oriented input operation.
+pub const MAX_INPUT_LINE_BYTES: usize = 16 * 1024;
+
 /// A small raw-input vocabulary used by the initial shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -15,6 +18,8 @@ pub enum InputEvent {
     Enter,
     /// Backspace/delete backwards.
     Backspace,
+    /// Tab.
+    Tab,
     /// Ctrl+C.
     CtrlC,
     /// Ctrl+D.
@@ -34,6 +39,7 @@ pub fn read_event<R: Read>(reader: &mut R) -> io::Result<Option<InputEvent>> {
         0x03 => InputEvent::CtrlC,
         0x04 => InputEvent::CtrlD,
         0x08 | 0x7F => InputEvent::Backspace,
+        0x09 => InputEvent::Tab,
         0x1B => decode_escape(reader)?,
         0x0E => InputEvent::Down,
         0x10 => InputEvent::Up,
@@ -87,8 +93,10 @@ pub fn read_line_from<R: Read, W: Write>(
         };
         match event {
             InputEvent::Character(character) => {
-                line.push(character);
-                write_char(writer, character)?;
+                if line.len().saturating_add(character.len_utf8()) <= MAX_INPUT_LINE_BYTES {
+                    line.push(character);
+                    write_char(writer, character)?;
+                }
             }
             InputEvent::Enter => return Ok(Some(line)),
             InputEvent::Backspace => {
@@ -99,7 +107,7 @@ pub fn read_line_from<R: Read, W: Write>(
                 }
             }
             InputEvent::CtrlC | InputEvent::CtrlD => return Ok(None),
-            InputEvent::Escape | InputEvent::Up | InputEvent::Down => {}
+            InputEvent::Escape | InputEvent::Up | InputEvent::Down | InputEvent::Tab => {}
         }
         writer.flush()?;
     }

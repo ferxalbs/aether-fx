@@ -6,7 +6,37 @@ The SDK version that was requested as a future `6.5.x` release was not present i
 
 Model catalogs are lazy and cached by the adapter layer when the caller asks for them. Startup and the initial terminal prompt do not construct a Rainy client or perform a network request. `RAINY_API_KEY` is required only for an explicit inference/catalog operation.
 
-Normal inference uses deterministic model precedence in the binary: `--model`, then `AETHER_MODEL`, then a clear configuration error. The adapter does not use the first catalog item as an implicit model and does not fetch the catalog merely to validate a selected model. The `models` subcommand remains the explicit catalog-discovery path.
+Normal inference uses deterministic model precedence in the binary: explicit `--model`, resumed
+session model, non-secret config `default_model`, compatibility `AETHER_MODEL`, then interactive
+selection when a TTY is available. The adapter does not use the first catalog item as an implicit
+model and does not fetch the catalog merely to validate a selected model. The `models` subcommand
+and `/model` remain explicit catalog-discovery paths.
+
+## Normalized catalog contract
+
+`RainyBackend::discover_model_views` converts the live SDK entries into one bounded `ModelView`
+projection shared by `/model`, `aether models`, `/status`, and JSON output. The projection consumes
+the SDK's authoritative fields rather than model-name heuristics:
+
+- identity and display name;
+- physical/model context, authenticated plan context, and effective usable context;
+- product tier and billing class;
+- tools, reasoning, reasoning modes/values/parameter paths, numeric thinking-budget bounds and
+  optional dynamic/disable values, supported parameters, and input/output modalities;
+- organization entitlement, privacy compatibility/mode, and three-valued availability;
+- policy status, disclosure requirement/notice, training-with-inputs, ZDR availability, and bounded
+  retention metadata.
+
+The normalization order is v2 capability data, then v1 capability flags, then supported parameter
+names where the SDK does not provide a richer block. Missing facts remain `unknown`. Explicit
+organization/privacy denial or an explicit lack of tool support makes an entry unavailable for the
+coding shell; unknown metadata remains selectable only after an explicit acknowledgement. A
+disclosure-required entry is shown with policy details before confirmation. All catalog text is
+bounded and terminal-sanitized before it reaches a selector.
+
+The primary selector is intentionally compact: human name plus model ID, effective context, tier,
+tools, reasoning, and access. The JSON form retains the normalized fields for machine consumers;
+it does not expose an unbounded copy of the provider response.
 
 Rainy's transport/retry behavior remains Rainy's/SDK's responsibility. AETHER emits semantic step IDs and does not blindly retry ambiguous tool/model operations. The verified 0.6.16 ResponsesRequest surface has no documented idempotency field, so AETHER does not invent one; the IDs remain the local semantic identity until an SDK contract exposes transport integration. Reasoning and continuation fields are opaque values; raw chain-of-thought is never rendered or exposed as a tool result.
 

@@ -73,6 +73,16 @@ impl SessionStore {
         session_fs::state_root()
     }
 
+    /// Resolve the non-secret user configuration path outside the workspace.
+    pub fn config_path(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+        session_fs::config_path(workspace, false)
+    }
+
+    /// Prepare the private state root and resolve the non-secret configuration path.
+    pub fn prepare_config_path(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+        session_fs::config_path(workspace, true)
+    }
+
     /// Return the canonical workspace path used for state binding and execution.
     pub fn canonical_workspace(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
         session_fs::canonical_workspace(workspace)

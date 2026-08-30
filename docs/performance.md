@@ -14,7 +14,6 @@ The initial targets are engineering targets, not achieved claims:
 | Renderer update | < 8 ms |
 | Ctrl+C cancellation | < 50 ms |
 
-The benchmark suite covers process startup, argument parsing, renderer/buffer work, event dispatch, small and large bounded reads, listing, finding, content search, patch validation/application, session replay, blocking-dispatch overhead, cancellation checkpoints, permission decisions, continuation bookkeeping, atomic write, staged patch application, persistent-process buffer reads, and short registry lookups. It is deterministic and excludes network calls; process-buffer benchmarks use a bounded fixture and terminate it after measurement.
 
 Phase 1 design measurements to record locally are:
 
@@ -24,6 +23,14 @@ Phase 1 design measurements to record locally are:
 | Persistent output memory | 16 × 2 × 256 KiB maximum stream storage | design bound |
 | Cancellation latency | cooperative checkpoints plus 10 ms polling for async process I/O | diagnostic benchmark pending |
 | Release binary size | 4,997,200 bytes (4.77 MiB); 225 locked packages | measured 2026-08-22 |
+
+The benchmark suite covers process startup, argument parsing, renderer/buffer work, event dispatch,
+small and large bounded reads, listing, finding, content search, patch validation/application,
+session replay, blocking-dispatch overhead, cancellation checkpoints, permission decisions,
+continuation bookkeeping, atomic write, staged patch application, persistent-process buffer reads,
+short registry lookups, and bounded shell selector/palette filtering. It is deterministic and
+excludes network calls; process-buffer benchmarks use a bounded fixture and terminate it after
+measurement.
 
 The blocking pool is deliberately not an unbounded fan-out: each filesystem/search tool call uses one bounded blocking operation, and traversal/result limits remain enforced inside that operation. Process output is drained continuously into recent-output buffers rather than accumulating an unbounded log.
 
@@ -180,3 +187,37 @@ These are deterministic, local diagnostics rather than cross-platform guarantees
 reference with the release build, the two `aether-eval` commands in `evals/README.md`,
 `cargo llvm-cov --workspace --all-features --locked --lcov`, and the preflight commands in
 `AGENTS.md`.
+
+## Interactive shell and model experience measurements — 2026-08-30
+
+The release-facing shell was measured on the same local macOS host after `cargo build --release
+--locked`. The stripped `target/release/aether` binary was 6,365,736 bytes (6.07 MiB), an
+increase of 242,320 bytes (236.6 KiB, 3.96%) over the frozen agent-runtime binary at 6,123,416
+bytes. This remains below the preferred 250 KiB feature-growth budget. Direct
+`/usr/bin/time -l` probes measured 0.07 s and 7,385,088 bytes peak RSS for `--version`, 0.07 s
+and 7,417,856 bytes for `--help`, and 0.07 s and 7,761,920 bytes for a piped EOF shell
+startup. These are process probes, not cross-platform interactive-startup guarantees.
+
+The full Criterion suite's selector probes measured 18.025 µs for slash-palette open/filter/confirm
+and 395.74 µs for filtering and confirming a 1,000-entry model list (point estimates). Both are
+local processing over an already loaded catalog and remain below the corresponding 2 ms / 1 ms
+engineering targets. The benchmark does not include Rainy catalog retrieval, terminal transport
+latency, or network time.
+
+Headless acceptance probes sent `/help`, `/status`, `/doctor`, and `/exit` through a pipe with
+`--non-interactive`: they produced 2,155 bytes, no stderr, no ANSI escape, and no prompt glyph.
+The JSON shell sent `/help` and `/exit` with `--json --non-interactive`: it produced one JSON
+line, no stderr, and no ANSI decoration. A PTY smoke drove `/help` and `/exit` through the native
+palette and exited successfully. The default doctor remained offline; no live Rainy credential
+was used in these measurements.
+
+The frozen agent-runtime acceptance metrics above remain the comparison reference. The new UI
+work does not alter WorkState, TurnDirectorState, adaptive tool selection, context/evidence
+freshness, verification, permission admission, expected-hash mutation, dirty-worktree ownership,
+scheduler behavior, or completion review; workspace tests and offline evaluator gates are required
+again before release claims are made.
+The final all-features LCOV run covered 21,936 of 27,711 lines (79.16%) across the workspace;
+the earlier 80.91% figure above is the frozen-runtime baseline from its separate measurement.
+The final source-tree evaluator rerun reproduced the frozen 9/9 regression and 5/5 capability
+results, with diagnostic agent wall times of 17,295 ms and 8,166 ms respectively; these are local
+measurements rather than release-time guarantees.
