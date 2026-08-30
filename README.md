@@ -5,7 +5,7 @@ bounded set of filesystem, process, search, patch, and Git tools.
 
 ## Alpha status
 
-`v0.1.0-alpha-01` is an alpha preview. It is not stable or production-ready software. The first
+`v0.1.0-alpha-02` is an alpha preview. It is not stable or production-ready software. This
 release is distributed only through GitHub Releases and supports the six platforms listed below.
 
 ## Install
@@ -17,8 +17,8 @@ archive with `SHA256SUMS`, installs to `$HOME/.local/bin`, and does not edit she
 
 ```sh
 curl -fsSL \
-  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-01/install.sh \
-  | sh -s -- --version v0.1.0-alpha-01
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-02/install.sh \
+  | sh -s -- --version v0.1.0-alpha-02
 ```
 
 Use `--dir <path>` to choose another user-owned installation directory.
@@ -30,10 +30,10 @@ Download the tagged installer, then run it with the explicit prerelease version.
 
 ```powershell
 Invoke-WebRequest `
-  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-01/install.ps1 `
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-02/install.ps1 `
   -OutFile install.ps1
 
-.\install.ps1 -Version v0.1.0-alpha-01
+.\install.ps1 -Version v0.1.0-alpha-02
 ```
 
 Use `-Dir <path>` to choose another user-owned installation directory.
@@ -41,7 +41,7 @@ Use `-Dir <path>` to choose another user-owned installation directory.
 ### Manual archive installation
 
 Download the archive for your platform and `SHA256SUMS` from the
-[v0.1.0-alpha-01 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-01).
+[v0.1.0-alpha-02 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-02).
 Verify the archive before extracting it, then place `aether` or `aether.exe` in a user-owned
 directory on your PATH. Each archive contains only the executable, its CycloneDX SBOM, `LICENSE`,
 `NOTICE`, and `THIRD_PARTY_NOTICES.md`.
@@ -114,7 +114,7 @@ download flow verifies the archive against `SHA256SUMS`; `sha256sum` or `shasum 
 the Unix installer. GitHub CLI users may additionally verify an archive's build attestation:
 
 ```sh
-gh attestation verify aether-v0.1.0-alpha-01-linux-x86_64-gnu.tar.gz \
+gh attestation verify aether-v0.1.0-alpha-02-linux-x86_64-gnu.tar.gz \
   --repo ferxalbs/aether-fx
 ```
 

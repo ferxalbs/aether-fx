@@ -1,6 +1,17 @@
 # CHANGELOG
 
-## Unreleased - 2026-08-29 (3) - Evidence freshness and completion reliability
+## Unreleased - 2026-08-29 (5) - Pending public changes
+
+## v0.1.0-alpha-02 - 2026-08-29 (4) - Adaptive orchestration and evidence-fresh completion
+
+### Release packaging and installation
+
+#### Changed
+
+- Published the second installable alpha contract with `aether --version` reporting
+  `0.1.0-alpha-02`; installers and GitHub Release archives remain version-pinned to this tag.
+
+### 2026-08-29 — Evidence freshness and completion reliability
 
 ### Changed
 
@@ -28,7 +39,7 @@
   boundary is weakened. Freshness decisions only control whether an observation may be reused;
   they never grant mutation authority.
 
-## Unreleased - 2026-08-29 (2) - Runtime-owned completion and verification
+### 2026-08-29 — Runtime-owned completion and verification
 
 ### Added
 
@@ -53,7 +64,7 @@
   and execution; completion remains fail-closed on stale evidence, unresolved work, or incomplete
   verification.
 
-## Unreleased - 2026-08-29 (1) - Adaptive repository orchestration
+### 2026-08-29 — Adaptive repository orchestration
 
 ### Added
 
@@ -78,7 +89,7 @@
 - Completion requires current task, evidence, verification, blocker, and user-ownership facts;
   stale or missing state cannot authorize a mutation result or Done state.
 
-## Unreleased - 2026-08-28 (1) - Evidence-driven coding loop hardening
+### 2026-08-28 — Evidence-driven coding loop hardening
 
 ### Added
 
@@ -100,7 +111,7 @@
 - Automatic evidence reads are bounded, canonical-root-contained, symlink-rejecting observations
   and never grant mutation authority or bypass tool permits and expected-hash checks.
 
-## Unreleased - 2026-08-27 (2) - Native Windows workspace paths
+### 2026-08-27 — Native Windows workspace paths
 
 ### Fixed
 
