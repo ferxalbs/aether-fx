@@ -217,33 +217,36 @@ fn initialize_git_repository(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Compare the same deterministic model trace with and without runtime-owned verification. The
+/// Evaluate deterministic runtime-owned verification and completion controls. The positive
 /// fixture is deliberately not a language package: the planner's bounded `git diff --check`
-/// fallback makes the control result fast, reproducible, and independent of a dependency cache.
+/// fallback makes that case fast, reproducible, and independent of a dependency cache.
 pub(crate) fn run_control_loop_evaluation() -> Result<ControlLoopEvaluation, String> {
     let baseline = run_task_with_git(&super::CONTROL_LOOP_TASK, super::CONTROL_LOOP_SCRIPT, false)?;
     let optimized = run_task_with_git(&super::CONTROL_LOOP_TASK, super::CONTROL_LOOP_SCRIPT, true)?;
     let correctness_preserved = baseline.success && optimized.success;
-    let reduced_tool_work = baseline.executed_tool_calls > optimized.executed_tool_calls;
     let automatic_verification = optimized.automatic_verification_attempts > 0;
-    let prevented_redundant = optimized.prevented_redundant_calls > 0;
-    let passed =
-        correctness_preserved && reduced_tool_work && automatic_verification && prevented_redundant;
-    let failure = (!passed).then(|| {
+    let bounded_fresh_reexecution =
+        optimized.executed_tool_calls <= baseline.executed_tool_calls.saturating_add(1);
+    let positive_passed =
+        correctness_preserved && automatic_verification && bounded_fresh_reexecution;
+    let positive_failure = (!positive_passed).then(|| {
         format!(
-            "same-trace control failed: baseline_success={} optimized_success={} baseline_tools={} optimized_tools={} automatic_verifications={} prevented={} baseline_failure={} optimized_failure={}",
+            "verification control failed: baseline_success={} optimized_success={} baseline_tools={} optimized_tools={} fresh_call_limit={} automatic_verifications={} prevented={} baseline_failure={} optimized_failure={}",
             baseline.success,
             optimized.success,
             baseline.executed_tool_calls,
             optimized.executed_tool_calls,
+            baseline.executed_tool_calls.saturating_add(1),
             optimized.automatic_verification_attempts,
             optimized.prevented_redundant_calls,
             baseline.failure.as_deref().unwrap_or("none"),
             optimized.failure.as_deref().unwrap_or("none"),
         )
     });
-    let case = ControlLoopCaseResult {
+    let positive_case = ControlLoopCaseResult {
         case_id: super::CONTROL_LOOP_TASK.id.to_owned(),
+        expected_completion_rejection: false,
+        passed: positive_passed,
         baseline_success: baseline.success,
         optimized_success: optimized.success,
         correctness_preserved,
@@ -257,9 +260,62 @@ pub(crate) fn run_control_loop_evaluation() -> Result<ControlLoopEvaluation, Str
         optimized_executed_tool_calls: optimized.executed_tool_calls,
         verification_scope: optimized.verification_scope,
         completion_rejections: optimized.completion_rejections,
-        failure,
+        failure: positive_failure,
     };
-    Ok(ControlLoopEvaluation { total: 1, passed: usize::from(passed), cases: vec![case] })
+    let premature_baseline =
+        run_task(&super::PREMATURE_COMPLETION, super::PREMATURE_COMPLETION_SCRIPT, false)?;
+    let premature_optimized =
+        run_task(&super::PREMATURE_COMPLETION, super::PREMATURE_COMPLETION_SCRIPT, true)?;
+    let completion_rejected = premature_baseline.completion_rejections > 0
+        && premature_optimized.completion_rejections > 0;
+    let no_verification_success = premature_baseline.verification_attempts == 0
+        && premature_optimized.verification_attempts == 0
+        && premature_baseline.final_test_status == "not_run"
+        && premature_optimized.final_test_status == "not_run";
+    let no_mutation_success = !super::PREMATURE_COMPLETION_SCRIPT
+        .iter()
+        .any(|action| matches!(action, Action::Write { .. }));
+    let completion_rejected_without_work = !premature_baseline.success
+        && !premature_optimized.success
+        && completion_rejected
+        && no_verification_success
+        && no_mutation_success;
+    let negative_failure = (!completion_rejected_without_work).then(|| {
+        format!(
+            "premature completion control failed: baseline_success={} optimized_success={} baseline_verification={} optimized_verification={} baseline_status={} optimized_status={} baseline_rejections={} optimized_rejections={} mutation_action_present={}",
+            premature_baseline.success,
+            premature_optimized.success,
+            premature_baseline.verification_attempts,
+            premature_optimized.verification_attempts,
+            premature_baseline.final_test_status,
+            premature_optimized.final_test_status,
+            premature_baseline.completion_rejections,
+            premature_optimized.completion_rejections,
+            !no_mutation_success,
+        )
+    });
+    let negative_case = ControlLoopCaseResult {
+        case_id: super::PREMATURE_COMPLETION.id.to_owned(),
+        expected_completion_rejection: true,
+        passed: completion_rejected_without_work,
+        baseline_success: premature_baseline.success,
+        optimized_success: premature_optimized.success,
+        correctness_preserved: !premature_baseline.success && !premature_optimized.success,
+        automatic_verification_attempts: premature_optimized.after.automatic_verification_attempts,
+        prevented_redundant_calls: premature_optimized.prevented_redundant_calls,
+        baseline_model_requests: premature_baseline.model_requests,
+        optimized_model_requests: premature_optimized.model_requests,
+        baseline_requested_tool_calls: premature_baseline.requested_tool_calls,
+        optimized_requested_tool_calls: premature_optimized.requested_tool_calls,
+        baseline_executed_tool_calls: premature_baseline.executed_tool_calls,
+        optimized_executed_tool_calls: premature_optimized.executed_tool_calls,
+        verification_scope: premature_optimized.verification_scope,
+        completion_rejections: premature_optimized.completion_rejections,
+        failure: negative_failure,
+    };
+    let cases = vec![positive_case, negative_case];
+    let passed = cases.iter().filter(|case| case.passed).count();
+    Ok(ControlLoopEvaluation { total: cases.len(), passed, cases })
 }
 
 /// Run a checkpointed task while applying one bounded external change between segments.

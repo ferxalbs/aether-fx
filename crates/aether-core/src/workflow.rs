@@ -731,6 +731,7 @@ impl WorkflowState {
     pub fn set_verification_plan(&mut self, steps: impl IntoIterator<Item = VerificationStep>) {
         for mut step in steps {
             step.revision = self.workspace_revision;
+            step.status = VerificationStatus::Pending;
             if step.command.as_str().is_empty()
                 || self.verification_steps.iter().any(|existing| {
                     existing.revision == step.revision && existing.command == step.command
@@ -1123,6 +1124,25 @@ mod tests {
         let step = VerificationStep::new("cargo check", "workspace", state.workspace_revision);
         state.set_verification_plan([step.clone(), step]);
         assert_eq!(state.verification_steps.len(), 1);
+    }
+
+    #[test]
+    fn installing_verification_plan_resets_prepassed_status_until_observed() {
+        let mut state = WorkflowState::new();
+        state.work.initialize_from_prompt("update the library");
+        state.record_relevant_file("src/lib.rs");
+        state.record_inspection();
+        state.record_mutation();
+
+        let mut step = VerificationStep::new("cargo test", "crate", state.workspace_revision);
+        step.status = VerificationStatus::Passed;
+        state.set_verification_plan([step]);
+
+        assert_eq!(state.verification_steps[0].status, VerificationStatus::Pending);
+        assert!(!state.complete_if_ready(&["src/lib.rs".into()]));
+        assert!(state.record_verification_command("cargo test", true));
+        assert_eq!(state.verification_steps[0].status, VerificationStatus::Passed);
+        assert!(state.complete_if_ready(&["src/lib.rs".into()]));
     }
 
     #[test]

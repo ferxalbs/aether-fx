@@ -262,10 +262,12 @@ pub struct CapabilityAggregate {
     pub unresolved_work_at_finish: u32,
 }
 
-/// One same-trace comparison for runtime-owned verification and zero-waste control.
+/// One deterministic control-loop case for runtime-owned verification and completion control.
 #[derive(Debug, Serialize)]
 pub struct ControlLoopCaseResult {
     pub case_id: String,
+    pub expected_completion_rejection: bool,
+    pub passed: bool,
     pub baseline_success: bool,
     pub optimized_success: bool,
     pub correctness_preserved: bool,
@@ -655,15 +657,41 @@ pub fn compact_capability_summary(suite: &CapabilitySuiteResult) -> String {
         .iter()
         .map(|case| case.automatic_verification_attempts)
         .sum::<u32>();
-    let reduced = suite
+    let bounded_fresh_reexecution = suite
         .control_loop
         .cases
         .iter()
-        .filter(|case| case.baseline_executed_tool_calls > case.optimized_executed_tool_calls)
+        .filter(|case| {
+            !case.expected_completion_rejection
+                && case.optimized_executed_tool_calls
+                    <= case.baseline_executed_tool_calls.saturating_add(1)
+        })
         .count();
+    let negative_case_id = suite
+        .control_loop
+        .cases
+        .iter()
+        .find(|case| case.expected_completion_rejection)
+        .map_or("none", |case| case.case_id.as_str());
     output.push_str(&format!(
-        "control_loop: {}/{} same_trace_reduced={} automatic_verifications={}\n",
-        suite.control_loop.passed, suite.control_loop.total, reduced, automatic,
+        "control_loop: {}/{} bounded_fresh_reexecution={} automatic_verifications={} negative_completion={}/{} negative_case={}\n",
+        suite.control_loop.passed,
+        suite.control_loop.total,
+        bounded_fresh_reexecution,
+        automatic,
+        suite
+            .control_loop
+            .cases
+            .iter()
+            .filter(|case| case.expected_completion_rejection && case.passed)
+            .count(),
+        suite
+            .control_loop
+            .cases
+            .iter()
+            .filter(|case| case.expected_completion_rejection)
+            .count(),
+        negative_case_id,
     ));
     output
 }
@@ -1272,7 +1300,6 @@ const RELATIONSHIP_HEAVY_EXPLORATION_SCRIPT: &[Action] = &[
     Action::Finish,
 ];
 
-#[cfg(test)]
 const PREMATURE_COMPLETION: Task = Task {
     id: "premature-completion-blocked",
     prompt: "repair the target and prove the change before finishing",
@@ -1284,7 +1311,6 @@ const PREMATURE_COMPLETION: Task = Task {
     max_tool_calls: 1,
     max_verification_attempts: 1,
 };
-#[cfg(test)]
 const PREMATURE_COMPLETION_SCRIPT: &[Action] = &[Action::Finish];
 
 #[cfg(test)]
@@ -1366,10 +1392,22 @@ mod tests {
         assert!(suite.aggregate.mutation_refresh_events > 0);
         assert_eq!(suite.aggregate.false_completion_count, 0);
         assert_eq!(suite.control_loop.passed, suite.control_loop.total);
+        assert_eq!(suite.control_loop.total, 2);
+        let negative = suite
+            .control_loop
+            .cases
+            .iter()
+            .find(|case| case.expected_completion_rejection)
+            .expect("negative completion control case");
+        assert_eq!(negative.case_id, PREMATURE_COMPLETION.id);
+        assert!(negative.passed);
+        assert!(!negative.baseline_success);
+        assert!(!negative.optimized_success);
+        assert!(negative.completion_rejections > 0);
         assert!(suite.control_loop.cases[0].automatic_verification_attempts > 0);
         assert!(
-            suite.control_loop.cases[0].baseline_executed_tool_calls
-                > suite.control_loop.cases[0].optimized_executed_tool_calls
+            suite.control_loop.cases[0].optimized_executed_tool_calls
+                <= suite.control_loop.cases[0].baseline_executed_tool_calls.saturating_add(1)
         );
     }
 }

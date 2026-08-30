@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## Unreleased - 2026-08-29 (3) - Evidence freshness and completion reliability
+
+### Changed
+
+- Successful non-read discovery and verification observations are re-executed unless their full
+  dependency freshness can be proven; this avoids returning stale search, listing, finding, or
+  verification results from the generic observation cache.
+- Exact read observations remain reusable when a bounded live hash of the canonical file still
+  matches the retained evidence. Known and certain shell mutations may clear stale workspace
+  state only after every affected path has been refreshed successfully; uncertain or partial
+  refreshes remain stale.
+- Installed verification plans normalize every step to `pending`, and completion requires an
+  observed successful verification for the current workspace revision.
+- The conservative re-execution rule can spend an extra tool call when dependency freshness is
+  uncertain; that bounded cost is preferred to speculative reuse of stale repository state.
+
+### Added
+
+- Added a deterministic negative premature-completion trajectory proving that a finish attempt
+  without required work or observed verification is rejected in both baseline and optimized
+  control runs.
+
+### Security
+
+- No permission, workspace-containment, canonical-path, symlink/reparse, permit, or expected-hash
+  boundary is weakened. Freshness decisions only control whether an observation may be reused;
+  they never grant mutation authority.
+
 ## Unreleased - 2026-08-29 (2) - Runtime-owned completion and verification
 
 ### Added

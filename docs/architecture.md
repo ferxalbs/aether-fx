@@ -75,6 +75,19 @@ Rainy adapter
 
 For complex prompts, `aether-core::WorkState` adds a compact adaptive work ledger: normalized objective, explicit acceptance criteria, bounded path subgoals, dependencies, active status, evidence, mutations, verification records, and typed blockers. A model may optionally send one bounded `<aether-work>` JSON outline containing subgoal intent, dependencies, and paths; the runtime validates that outline but ignores model-declared completion, blocker, criterion, evidence, mutation, and verification fields. Simple prompts retain the simple path. The runtime records observable work and refuses completion when concrete structured work, unsatisfied criteria, or blockers remain. Failed verification output is reduced to bounded path/line/column/code/symbol diagnostics, and the runtime promotes a canonical, bounded source window for those paths. Successful mutations similarly refresh affected source evidence; exact subsequent reads may reuse it only after a live hash check. Restored contexts are re-hashed against the live workspace before any resumed action and again before completion.
 
+Observation freshness is deliberately asymmetric. Successful non-read discovery and verification
+observations are not served from the generic cache unless all of their dependencies have a proven
+current revision; when that proof is unavailable, the tool executes again. This conservative extra
+call preserves current repository navigation and verification evidence at the cost of some local
+latency. Exact reads retain the cheaper reuse path only after a bounded live hash of the canonical
+file matches the retained hash. A known, certain shell mutation may clear stale workspace state
+only after every affected path has been refreshed successfully; uncertain commands or partial
+refreshes leave the state stale and route the loop through recovery. Installing a verification
+plan resets its steps to `pending`, and completion accepts only an observed successful verification
+for the current workspace revision. The deterministic eval suite includes a negative premature-
+completion trajectory to ensure a finish claim without required work or observed verification is
+rejected.
+
 Context selection is scoped to the active workflow: current objective and subgoal, modified and
 user-owned paths, current diagnostics, inspected excerpts, symbol/relationship hits, and relevant
 tests are ranked before broad repository metadata. Effective `AGENTS.md`/`CLAUDE.md`-style
@@ -110,7 +123,8 @@ permission/environment failures remain blockers. The verification director order
 before package or workspace-dependent checks; public Rust module changes in multi-package
 workspaces require the broader dependent check. Completion is a current-revision review over task
 state, evidence, verification, blockers, and user-owned paths, and fails closed when any required
-fact is missing or stale.
+fact is missing or stale. None of these freshness or completion controls bypasses the existing
+permission, canonical-path, containment, permit, or expected-hash checks.
 
 Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json` plus `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 5 stores `Started`, committed `TurnSnapshot` records, resumable `Checkpoint` records, and `Finished`. Each turn record contains only bounded metadata, minimized context (paths/hashes/ranges, structured work state, and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the latest committed turn or checkpoint, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
 

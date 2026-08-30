@@ -282,7 +282,9 @@ impl ContextEngine {
                 result,
             );
         }
-        if mutation && mutation_applied(name, input, result, command_effects) {
+        let mutation_succeeded = mutation && mutation_applied(name, input, result, command_effects);
+        let mut mutation_evidence_refreshed = false;
+        if mutation_succeeded {
             let mutation_paths = mutation_paths(name, input, result, command_effects);
             if let Some(effects) = command_effects.as_ref() {
                 let include_manifests = matches!(
@@ -302,7 +304,11 @@ impl ContextEngine {
                 self.invalidate_command_effects(effects);
             }
             self.snapshot.workflow.record_mutation_scope(name, &mutation_paths);
-            self.promote_mutation_evidence(&mutation_paths);
+            let evidence_promoted = self.promote_mutation_evidence(&mutation_paths);
+            mutation_evidence_refreshed = name == "shell"
+                && command_effects.is_some_and(|effects| !effects.uncertain)
+                && evidence_promoted
+                && !self.snapshot.inspected.iter().any(|file| file.stale);
             self.refresh_verification_plan();
         }
         if focused_verification {
@@ -349,7 +355,8 @@ impl ContextEngine {
                 .record_inspection_with_provenance(aether_core::EvidenceProvenance::ToolOutput);
         }
         if result.ok
-            && matches!(name, "read" | "find" | "list" | "search" | "git" | "write" | "patch")
+            && (matches!(name, "read" | "find" | "list" | "search" | "git" | "write" | "patch")
+                || mutation_evidence_refreshed)
             && !self.snapshot.inspected.iter().any(|file| file.stale)
         {
             self.snapshot.workspace_changed = false;
@@ -1255,23 +1262,32 @@ impl ContextEngine {
         }
     }
 
-    fn promote_mutation_evidence(&mut self, paths: &[String]) {
-        if self.snapshot.workspace_root.is_empty() {
-            return;
+    fn promote_mutation_evidence(&mut self, paths: &[String]) -> bool {
+        if self.snapshot.workspace_root.is_empty() || paths.is_empty() {
+            return false;
         }
         let root = self.snapshot.workspace_root.clone();
         let mut seen = Vec::new();
+        let mut all_refreshed = paths.len() <= MAX_AUTOMATIC_EVIDENCE_FILES;
+        let valid_path_count = paths.iter().filter(|path| path_is_workspace_relative(path)).count();
         for path in paths.iter().take(MAX_AUTOMATIC_EVIDENCE_FILES) {
-            if !path_is_workspace_relative(path) || seen.iter().any(|existing| existing == path) {
+            if !path_is_workspace_relative(path) {
+                all_refreshed = false;
+                continue;
+            }
+            if seen.iter().any(|existing| existing == path) {
                 continue;
             }
             seen.push(path.clone());
-            if let Some(excerpt) = read_auto_excerpt(Path::new(&root), path, None) {
-                self.store_automatic_excerpt(excerpt);
-                self.snapshot.workflow.progress.note_automatic_evidence_reaction();
-                self.snapshot.workflow.progress.note_mutation_refresh();
-            }
+            let Some(excerpt) = read_auto_excerpt(Path::new(&root), path, None) else {
+                all_refreshed = false;
+                continue;
+            };
+            self.store_automatic_excerpt(excerpt);
+            self.snapshot.workflow.progress.note_automatic_evidence_reaction();
+            self.snapshot.workflow.progress.note_mutation_refresh();
         }
+        all_refreshed && !seen.is_empty() && seen.len() == valid_path_count
     }
 
     fn store_automatic_excerpt(&mut self, excerpt: FileExcerpt) {
@@ -2011,6 +2027,121 @@ mod tests {
         assert!(engine.snapshot().excerpts.is_empty());
         assert!(engine.snapshot().modified.iter().any(|path| path == "src/lib.rs"));
         assert_eq!(engine.snapshot().workflow.workspace_revision, 1);
+    }
+
+    #[test]
+    fn known_shell_mutation_and_verification_can_complete_without_extra_read() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/fixtures/targeted-bug");
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.set_task("format the source and verify the change");
+        let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let read_input = serde_json::json!({
+            "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 32}]
+        });
+        engine.observe_tool(
+            "read",
+            &read_input,
+            &success(serde_json::json!({
+                "files": [{
+                    "path": "src/lib.rs",
+                    "content_hash": blake3::hash(source.as_bytes()).to_hex().to_string(),
+                    "lines": [{"number": 1, "text": source.lines().next().unwrap_or("")}]
+                }]
+            })),
+        );
+
+        engine.observe_tool(
+            "shell",
+            &serde_json::json!({
+                "program": "rustfmt",
+                "args": ["src/lib.rs"]
+            }),
+            &success(serde_json::json!({"success": true})),
+        );
+        assert!(!engine.snapshot().workspace_changed);
+        assert!(engine.snapshot().inspected.iter().all(|file| !file.stale));
+
+        for _ in 0..aether_core::MAX_WORKFLOW_VERIFICATIONS {
+            let Some(command) = engine.next_pending_verification() else { break };
+            engine.observe_tool(
+                "shell",
+                &serde_json::json!({
+                    "program": command.program,
+                    "args": command.args,
+                    "cwd": command.cwd
+                }),
+                &success(serde_json::json!({"success": true})),
+            );
+        }
+        assert!(engine.next_pending_verification().is_none());
+        assert_eq!(engine.snapshot().workflow.verification, WorkflowVerification::Passed);
+        assert!(engine.finish_turn());
+    }
+
+    #[test]
+    fn known_shell_mutation_with_partial_evidence_stays_blocked() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/fixtures/targeted-bug");
+        let mut engine = ContextEngine::new(root.display().to_string(), None);
+        engine.set_task("format the source and verify the change");
+        let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let read_input = serde_json::json!({
+            "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 32}]
+        });
+        engine.observe_tool(
+            "read",
+            &read_input,
+            &success(serde_json::json!({
+                "files": [{
+                    "path": "src/lib.rs",
+                    "content_hash": blake3::hash(source.as_bytes()).to_hex().to_string(),
+                    "lines": [{"number": 1, "text": source.lines().next().unwrap_or("")}]
+                }]
+            })),
+        );
+
+        engine.observe_tool(
+            "shell",
+            &serde_json::json!({
+                "program": "rustfmt",
+                "args": ["src/lib.rs", "missing.rs"]
+            }),
+            &success(serde_json::json!({"success": true})),
+        );
+        assert!(engine.snapshot().workspace_changed);
+        assert!(engine.snapshot().inspected.iter().all(|file| !file.stale));
+        assert!(!engine.finish_turn());
+    }
+
+    #[test]
+    fn uncertain_shell_mutation_remains_stale_and_blocks_completion() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        engine.set_task("update the source and verify the change");
+        let read_input = serde_json::json!({
+            "files": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
+        });
+        engine.observe_tool(
+            "read",
+            &read_input,
+            &success(serde_json::json!({
+                "files": [{
+                    "path": "src/lib.rs",
+                    "content_hash": "before",
+                    "lines": [{"number": 1, "text": "fn main() {}"}]
+                }]
+            })),
+        );
+
+        engine.observe_tool(
+            "shell",
+            &serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "cargo fmt -- src/lib.rs"]
+            }),
+            &success(serde_json::json!({"success": true})),
+        );
+        assert!(engine.snapshot().workspace_changed);
+        assert!(engine.snapshot().inspected.iter().any(|file| file.stale));
+        assert!(!engine.finish_turn());
     }
 
     #[test]

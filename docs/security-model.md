@@ -14,6 +14,15 @@ Permission requests contain operation data, not file bodies or environment secre
 
 Prepared actions retain typed provenance for auditability: model-generated calls are `Model`, repository indexing is `Repository`, and completed local observations are `ToolOutput`; `User` and `Network` are explicit origins rather than inferred from text. Provenance is never user authorization. Repeating tool output inside a later model argument therefore cannot satisfy the user-authority requirement; mutation admission still requires the exact current inspection, content precondition, and independent `ExecutionPermit`.
 
+Observation freshness is separate from authority. Successful non-read discovery and verification
+observations are re-executed unless their dependency freshness is proven; this conservative extra
+tool call avoids treating a stale search, listing, finding, or verification result as current.
+Exact reads may be reused only after a bounded live hash of the canonical file matches the
+retained hash. A known, certain shell mutation may clear stale workspace state only after every
+affected path has refreshed successfully; uncertain commands and partial refreshes remain stale.
+These decisions never grant permission and do not weaken workspace containment, canonical-path,
+symlink/reparse, permit, or expected-hash enforcement.
+
 File replacement stages a same-directory temporary file, writes/flushed/syncs it, preserves basic destination permissions, and installs it with an atomic same-filesystem operation. For an existing destination, Unix uses rename replacement and Windows uses `ReplaceFileW`; this is atomic replacement, not create-if-absent. For `create_only=true` (and for a destination that was missing when an ordinary write began), the commit uses a native no-replace install: Linux/macOS `renameat_with(NOREPLACE)` / `RENAME_EXCL`, Windows `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, and a hard-link fallback only when exclusive rename is unsupported on the filesystem. The destination is never replaced by that path. Filesystems that provide neither exclusive rename nor hard links cannot atomically create-if-absent; AETHER fails closed rather than copying over an existing file. The implementation does not claim preservation of xattrs, ACLs, alternate streams, or other extended metadata.
 
 `write` and `patch` share a weak-reference per-destination mutation coordinator inside a workspace. This serializes AETHER mutations to the same resolved destination without imposing one global filesystem lock. Multi-file patches normalize, sort, and deduplicate keys before acquiring locks, preventing lock-order deadlocks. A patch stages all replacements before committing and revalidates each source state immediately before its commit.
@@ -75,7 +84,11 @@ read at most the bounded source window after rejecting symlinks, non-files, and 
 outside the workspace. A cached read is reused only for a complete retained range whose content
 hash still matches a bounded live re-hash; otherwise the normal read tool executes. Mutation
 admission continues to require its own typed permit, containment checks, and expected-hash
-revalidation.
+revalidation. Installing a verification plan normalizes each step to `pending`; completion
+requires an observed successful verification for the current workspace revision, so a model's
+premature finish claim cannot establish completion. The deterministic negative completion eval
+asserts that such a claim is rejected. The extra re-execution under uncertain freshness is an
+intentional bounded cost for fail-closed evidence handling.
 
 ## Dangerous operations
 

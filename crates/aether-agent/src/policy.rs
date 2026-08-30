@@ -191,8 +191,12 @@ impl AutonomousCodingPolicy {
                 })
                 .or_else(|| self.mutation_preflight(snapshot, call_id, name, input));
         }
+        // Discovery and verification results may depend on files that are not represented by the
+        // current inspected set. The generic successful-observation cache has no workspace handle
+        // with which to prove those dependencies are still current, so only retain its bounded
+        // repeated-failure circuit here and execute successful non-read calls again.
         self.guardrails
-            .preflight(call_id.clone(), name, input, snapshot.workflow.workspace_revision)
+            .preflight_failure(call_id.clone(), name, input, snapshot.workflow.workspace_revision)
             .or_else(|| self.mutation_preflight(snapshot, call_id, name, input))
     }
 
@@ -220,9 +224,18 @@ impl AutonomousCodingPolicy {
                 })
                 .or_else(|| self.mutation_preflight_prepared(snapshot, action));
         }
+        // See the direct-call path above: successful non-read observations/verifications are not
+        // reusable without a sound dependency-freshness check. Keep the prepared fast path only
+        // when no successful observation exists, so its repeated-failure handling remains active
+        // without allowing the cached success through.
         self.optimizations_enabled
             .then(|| {
-                self.guardrails.preflight_prepared(action, snapshot.workflow.workspace_revision)
+                let revision = snapshot.workflow.workspace_revision;
+                self.guardrails.preflight_failure_prepared(action, revision).or_else(|| {
+                    (!self.guardrails.has_cached_prepared(action, revision))
+                        .then(|| self.guardrails.preflight_prepared(action, revision))
+                        .flatten()
+                })
             })
             .flatten()
             .or_else(|| self.mutation_preflight_prepared(snapshot, action))
@@ -1271,6 +1284,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocked.error.unwrap().code.as_str(), "insufficient_evidence");
+    }
+
+    #[test]
+    fn successful_non_read_observations_are_not_reused_without_freshness() {
+        let mut engine = ContextEngine::new("", None);
+        let mut policy = AutonomousCodingPolicy::new();
+
+        let search_input = json!({"patterns": ["needle"]});
+        let search_result = ToolResult::success_text(
+            ToolCallId::new("search-first").unwrap(),
+            "first result",
+            1024,
+        );
+        assert!(
+            policy.observe(&mut engine, "search", &search_input, &search_result, true).is_some()
+        );
+        assert!(
+            policy
+                .preflight(
+                    engine.snapshot(),
+                    ToolCallId::new("search-repeat").unwrap(),
+                    "search",
+                    &search_input,
+                )
+                .is_none()
+        );
+
+        let verification_input = json!({"program": "cargo", "args": ["test", "-p", "api"]});
+        let verification_result = ToolResult::success_text(
+            ToolCallId::new("verification-first").unwrap(),
+            "passed",
+            1024,
+        );
+        let mut verification = PreparedAction::fallback(
+            aether_core::ToolInvocation {
+                call_id: ToolCallId::new("verification-first").unwrap(),
+                name: "shell".to_owned(),
+                input: verification_input.clone(),
+            },
+            aether_core::PermissionClass::ReadOnly,
+        );
+        verification.classification = ActionClassification::Verification;
+        assert!(
+            policy
+                .observe_prepared(&mut engine, &verification, &verification_result, true)
+                .is_some()
+        );
+        let mut repeated_verification = verification;
+        repeated_verification.call_id = ToolCallId::new("verification-repeat").unwrap();
+        assert!(policy.preflight_prepared(engine.snapshot(), &repeated_verification,).is_none());
+        assert_eq!(policy.prevented_count(), 0);
+    }
+
+    #[test]
+    fn repeated_non_read_failures_remain_bounded() {
+        let mut engine = ContextEngine::new("", None);
+        let mut policy = AutonomousCodingPolicy::new();
+        let input = json!({"patterns": ["missing"]});
+
+        for index in 0..3 {
+            let result = ToolResult::failure(
+                ToolCallId::new(format!("search-failure-{index}")).unwrap(),
+                "io",
+                "same failure",
+                true,
+                1024,
+            );
+            assert!(policy.observe(&mut engine, "search", &input, &result, true).is_some());
+        }
+
+        let blocked = policy
+            .preflight(
+                engine.snapshot(),
+                ToolCallId::new("search-circuit").unwrap(),
+                "search",
+                &input,
+            )
+            .expect("repeated non-read failures must trip the circuit breaker");
+        let error = blocked.error.expect("circuit breaker returns a typed error");
+        assert_eq!(error.code.as_str(), "repeated_failure");
+        assert!(!error.retryable);
     }
 
     #[test]

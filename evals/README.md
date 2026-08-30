@@ -24,6 +24,14 @@ before completion; the second segment receives only serialized, persistable cont
 remaining deterministic model trace. The final check reads the fixture and verifies the real
 repository state, not just the event transcript.
 
+The capability suite also runs the tracked Git-backed `control-loop` fixture at
+`evals/fixtures/control-loop/notes.txt`. Its serialized control evaluation contains two separate
+controls: a positive runtime-owned verification case and a negative premature-completion case.
+The positive case allows at most one additional optimized execution for a fresh runtime
+verification; a non-read or dependency-ambiguous observation is not treated as reusable without
+current freshness evidence. The negative case passes only when both traces reject completion
+before required work, verification, or mutation success is established.
+
 Capability output is separate from efficiency and regression output. It reports success@1,
 intentionally interrupted baseline success, newly solved tasks, checkpoint and WorkState survival,
 multi-file correctness, typed recovery, stale-evidence rejections, user-change corruption,
@@ -34,8 +42,9 @@ behind `EvalBackend` and are not fabricated by the offline runner.
 
 Each task declares its prompt, file outcomes, exact verification command, model-step budget,
 tool-call budget, and verification-attempt budget in `crates/aether-eval/src/lib.rs`. The suite
-also includes a shell-heavy command-reuse scenario with repeated direct `rg`, `find`, and `cat`
-argv calls so command intelligence can be measured without shell parsing or network access.
+also includes a shell-heavy command-reuse scenario with repeated direct `cargo metadata`,
+`cargo locate-project`, and `cargo tree` argv calls so command intelligence can be measured
+without shell parsing or network access.
 Fixtures are
 small standalone Rust workspaces. The runner copies one into a new temporary directory for every
 task and removes the copy afterward, so runs never mutate fixture sources or reuse build state.
