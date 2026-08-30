@@ -21,6 +21,7 @@
 - Release packaging generates the CycloneDX binary SBOM with `--describe binaries` and renames
   the `aether_bin.cdx.json` output to `bom.json`. `--override-filename` cannot be combined with
   `--describe` in cargo-cyclonedx 0.5.9.
+- The GitHub prerelease job authenticates `gh` with `GH_TOKEN` from `github.token`.
 
 ### Fixed
 
