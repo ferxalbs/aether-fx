@@ -180,8 +180,15 @@ jobs:
           set -euo pipefail
           cargo install --locked --version 0.5.9 cargo-cyclonedx
           cargo cyclonedx --manifest-path crates/aether/Cargo.toml --format json --describe binaries
-          test -f crates/aether/aether.cdx.json
-          mv crates/aether/aether.cdx.json crates/aether/bom.json
+          generated=crates/aether/aether_bin.cdx.json
+          if ! test -f "$generated"; then
+            printf 'expected %s, found:\n' "$generated" >&2
+            ls -la crates/aether >&2
+            find . -name '*.cdx.json' >&2 || true
+            exit 1
+          fi
+          mv "$generated" crates/aether/bom.json
+          find . -name '*.cdx.json' -delete
 
       - name: Native smoke tests
         if: runner.os != 'Windows'

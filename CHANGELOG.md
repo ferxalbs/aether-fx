@@ -7,7 +7,6 @@
 - Established the immutable end-of-phase agent runtime baseline across deterministic regression, capability, and Zero-Waste control-loop evaluation suites.
 - Confirmed single-source-of-truth invariants across operational phase, workspace revisions, WorkState subgoals, evidence freshness, verification coverage, and dirty worktree preservation.
 
-
 ## v0.1.0-alpha-02 - 2026-08-29 (4) - Adaptive orchestration and evidence-fresh completion
 
 ### Release packaging and installation
@@ -19,8 +18,9 @@
 
 #### Fixed
 
-- Release packaging generates the CycloneDX binary SBOM without combining `--describe binaries`
-  with `--override-filename`, which cargo-cyclonedx 0.5.9 rejects.
+- Release packaging generates the CycloneDX binary SBOM with `--describe binaries` and renames
+  the `aether_bin.cdx.json` output to `bom.json`. `--override-filename` cannot be combined with
+  `--describe` in cargo-cyclonedx 0.5.9.
 
 ### Fixed
 
