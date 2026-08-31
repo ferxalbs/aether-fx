@@ -38,11 +38,11 @@ does not become model input. `/status`, `/context`, `/config`, `/doctor`, `/help
 `/exit` remain offline/local operations; `/model` is the explicit live catalog boundary.
 
 `aether-rainy` owns one normalized `ModelView` projection of each SDK catalog entry. It preserves
-unknowns instead of guessing from model names, distinguishes model, plan, and effective context,
-records tools/reasoning/modalities and access state, and carries only bounded data-policy
-disclosure fields. `/model`, `aether models`, `/status`, and the JSON model surface consume this
-projection. A selected model is applied to future turns, while its Rainy continuation and seeded
-context continuation are cleared before the next request so a provider response from one model is
+unknowns instead of guessing from model names, records the SDK's model context,
+tools/reasoning/modalities, and supported parameters, and retains compatibility fields as unknown
+when the SDK catalog does not provide them. `/model`, `aether models`, `/status`, and the JSON model
+surface consume this projection. A selected model is applied to future turns, while its Rainy
+continuation and seeded context continuation are cleared before the next request so a provider response from one model is
 never sent to another.
 
 The autonomous work loop is deliberately evidence-driven rather than a second planner:
@@ -119,7 +119,12 @@ packets and contain only affected paths plus the newest bounded source windows.
 
 An interrupted or step-limited turn is appended as a `Checkpoint`, distinct from a completed `TurnSnapshot`. Checkpoints contain only the same minimized context and sanitized continuation allowed for normal session persistence. Resume therefore recovers the latest active work state, unresolved blockers, current workspace evidence, and completion status without relying on hidden conversation history. The runtime remains single-agent; the repository action planner is a bounded read-only optimization for high-confidence local evidence, not an additional model or project-management system.
 
-`aether-rainy` is the only crate that imports `rainy_sdk`. It maps the SDK's dynamic Responses stream values into AETHER `ModelEvent` values and treats provider reasoning metadata as opaque continuation data. A successful `ModelEvent::Done` requires a verified `response.completed` event and a response identity; failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No provider endpoint, model catalog, or key appears elsewhere.
+`aether-rainy` is the only crate that imports `rainy_sdk`. It consumes the SDK's typed public
+Responses stream and maps it into AETHER `ModelEvent` values; provider reasoning metadata remains
+outside the agent contract. A successful `ModelEvent::Done` requires a verified
+`response.completed` event and a response identity; failed, incomplete, transport-error, and
+unexpected-EOF paths remain backend errors. No provider endpoint, model catalog, or key appears
+elsewhere.
 
 `aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
 

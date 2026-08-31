@@ -1,5 +1,41 @@
 # CHANGELOG
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased - 2026-08-31 (1) - Rainy SDK 0.6.50 compatibility
+
+### Changed
+
+- Upgraded the direct Rainy dependency to the published `rainy-sdk 0.6.50` release with its
+  minimal feature set and no account/session integration.
+- Preserved Responses-only inference, explicit model selection, lazy catalog discovery, and
+  AETHER-owned credentials, continuation, session, and state boundaries.
+
+### Fixed
+
+- Adapted Rainy stream handling to the SDK's typed public `ResponsesStreamEvent` abstraction while
+  retaining send-once inference and fail-closed terminal-event handling.
+- Removed adapter dependence on the retired v2 catalog and provider-policy representations; facts
+  no longer supplied by the SDK remain unknown instead of being inferred.
+
+### Security
+
+- Kept authentication, redirects, SSE framing, payload bounds, and safe-operation retry policy in
+  the Rainy SDK boundary; mapped typed SDK errors to bounded provider-neutral backend errors.
+
+### Performance
+
+- Recorded the final 6,320,592-byte stripped release binary and local startup/RSS and Criterion
+  measurements for the 0.6.50 dependency graph.
+
+### Documentation
+
+- Updated the Rainy integration, architecture, dependency, binary-size, and third-party notices
+  for the 0.6.50 boundary and recorded local stream-adversarial coverage.
+
 ## Unreleased - 2026-08-30 (2) - Interactive shell and model experience
 
 ### Added

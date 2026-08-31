@@ -1,6 +1,6 @@
 # Toolchain and dependency baseline
 
-Verified on 2026-08-21 using Rust/Cargo `1.98.0`, `cargo info`, crates.io metadata, docs.rs, and the official Rainy SDK repository metadata. Versions below are exact manifest selections, not floating requirements. Cargo.lock is authoritative for the transitive graph.
+Verified on 2026-08-31 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.50` crate, and the official Rainy SDK documentation. Versions below are exact manifest selections, not floating requirements. Cargo.lock is authoritative for the transitive graph.
 
 | Component | Resolved version | License | Why it exists | Hot path? |
 | --- | --- | --- | --- | --- |
@@ -22,14 +22,19 @@ Verified on 2026-08-21 using Rust/Cargo `1.98.0`, `cargo info`, crates.io metada
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 | Explicit bounded pattern validation/literal matcher support | Search hot path |
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | Preconditions and content identity | Tool hot path |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Consume the Rainy SDK stream without async-trait | Rainy stream |
-| rainy-sdk | 0.6.16 | Apache-2.0 | Official Rainy API boundary; verified Responses, stream, catalog, and error APIs | Network path |
+| rainy-sdk | 0.6.50 | Apache-2.0 | Official Rainy API boundary; typed Responses stream, catalog, reasoning, and error APIs | Network path |
 | criterion | 0.8.2 | Apache-2.0 OR MIT | Reproducible local benchmarks | Benchmark only |
 
-The verified Rainy SDK is `rainy-sdk 0.6.16`. No `6.5.x` release was available, so AETHER does not fabricate that version or its APIs. The adapter is isolated so a later verified SDK generation can replace it.
+The verified Rainy SDK is exactly `rainy-sdk 0.6.50`, declared with `default-features = false`. Its
+minimal default feature set leaves account/session, legacy, rate-limiting, and tracing surfaces
+disabled. The adapter consumes the public typed Responses stream and leaves SSE framing, redirect
+blocking, authentication, request/response bounds, and SDK-owned safe-operation retries to Rainy.
 
 No new crate is added. `aether-agent` uses the existing `blake3` crate for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, or unpublished Rainy SDK version is used.
 
-The interactive shell/model work adds no package to the resolved dependency graph. The existing
+The interactive shell/model work adds no package to the resolved dependency graph. The Rainy 0.6.50
+upgrade removes its former `eventsource-stream`/`nom` parser path and adds only the rand 0.9 family
+and its platform support dependencies; the workspace still has no second SSE parser. The existing
 workspace `serde` dependency is now declared directly by `aether` for bounded config and machine
 output, and by `aether-rainy` for the normalized catalog projection; this is serialization on
 control/catalog paths, not a new provider transport or an additional hot-path framework. The

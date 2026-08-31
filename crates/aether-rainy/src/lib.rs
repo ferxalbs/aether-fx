@@ -13,8 +13,8 @@ use aether_agent::{BackendError, BackendFuture, ModelBackend, ModelCatalogItem};
 use aether_core::{ModelEvent, ModelRequest, OpaqueContinuation, ToolCallId, ToolDefinition};
 use futures_util::StreamExt;
 use rainy_sdk::{
-    CapabilityFlag, ModelCatalogItem as RainyModelCatalogItem, RainyCapabilities,
-    RainyCapabilitiesV2, RainyClient, RainyError, ResponsesRequest,
+    CapabilityFlag, ModelCatalogItem as RainyModelCatalogItem, RainyCapabilities, RainyClient,
+    RainyError, ResponsesEventType, ResponsesRequest, ResponsesStreamEvent,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -120,81 +120,49 @@ impl ModelView {
             160,
         );
         let (input_modalities, output_modalities, modalities_reported) =
-            modalities(item.architecture.as_ref(), item.rainy_capabilities_v2.as_ref());
-        let supported_parameters = bounded_values(
-            item.rainy_capabilities_v2
-                .as_ref()
-                .map(|capabilities| capabilities.parameters.accepted.as_slice())
-                .or(item.supported_parameters.as_deref())
-                .unwrap_or_default(),
-            64,
-            80,
-        );
-        let policy = item.rainy_data_policy.as_ref();
-        let availability =
-            availability(item.rainy_organization_enabled, item.rainy_privacy_compatible);
-        let (reasoning_modes, reasoning_values, reasoning_parameters) = reasoning_metadata(
-            item.rainy_capabilities_v2.as_ref(),
-            item.supported_parameters.as_deref(),
-        );
-        let (
-            thinking_budget_min,
-            thinking_budget_max,
-            thinking_budget_dynamic_value,
-            thinking_budget_disable_value,
-        ) = thinking_budget_metadata(item.rainy_capabilities_v2.as_ref());
+            modalities(item.architecture.as_ref());
+        let supported_parameters =
+            bounded_values(item.supported_parameters.as_deref().unwrap_or_default(), 64, 80);
+        let (reasoning_modes, reasoning_values, reasoning_parameters) =
+            reasoning_metadata(item.supported_parameters.as_deref());
         Some(Self {
             id,
             display_name,
-            context_length: item
-                .rainy_effective_context_length
-                .or_else(|| item.context_length.map(u64::from)),
+            context_length: item.context_length.map(u64::from),
             model_context_length: item.context_length,
-            plan_context_length: item.rainy_plan_context_length,
-            effective_context_length: item.rainy_effective_context_length,
-            tier: item
-                .rainy_model_tier
-                .as_ref()
-                .map(|tier| bounded_text(&format!("{tier:?}"), 32).to_lowercase()),
-            billing_class: item
-                .rainy_billing_class
-                .as_ref()
-                .map(|class| bounded_text(&format!("{class:?}"), 32).to_lowercase()),
+            plan_context_length: None,
+            effective_context_length: None,
+            tier: None,
+            billing_class: None,
             tools: tools_capability(
                 item.rainy_capabilities.as_ref(),
-                item.rainy_capabilities_v2.as_ref(),
                 item.supported_parameters.as_deref(),
             ),
             reasoning: reasoning_capability(
                 item.rainy_capabilities.as_ref(),
-                item.rainy_capabilities_v2.as_ref(),
                 item.supported_parameters.as_deref(),
             ),
             reasoning_modes,
             reasoning_values,
             reasoning_parameters,
-            thinking_budget_min,
-            thinking_budget_max,
-            thinking_budget_dynamic_value,
-            thinking_budget_disable_value,
+            thinking_budget_min: None,
+            thinking_budget_max: None,
+            thinking_budget_dynamic_value: None,
+            thinking_budget_disable_value: None,
             input_modalities,
             output_modalities,
             modalities_reported,
             supported_parameters,
-            availability,
-            organization_enabled: item.rainy_organization_enabled,
-            privacy_compatible: item.rainy_privacy_compatible,
-            privacy_mode: item.rainy_privacy_mode.as_deref().map(|value| bounded_text(value, 64)),
-            policy_status: policy
-                .and_then(|policy| policy.status.as_ref())
-                .map(|status| bounded_text(&format!("{status:?}"), 32).to_lowercase()),
-            disclosure_required: policy.is_some_and(|policy| policy.requires_data_disclosure),
-            policy_notice: policy
-                .and_then(|policy| policy.notice.as_deref())
-                .map(|notice| bounded_text(notice, 240)),
-            training_with_inputs: policy.and_then(|policy| policy.training_with_inputs),
-            zdr_available: policy.and_then(|policy| policy.zdr_available),
-            retention_days: policy.and_then(|policy| policy.retention_days),
+            availability: ModelAvailability::Unknown,
+            organization_enabled: None,
+            privacy_compatible: None,
+            privacy_mode: None,
+            policy_status: None,
+            disclosure_required: false,
+            policy_notice: None,
+            training_with_inputs: None,
+            zdr_available: None,
+            retention_days: None,
         })
     }
 
@@ -371,25 +339,17 @@ fn bounded_values(values: &[String], max_items: usize, max_bytes: usize) -> Vec<
 
 fn modalities(
     architecture: Option<&rainy_sdk::ModelArchitecture>,
-    v2: Option<&RainyCapabilitiesV2>,
 ) -> (Vec<String>, Vec<String>, bool) {
-    if let Some(capabilities) = v2 {
-        return (
-            bounded_modalities(&capabilities.multimodal.input),
-            bounded_modalities(&capabilities.multimodal.output),
-            true,
-        );
-    }
-    if let Some(architecture) = architecture
-        && (architecture.input_modalities.is_some() || architecture.output_modalities.is_some())
-    {
-        return (
-            architecture.input_modalities.as_deref().map(bounded_modalities).unwrap_or_default(),
-            architecture.output_modalities.as_deref().map(bounded_modalities).unwrap_or_default(),
-            true,
-        );
-    }
-    (Vec::new(), Vec::new(), false)
+    architecture.map_or_else(
+        || (Vec::new(), Vec::new(), false),
+        |architecture| {
+            (
+                bounded_modalities(&architecture.input_modalities),
+                bounded_modalities(&architecture.output_modalities),
+                true,
+            )
+        },
+    )
 }
 
 fn bounded_modalities(values: &[String]) -> Vec<String> {
@@ -418,21 +378,8 @@ fn parameters_include(parameters: Option<&[String]>, names: &[&str]) -> Option<b
 
 fn tools_capability(
     v1: Option<&RainyCapabilities>,
-    v2: Option<&RainyCapabilitiesV2>,
     parameters: Option<&[String]>,
 ) -> CapabilityState {
-    if let Some(capabilities) = v2 {
-        return if capabilities
-            .parameters
-            .accepted
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case("tools"))
-        {
-            CapabilityState::Supported
-        } else {
-            CapabilityState::Unsupported
-        };
-    }
     if let Some(capabilities) = v1 {
         return capability_flag(capabilities.tools.as_ref());
     }
@@ -443,16 +390,8 @@ fn tools_capability(
 
 fn reasoning_capability(
     v1: Option<&RainyCapabilities>,
-    v2: Option<&RainyCapabilitiesV2>,
     parameters: Option<&[String]>,
 ) -> CapabilityState {
-    if let Some(capabilities) = v2 {
-        return if capabilities.reasoning.supported {
-            CapabilityState::Supported
-        } else {
-            CapabilityState::Unsupported
-        };
-    }
     if let Some(capabilities) = v1 {
         return capability_flag(capabilities.reasoning.as_ref());
     }
@@ -464,127 +403,36 @@ fn reasoning_capability(
     )
 }
 
-fn reasoning_metadata(
-    v2: Option<&RainyCapabilitiesV2>,
-    parameters: Option<&[String]>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    if let Some(capabilities) = v2 {
-        let mut modes = Vec::new();
-        let mut reasoning_values = Vec::new();
-        let mut parameters_out = capabilities
-            .reasoning
-            .controls
-            .as_ref()
-            .and_then(|controls| controls.observed_parameters.as_deref())
-            .map(|values| bounded_values(values, 32, 80))
-            .unwrap_or_default();
-        if capabilities.reasoning.controls.as_ref().is_some_and(|controls| {
-            controls.reasoning_effort == Some(true)
-                || controls.effort.as_ref().is_some_and(|values| !values.is_empty())
-        }) {
-            modes.push("effort".to_owned());
-        }
-        if capabilities.reasoning.controls.as_ref().is_some_and(|controls| {
-            controls.thinking_level.as_ref().is_some_and(|values| !values.is_empty())
-        }) {
-            modes.push("thinking_level".to_owned());
-        }
-        if capabilities
-            .reasoning
-            .controls
-            .as_ref()
-            .and_then(|controls| controls.thinking_budget.as_ref())
-            .is_some()
-        {
-            modes.push("thinking_budget".to_owned());
-        }
-        if capabilities.reasoning.toggle.is_some()
-            || capabilities
-                .reasoning
-                .controls
-                .as_ref()
-                .is_some_and(|controls| controls.reasoning_toggle == Some(true))
-        {
-            modes.push("toggle".to_owned());
-        }
-        if let Some(controls) = capabilities.reasoning.controls.as_ref() {
-            if let Some(efforts) = controls.effort.as_deref() {
-                reasoning_values.extend(bounded_values(efforts, 32, 40));
-            }
-            if let Some(levels) = controls.thinking_level.as_deref() {
-                reasoning_values.extend(bounded_values(levels, 32, 40));
-            }
-            if controls.thinking_budget.is_some() {
-                modes.push("thinking_budget".to_owned());
-            }
-        }
-        if let Some(toggle) = capabilities.reasoning.toggle.as_ref() {
-            parameters_out.extend(
-                toggle
-                    .enable_param
-                    .as_deref()
-                    .into_iter()
-                    .chain(toggle.include_reasoning_param.as_deref())
-                    .map(|parameter| bounded_text(parameter, 80))
-                    .filter(|parameter| !parameter.is_empty()),
-            );
-        }
-        for profile in &capabilities.reasoning.profiles {
-            let parameter = bounded_text(&profile.parameter_path, 80);
-            if !parameter.is_empty() {
-                parameters_out.push(parameter);
-            }
-            if let Some(values_for_profile) = profile.values.as_deref() {
-                reasoning_values.extend(bounded_values(values_for_profile, 32, 40));
-            }
-        }
-        parameters_out.sort();
-        parameters_out.dedup();
-        reasoning_values.sort();
-        reasoning_values.dedup();
-        modes.sort();
-        modes.dedup();
-        return (modes, reasoning_values, parameters_out);
-    }
+fn reasoning_metadata(parameters: Option<&[String]>) -> (Vec<String>, Vec<String>, Vec<String>) {
     let parameters = bounded_values(parameters.unwrap_or_default(), 64, 80);
     let reasoning_parameters = parameters
         .iter()
         .filter(|parameter| {
             parameter.eq_ignore_ascii_case("reasoning")
-                || parameter.eq_ignore_ascii_case("thinking")
-                || parameter.starts_with("reasoning.")
+                || parameter.eq_ignore_ascii_case("reasoning_effort")
+                || parameter.eq_ignore_ascii_case("reasoning.effort")
+                || parameter.eq_ignore_ascii_case("reasoning_max_tokens")
+                || parameter.eq_ignore_ascii_case("reasoning.max_tokens")
         })
         .cloned()
         .collect::<Vec<_>>();
-    let modes =
-        if reasoning_parameters.is_empty() { Vec::new() } else { vec!["reasoning".to_owned()] };
-    (modes, Vec::new(), reasoning_parameters)
-}
-
-fn thinking_budget_metadata(
-    v2: Option<&RainyCapabilitiesV2>,
-) -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
-    v2.and_then(|capabilities| capabilities.reasoning.controls.as_ref())
-        .and_then(|controls| controls.thinking_budget.as_ref())
-        .map(|budget| {
-            (Some(budget.min), Some(budget.max), budget.dynamic_value, budget.disable_value)
-        })
-        .unwrap_or((None, None, None, None))
-}
-
-fn availability(
-    organization_enabled: Option<bool>,
-    privacy_compatible: Option<bool>,
-) -> ModelAvailability {
-    if privacy_compatible == Some(false) {
-        ModelAvailability::PrivacyIncompatible
-    } else if organization_enabled == Some(false) {
-        ModelAvailability::OrganizationDenied
-    } else if organization_enabled == Some(true) && privacy_compatible == Some(true) {
-        ModelAvailability::Available
-    } else {
-        ModelAvailability::Unknown
+    let mut modes = Vec::new();
+    if reasoning_parameters.iter().any(|parameter| {
+        parameter.eq_ignore_ascii_case("reasoning_effort")
+            || parameter.eq_ignore_ascii_case("reasoning.effort")
+    }) {
+        modes.push("effort".to_owned());
     }
+    if reasoning_parameters.iter().any(|parameter| {
+        parameter.eq_ignore_ascii_case("reasoning_max_tokens")
+            || parameter.eq_ignore_ascii_case("reasoning.max_tokens")
+    }) {
+        modes.push("budget".to_owned());
+    }
+    if modes.is_empty() && !reasoning_parameters.is_empty() {
+        modes.push("reasoning".to_owned());
+    }
+    (modes, Vec::new(), reasoning_parameters)
 }
 
 fn format_context(tokens: u64) -> String {
@@ -659,7 +507,7 @@ fn tool_definition(definition: &ToolDefinition) -> Value {
 
 async fn adapt_stream(
     mut stream: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<Value, RainyError>> + Send>,
+        Box<dyn futures_util::Stream<Item = Result<ResponsesStreamEvent, RainyError>> + Send>,
     >,
     sender: mpsc::Sender<Result<ModelEvent, BackendError>>,
     continuation_attached: bool,
@@ -683,8 +531,7 @@ async fn adapt_stream(
                         return;
                     }
                 };
-                let is_completed = event.get("type").and_then(Value::as_str)
-                    == Some("response.completed");
+                let is_completed = event.kind == ResponsesEventType::ResponseCompleted;
                 if is_completed && !tool_calls.is_empty() {
                     let _ = sender.send(Err(BackendError::IncompleteStream {
                         message: "Rainy response completed with an incomplete tool call".to_owned(),
@@ -713,31 +560,30 @@ async fn adapt_stream(
 }
 
 fn map_event(
-    event: Value,
+    event: ResponsesStreamEvent,
     tool_calls: &mut HashMap<String, (String, String)>,
     completed_tool_calls: &mut HashSet<String>,
 ) -> Result<Vec<ModelEvent>, BackendError> {
-    let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
-    match event_type {
-        "response.output_text.delta" => Ok(event
-            .get("delta")
-            .and_then(Value::as_str)
+    match event.kind {
+        ResponsesEventType::OutputTextDelta => Ok(event
+            .text_delta()
             .map(|text| vec![ModelEvent::TextDelta { text: text.to_owned() }])
             .unwrap_or_default()),
-        "response.function_call_arguments.delta" => {
-            let call_id = event_string(&event, &["call_id", "item_id", "id"])?;
+        ResponsesEventType::FunctionCallArgumentsDelta => {
+            let call_id = event_string(&event.data, &["call_id", "item_id", "id"])?;
             let entry = tool_calls.entry(call_id).or_insert_with(|| (String::new(), String::new()));
-            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+            if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
                 entry.1.push_str(delta);
             }
             Ok(Vec::new())
         }
-        "response.function_call_arguments.done" => {
-            let call_id = event_string(&event, &["call_id", "item_id", "id"])?;
+        ResponsesEventType::FunctionCallArgumentsDone => {
+            let call_id = event_string(&event.data, &["call_id", "item_id", "id"])?;
             if completed_tool_calls.contains(&call_id) {
                 return Ok(Vec::new());
             }
             let name = event
+                .data
                 .get("name")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
@@ -746,6 +592,7 @@ fn map_event(
                     message: "Rainy function call omitted its name".to_owned(),
                 })?;
             let arguments = event
+                .data
                 .get("arguments")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
@@ -764,8 +611,8 @@ fn map_event(
                 arguments,
             }])
         }
-        "response.output_item.done" | "response.output_item.added" => {
-            let item = event.get("item").unwrap_or(&event);
+        ResponsesEventType::OutputItemDone | ResponsesEventType::OutputItemAdded => {
+            let item = event.data.get("item").unwrap_or(&event.data);
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
                 return Ok(Vec::new());
             }
@@ -776,7 +623,7 @@ fn map_event(
             let name = event_string(item, &["name"])?;
             let arguments =
                 item.get("arguments").and_then(Value::as_str).unwrap_or("{}").to_owned();
-            if event_type == "response.output_item.added" {
+            if event.kind == ResponsesEventType::OutputItemAdded {
                 tool_calls.insert(call_id, (name, arguments));
                 return Ok(Vec::new());
             }
@@ -793,8 +640,8 @@ fn map_event(
                 arguments,
             }])
         }
-        "response.completed" => {
-            let response = event.get("response").unwrap_or(&event);
+        ResponsesEventType::ResponseCompleted => {
+            let response = event.data.get("response").unwrap_or(&event.data);
             let id =
                 response.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(
                     || BackendError::Mapping {
@@ -823,15 +670,19 @@ fn map_event(
             });
             Ok(output)
         }
-        "response.failed" => {
-            Err(BackendError::ResponseFailed { message: terminal_message(&event) })
+        ResponsesEventType::ResponseFailed => {
+            let event_name =
+                event.event.as_deref().or_else(|| event.data.get("type").and_then(Value::as_str));
+            if event_name.is_some_and(|name| name.eq_ignore_ascii_case("response.incomplete")) {
+                Err(BackendError::ResponseIncomplete { message: terminal_message(&event.data) })
+            } else {
+                Err(BackendError::ResponseFailed { message: terminal_message(&event.data) })
+            }
         }
-        "response.incomplete" => {
-            Err(BackendError::ResponseIncomplete { message: terminal_message(&event) })
-        }
-        "error" => {
-            Err(BackendError::Operation { message: terminal_message(&event), retryable: false })
-        }
+        ResponsesEventType::Error => Err(BackendError::Operation {
+            message: terminal_message(&event.data),
+            retryable: false,
+        }),
         _ => Ok(Vec::new()),
     }
 }
@@ -893,11 +744,39 @@ fn map_rainy_error(error: &RainyError, continuation_attached: bool) -> BackendEr
             message: "Rainy rejected previous_response_id".to_owned(),
         };
     }
-    let request_id =
-        error.request_id().map(|value| format!(" (request_id={value})")).unwrap_or_default();
+    let code = error
+        .code()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 80 && !value.chars().any(char::is_control)
+        })
+        .map(|value| format!(": {value}"))
+        .unwrap_or_default();
+    let request_id = error
+        .request_id()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .map(|value| format!(" (request_id={value})"))
+        .unwrap_or_default();
     BackendError::Operation {
-        message: format!("Rainy SDK request failed{request_id}"),
+        message: format!("Rainy {} error{code}{request_id}", rainy_error_kind(error)),
         retryable: error.is_retryable(),
+    }
+}
+
+fn rainy_error_kind(error: &RainyError) -> &'static str {
+    match error {
+        RainyError::Authentication { .. } => "authentication",
+        RainyError::AccessDenied { .. } => "access denied",
+        RainyError::RateLimit { .. } => "rate limit",
+        RainyError::InsufficientCredits { .. } => "insufficient credits",
+        RainyError::Network { .. } | RainyError::NetworkError(_) => "network",
+        RainyError::Api { .. } | RainyError::Provider { .. } => "service",
+        RainyError::Timeout { .. } => "timeout",
+        RainyError::Serialization { .. } => "serialization",
+        RainyError::InvalidRequest { .. } | RainyError::ValidationError(_) => "invalid request",
+        RainyError::FeatureNotAvailable { .. } => "feature unavailable",
+        RainyError::PayloadTooLarge { .. } => "payload too large",
     }
 }
 
@@ -910,12 +789,26 @@ fn is_continuation_field_code(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+    };
+
     use super::*;
+    use aether_core::{SessionId, StepId, TurnId};
     use futures_util::stream;
+    use rainy_sdk::ResponsesEvent;
 
     async fn collect(events: Vec<Value>) -> Vec<Result<ModelEvent, BackendError>> {
         let stream = Box::pin(stream::iter(
-            events.into_iter().map(Ok::<Value, RainyError>).collect::<Vec<_>>(),
+            events
+                .into_iter()
+                .map(|value| {
+                    Ok::<ResponsesStreamEvent, RainyError>(ResponsesEvent::new(None, value))
+                })
+                .collect::<Vec<_>>(),
         ));
         let (sender, mut receiver) = mpsc::channel(16);
         adapt_stream(stream, sender, false).await;
@@ -924,6 +817,107 @@ mod tests {
             output.push(event);
         }
         output
+    }
+
+    fn test_model_request() -> ModelRequest {
+        ModelRequest {
+            session_id: SessionId::new("session-1").unwrap(),
+            turn_id: TurnId::new("turn-1").unwrap(),
+            step_id: StepId::new("step-1").unwrap(),
+            model: Some("test-model".to_owned()),
+            input: json!("hello"),
+            tools: Arc::new(Vec::new()),
+            continuation: None,
+        }
+    }
+
+    fn test_backend(base_url: &str) -> RainyBackend {
+        let client = RainyClient::with_config(
+            rainy_sdk::AuthConfig::new("test-key")
+                .with_api_base_url(base_url)
+                .with_timeout(5)
+                .with_retry(false),
+        )
+        .unwrap();
+        RainyBackend::new(client)
+    }
+
+    fn spawn_stream_server(body: Vec<u8>, chunk_size: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            for chunk in body.chunks(chunk_size.max(1)) {
+                if socket.write_all(chunk).is_err() {
+                    break;
+                }
+                if socket.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    async fn collect_backend_stream(
+        body: Vec<u8>,
+        chunk_size: usize,
+    ) -> Vec<Result<ModelEvent, BackendError>> {
+        let (base_url, handle) = spawn_stream_server(body, chunk_size);
+        let backend = test_backend(&base_url);
+        let result = backend.stream_step(test_model_request()).await;
+        let mut output = Vec::new();
+        match result {
+            Ok(mut stream) => {
+                while let Some(event) = stream.recv().await {
+                    output.push(event);
+                }
+            }
+            Err(error) => output.push(Err(error)),
+        }
+        handle.join().unwrap();
+        output
+    }
+
+    fn spawn_closing_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        observed_requests.fetch_add(1, Ordering::SeqCst);
+                        let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+                        let mut request = [0_u8; 1024];
+                        let _ = socket.read(&mut request);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::yield_now();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
+    fn map_event(
+        value: Value,
+        tool_calls: &mut HashMap<String, (String, String)>,
+        completed_tool_calls: &mut HashSet<String>,
+    ) -> Result<Vec<ModelEvent>, BackendError> {
+        super::map_event(ResponsesEvent::new(None, value), tool_calls, completed_tool_calls)
     }
 
     #[test]
@@ -945,45 +939,118 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn sdk_stream_handles_fragmented_responses_events_and_done() {
+        let body = concat!(
+            "event: vendor.unknown\n",
+            "data: {\"type\":\"vendor.unknown\",\"ignored\":true}\n\n",
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\r\n",
+            "data: \"delta\":\"hé\"}\r\n",
+            "\r\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let output = collect_backend_stream(body, 1).await;
+        assert_eq!(output.len(), 2);
+        assert!(matches!(
+            &output[0],
+            Ok(ModelEvent::TextDelta { text }) if text == "hé"
+        ));
+        assert!(matches!(
+            &output[1],
+            Ok(ModelEvent::Done { continuation: Some(continuation) })
+                if continuation.0["previous_response_id"] == "resp-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sdk_stream_maps_malformed_json_to_bounded_serialization_error() {
+        let body = b"event: response.output_text.delta\ndata: {not-json}\n\n".to_vec();
+        let output = collect_backend_stream(body, 3).await;
+        assert!(matches!(
+            output.as_slice(),
+            [Err(BackendError::Operation { message, retryable: false })]
+                if message.contains("serialization")
+        ));
+    }
+
+    #[tokio::test]
+    async fn sdk_stream_rejects_oversized_sse_frames_without_forwarding_payload() {
+        let mut body = b"event: response.output_text.delta\ndata: ".to_vec();
+        body.extend(vec![b'x'; 8 * 1024 * 1024]);
+        body.extend_from_slice(b"\n\n");
+        let output = collect_backend_stream(body, 64 * 1024).await;
+        assert!(matches!(
+            output.as_slice(),
+            [Err(BackendError::Operation { message, retryable: false })]
+                if message.contains("payload too large")
+        ));
+    }
+
+    #[tokio::test]
+    async fn sdk_stream_reports_disconnect_after_partial_response() {
+        let body = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n".to_vec();
+        let output = collect_backend_stream(body, 2).await;
+        assert!(output.iter().any(|event| matches!(
+            event,
+            Ok(ModelEvent::TextDelta { text }) if text == "partial"
+        )));
+        assert!(output.iter().any(|event| matches!(
+            event,
+            Err(BackendError::IncompleteStream { message })
+                if message.contains("ended before a terminal")
+        )));
+        assert!(!output.iter().any(|event| matches!(event, Ok(ModelEvent::Done { .. }))));
+    }
+
+    #[tokio::test]
+    async fn inference_transport_failure_is_sent_once_without_adapter_retry() {
+        let (base_url, requests, handle) = spawn_closing_server();
+        let backend = test_backend(&base_url);
+        let result = backend.stream_step(test_model_request()).await;
+        assert!(matches!(result, Err(BackendError::Operation { .. })));
+        handle.join().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
-    fn normalized_model_view_exposes_access_capability_context_and_policy_fields() {
+    fn normalized_model_view_preserves_sdk_fields_and_marks_removed_metadata_unknown() {
         let item: RainyModelCatalogItem = serde_json::from_value(json!({
             "id": "provider/frontier",
             "name": "Frontier \u{001b}[31mModel",
             "context_length": 128000,
-            "rainy_plan_context_length": 100000,
-            "rainy_effective_context_length": 96000,
-            "rainy_model_tier": "frontier",
-            "rainy_billing_class": "extreme",
-            "rainy_capabilities_v2": {
-                "multimodal": {"input": ["text", "image"], "output": ["text"]},
-                "reasoning": {"supported": true},
-                "parameters": {"accepted": ["tools", "reasoning"]}
+            "architecture": {
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"]
             },
-            "rainy_organization_enabled": true,
-            "rainy_privacy_mode": "strict",
-            "rainy_privacy_compatible": false,
-            "rainy_data_policy": {
-                "status": "verified",
-                "requiresDataDisclosure": true,
-                "notice": "Provider retains prompts",
-                "trainingWithInputs": false,
-                "zdrAvailable": false,
-                "retentionDays": 30
-            }
+            "supported_parameters": ["tools", "reasoning.effort"],
+            "rainy_capabilities": {"tools": true, "reasoning": true}
         }))
         .unwrap();
         let view = ModelView::from_catalog(&item).expect("safe model id");
         assert_eq!(view.display_name, "Frontier �[31mModel");
-        assert_eq!(view.effective_context_length, Some(96000));
-        assert_eq!(view.plan_context_length, Some(100000));
+        assert_eq!(view.context_length, Some(128000));
+        assert_eq!(view.model_context_length, Some(128000));
+        assert_eq!(view.plan_context_length, None);
+        assert_eq!(view.effective_context_length, None);
+        assert_eq!(view.tier, None);
+        assert_eq!(view.billing_class, None);
         assert_eq!(view.tools, CapabilityState::Supported);
         assert_eq!(view.reasoning, CapabilityState::Supported);
-        assert_eq!(view.availability, ModelAvailability::PrivacyIncompatible);
-        assert!(!view.selectable());
-        assert!(view.disclosure_required);
-        assert_eq!(view.retention_days, Some(30));
-        assert!(view.detail().contains("privacy_incompatible"));
+        assert!(view.input_modalities.contains(&"image".to_owned()));
+        assert!(view.reasoning_modes.contains(&"effort".to_owned()));
+        assert!(view.reasoning_parameters.contains(&"reasoning.effort".to_owned()));
+        assert_eq!(view.thinking_budget_min, None);
+        assert_eq!(view.thinking_budget_max, None);
+        assert_eq!(view.availability, ModelAvailability::Unknown);
+        assert!(view.selectable());
+        assert!(!view.disclosure_required);
+        assert_eq!(view.retention_days, None);
+        assert!(view.detail().contains("access unknown"));
     }
 
     #[test]
@@ -993,112 +1060,50 @@ mod tests {
                 "id": "01-coding",
                 "name": "Coding Core",
                 "context_length": 128000,
-                "rainy_effective_context_length": 128000,
-                "rainy_model_tier": "core",
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {"supported": false},
-                    "parameters": {"accepted": ["tools"]}
-                },
-                "rainy_organization_enabled": true,
-                "rainy_privacy_compatible": true
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "rainy_capabilities": {"tools": true, "reasoning": false}
             }),
             json!({
                 "id": "02-no-tools",
                 "name": "No Tools",
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {"supported": false},
-                    "parameters": {"accepted": ["response_format"]}
-                },
-                "rainy_organization_enabled": true,
-                "rainy_privacy_compatible": true
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "rainy_capabilities": {"tools": false, "reasoning": false}
             }),
             json!({
                 "id": "03-reasoning",
                 "name": "Reasoning Model",
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {
-                        "supported": true,
-                        "controls": {
-                            "observed_parameters": ["reasoning.effort"],
-                            "reasoning_effort": true,
-                            "effort": ["low", "high"],
-                            "thinking_level": ["low", "high"],
-                            "thinking_budget": {
-                                "min": 256,
-                                "max": 4096,
-                                "dynamic_value": 2048,
-                                "disable_value": 0
-                            }
-                        },
-                        "profiles": [{
-                            "provider": "openai",
-                            "parameter_path": "reasoning.effort",
-                            "values": ["low", "high"]
-                        }]
-                    },
-                    "parameters": {"accepted": ["tools", "reasoning"]}
-                },
-                "rainy_organization_enabled": true,
-                "rainy_privacy_compatible": true
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "supported_parameters": ["tools", "reasoning.effort", "reasoning.max_tokens"],
+                "rainy_capabilities": {"tools": true, "reasoning": true}
             }),
             json!({"id": "04-unknown", "name": "Unknown Capability"}),
             json!({
-                "id": "05-plan-context",
-                "name": "Plan Limited",
+                "id": "05-context",
+                "name": "Context Metadata",
                 "context_length": 1000000,
-                "rainy_plan_context_length": 262144,
-                "rainy_effective_context_length": 262144,
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {"supported": false},
-                    "parameters": {"accepted": ["tools"]}
-                },
-                "rainy_organization_enabled": true,
-                "rainy_privacy_compatible": true
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "rainy_capabilities": {"tools": true, "reasoning": false}
             }),
             json!({
-                "id": "06-org-disabled",
-                "name": "Org Disabled",
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {"supported": false},
-                    "parameters": {"accepted": ["tools"]}
-                },
+                "id": "06-org-metadata-removed",
+                "name": "Organization Metadata Removed",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
                 "rainy_organization_enabled": false,
-                "rainy_privacy_compatible": true
+                "rainy_capabilities": {"tools": true, "reasoning": false}
             }),
             json!({
-                "id": "07-privacy-blocked",
-                "name": "Privacy Blocked",
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {"supported": false},
-                    "parameters": {"accepted": ["tools"]}
-                },
-                "rainy_organization_enabled": true,
-                "rainy_privacy_compatible": false
+                "id": "07-privacy-metadata-removed",
+                "name": "Privacy Metadata Removed",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "rainy_privacy_compatible": false,
+                "rainy_capabilities": {"tools": true, "reasoning": false}
             }),
             json!({
-                "id": "08-disclosure",
-                "name": "Disclosure Required",
-                "rainy_capabilities_v2": {
-                    "multimodal": {"input": ["text"], "output": ["text"]},
-                    "reasoning": {"supported": false},
-                    "parameters": {"accepted": ["tools"]}
-                },
-                "rainy_organization_enabled": true,
-                "rainy_privacy_compatible": true,
-                "rainy_data_policy": {
-                    "status": "verified",
-                    "requiresDataDisclosure": true,
-                    "notice": "Inputs may be retained",
-                    "trainingWithInputs": false,
-                    "zdrAvailable": true,
-                    "retentionDays": 7
-                }
+                "id": "08-policy-metadata-removed",
+                "name": "Policy Metadata Removed",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "rainy_data_policy": {"requiresDataDisclosure": true, "retentionDays": 7},
+                "rainy_capabilities": {"tools": true, "reasoning": false}
             }),
             json!({
                 "id": "09-missing-optional",
@@ -1116,7 +1121,7 @@ mod tests {
             json!({"id": "12-duplicate-b", "name": "Same Name", "supported_parameters": ["tools"]}),
             json!({
                 "id": "13-v1-capabilities",
-                "name": "Legacy Hints",
+                "name": "V1 Capabilities",
                 "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
                 "rainy_capabilities": {"tools": true, "reasoning": "unknown"}
             }),
@@ -1142,28 +1147,32 @@ mod tests {
         assert!(!view("02-no-tools").selectable());
         assert_eq!(view("03-reasoning").reasoning, CapabilityState::Supported);
         assert!(view("03-reasoning").reasoning_modes.contains(&"effort".to_owned()));
-        assert_eq!(view("03-reasoning").thinking_budget_min, Some(256));
-        assert_eq!(view("03-reasoning").thinking_budget_max, Some(4096));
-        assert_eq!(view("03-reasoning").thinking_budget_dynamic_value, Some(2048));
-        assert_eq!(view("03-reasoning").thinking_budget_disable_value, Some(0));
-        assert!(view("03-reasoning").reasoning_values.contains(&"high".to_owned()));
+        assert!(view("03-reasoning").reasoning_modes.contains(&"budget".to_owned()));
+        assert_eq!(view("03-reasoning").thinking_budget_min, None);
+        assert_eq!(view("03-reasoning").thinking_budget_max, None);
+        assert!(view("03-reasoning").reasoning_values.is_empty());
         assert!(view("03-reasoning").reasoning_parameters.contains(&"reasoning.effort".to_owned()));
+        assert!(
+            view("03-reasoning").reasoning_parameters.contains(&"reasoning.max_tokens".to_owned())
+        );
         assert_eq!(view("04-unknown").tools, CapabilityState::Unknown);
         assert_eq!(view("04-unknown").availability, ModelAvailability::Unknown);
         assert!(view("04-unknown").has_unknown_metadata());
-        assert_eq!(view("05-plan-context").context_length, Some(262144));
-        assert_eq!(view("05-plan-context").model_context_length, Some(1000000));
-        assert_eq!(view("05-plan-context").plan_context_length, Some(262144));
-        assert_eq!(view("06-org-disabled").availability, ModelAvailability::OrganizationDenied);
-        assert!(!view("06-org-disabled").selectable());
-        assert_eq!(view("07-privacy-blocked").availability, ModelAvailability::PrivacyIncompatible);
-        assert!(!view("07-privacy-blocked").selectable());
-        assert!(view("08-disclosure").disclosure_required);
-        assert_eq!(view("08-disclosure").retention_days, Some(7));
+        assert_eq!(view("05-context").context_length, Some(1000000));
+        assert_eq!(view("05-context").model_context_length, Some(1000000));
+        assert_eq!(view("05-context").plan_context_length, None);
+        assert_eq!(view("05-context").effective_context_length, None);
+        assert_eq!(view("06-org-metadata-removed").availability, ModelAvailability::Unknown);
+        assert!(view("06-org-metadata-removed").selectable());
+        assert_eq!(view("07-privacy-metadata-removed").availability, ModelAvailability::Unknown);
+        assert!(view("07-privacy-metadata-removed").selectable());
+        assert!(!view("08-policy-metadata-removed").disclosure_required);
+        assert_eq!(view("08-policy-metadata-removed").retention_days, None);
         assert_eq!(view("09-missing-optional").tools, CapabilityState::Supported);
         assert_eq!(view("10-untrusted-name").display_name, "Bad�[31mName�");
         assert_eq!(view("11-duplicate-a").display_name, view("12-duplicate-b").display_name);
         assert_eq!(view("13-v1-capabilities").tools, CapabilityState::Supported);
+        assert_eq!(view("13-v1-capabilities").reasoning, CapabilityState::Unknown);
         assert_eq!(view("14-parameter-fallback").reasoning, CapabilityState::Supported);
     }
 
@@ -1220,6 +1229,58 @@ mod tests {
             source_error: None,
         };
         assert!(matches!(map_rainy_error(&network, true), BackendError::Operation { .. }));
+    }
+
+    #[test]
+    fn typed_rainy_errors_map_to_bounded_categories_without_provider_messages() {
+        let cases = [
+            (
+                RainyError::Authentication {
+                    code: "INVALID_API_KEY".to_owned(),
+                    message: "secret-key-value".to_owned(),
+                    retryable: false,
+                },
+                "authentication",
+                false,
+            ),
+            (
+                RainyError::RateLimit {
+                    code: "RATE_LIMIT_EXCEEDED".to_owned(),
+                    message: "secret-rate-detail".to_owned(),
+                    retry_after: Some(30),
+                    current_usage: None,
+                },
+                "rate limit",
+                true,
+            ),
+            (
+                RainyError::Serialization {
+                    message: "secret-serialization-detail".to_owned(),
+                    source_error: Some("secret-source-detail".to_owned()),
+                },
+                "serialization",
+                false,
+            ),
+            (
+                RainyError::PayloadTooLarge {
+                    message: "secret-payload-detail".to_owned(),
+                    max_bytes: 1024,
+                },
+                "payload too large",
+                false,
+            ),
+        ];
+        for (error, category, retryable) in cases {
+            let mapped = map_rainy_error(&error, false);
+            assert!(matches!(
+                mapped,
+                BackendError::Operation { ref message, retryable: actual }
+                    if actual == retryable
+                        && message.contains(category)
+                        && message.len() <= 256
+                        && !message.contains("secret")
+            ));
+        }
     }
 
     #[test]
@@ -1428,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_drop_stops_stream_consumption() {
-        let stream = Box::pin(stream::pending::<Result<Value, RainyError>>());
+        let stream = Box::pin(stream::pending::<Result<ResponsesStreamEvent, RainyError>>());
         let (sender, receiver) = mpsc::channel(1);
         let task = tokio::spawn(adapt_stream(stream, sender, false));
         drop(receiver);
