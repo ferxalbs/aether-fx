@@ -1008,6 +1008,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_stream_rejects_incomplete_final_sse_frame() {
+        let body = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}".to_vec();
+        let output = collect_backend_stream(body, 2).await;
+        assert!(output.iter().any(|event| matches!(
+            event,
+            Err(BackendError::IncompleteStream { message })
+                if message.contains("ended before a terminal")
+        )));
+        assert!(!output.iter().any(|event| matches!(event, Ok(ModelEvent::Done { .. }))));
+    }
+
+    #[tokio::test]
     async fn inference_transport_failure_is_sent_once_without_adapter_retry() {
         let (base_url, requests, handle) = spawn_closing_server();
         let backend = test_backend(&base_url);
@@ -1195,6 +1207,13 @@ mod tests {
             views.iter().map(|view| view.id.as_str()).collect::<Vec<_>>(),
             vec!["a-model", "z-model"]
         );
+    }
+
+    #[test]
+    fn empty_catalog_normalizes_to_empty_views() {
+        let (models, views) = normalize_catalog(Vec::new());
+        assert!(models.is_empty());
+        assert!(views.is_empty());
     }
 
     #[test]

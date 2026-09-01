@@ -5,96 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased - 2026-08-31 (1) - Rainy SDK 0.6.50 compatibility
+## v0.1.0-alpha-03 - 2026-08-31 (1) - Adaptive runtime and native terminal experience
+
+### Added
+
+- Added adaptive tool surfaces, targeted context selection, progress/stall awareness, bounded
+  recovery feedback, and runtime-owned evidence and completion review for coding tasks.
+- Added the native AETHER Fx interactive shell with local `/` discovery and `/model`, `/status`,
+  `/context`, `/config`, `/auth`, `/sessions`, `/resume`, `/doctor`, `/help`, `/clear`, and
+  `/exit` commands.
+- Added live Rainy model catalog presentation with capability, access, context, reasoning,
+  modality, and data-policy metadata, plus deterministic model selection and safe continuation
+  invalidation on model changes.
 
 ### Changed
 
-- Upgraded the direct Rainy dependency to the published `rainy-sdk 0.6.50` release with its
-  minimal feature set and no account/session integration.
-- Preserved Responses-only inference, explicit model selection, lazy catalog discovery, and
-  AETHER-owned credentials, continuation, session, and state boundaries.
+- Unified interactive, one-shot, piped, JSON, and headless execution behind explicit terminal
+  boundaries; local slash commands remain local and never reach the model.
+- Migrated the provider boundary to `rainy-sdk 0.6.50` with `default-features = false`, typed
+  Responses streaming, a single SDK-owned bounded SSE parser, typed reasoning semantics, and no
+  obsolete adapter compatibility path.
 
 ### Fixed
 
-- Adapted Rainy stream handling to the SDK's typed public `ResponsesStreamEvent` abstraction while
-  retaining send-once inference and fail-closed terminal-event handling.
-- Removed adapter dependence on the retired v2 catalog and provider-policy representations; facts
-  no longer supplied by the SDK remain unknown instead of being inferred.
+- Completion now remains blocked by stale or missing evidence, unresolved work, incomplete
+  verification, and unsuccessful mutations; session checkpoints and resume preserve the current
+  task state across interruption.
+- Rainy stream handling rejects incomplete terminal frames, maps typed SDK failures to bounded
+  backend errors, and keeps inference send-once at the adapter boundary.
 
 ### Security
 
-- Kept authentication, redirects, SSE framing, payload bounds, and safe-operation retry policy in
-  the Rainy SDK boundary; mapped typed SDK errors to bounded provider-neutral backend errors.
+- Preserved expected-hash mutation checks, dirty-user-change preservation, fail-closed
+  noninteractive permissions, and private session/configuration state.
+- Kept API keys out of normal configuration, history, sessions, logs, JSON output, and model
+  context; credential helpers and editors run without a shell, and remote catalog data is
+  terminal-sanitized and bounded.
 
 ### Performance
 
-- Recorded the final 6,320,592-byte stripped release binary and local startup/RSS and Criterion
-  measurements for the 0.6.50 dependency graph.
+- The locked stripped macOS release binary measured 6,320,592 bytes (6.03 MiB); deterministic
+  evaluation retained the frozen regression, capability, and control-loop gates while reducing
+  model-visible runtime overhead and tool-schema overhead.
 
 ### Documentation
 
-- Updated the Rainy integration, architecture, dependency, binary-size, and third-party notices
-  for the 0.6.50 boundary and recorded local stream-adversarial coverage.
-
-## Unreleased - 2026-08-30 (2) - Interactive shell and model experience
-
-### Added
-
-- Added a TTY-gated stateful shell with a local slash-command palette, shared selectors,
-  confirmations, secret input, status/context views, session controls, and terminal restoration.
-- Added live Rainy catalog normalization for capability, access, context, reasoning modes and
-  numeric budgets, modality, and data-policy presentation across `/model`, `aether models`,
-  `/status`, and JSON output.
-- Added non-secret configuration commands (`config path|show|edit`), a separate authentication
-  surface, bounded direct credential-helper support, and offline/network-separated diagnostics.
-
-### Changed
-
-- Unified interactive, one-shot, piped, JSON, and headless behavior behind explicit TTY and
-  non-interactive boundaries; local slash commands are never sent to the model.
-- Added deterministic model precedence and model-switch continuation invalidation while keeping
-  the existing backend-neutral agent runtime and permission authority intact.
-
-### Performance
-
-- Added bounded shell-selector benchmarks; the full local run measured 18.025 µs for slash-palette
-  filtering and 395.74 µs for filtering a 1,000-entry model catalog.
-
-### Security
-
-- Kept API keys out of configuration, argv, history, sessions, logs, JSON output, and model
-  context; bounded helper output and direct editor/helper invocation do not use a shell.
-- Added terminal-safe catalog/session rendering, private configuration permissions, and adversarial
-  coverage for symlink, redaction, malformed-catalog, and machine-output boundaries.
-
-### Documentation
-
-- Documented the interactive/headless architecture, normalized catalog contract, model precedence,
-  configuration/authentication behavior, and terminal trust boundaries.
-
-## Unreleased - 2026-08-30 (1) - Adaptive tool surface and interactive model selection
-
-### Added
-
-- Added dynamic deterministic tool surface selection (`select_tool_surface`), filtering model-visible tool definitions per workflow phase without brittle phase allowlists and reducing tool schema overhead by >35%.
-- Added progress effect classification (`ProgressEffect`) and bounded stall recovery feedback prompting strategy reconsideration when consecutive actions yield no new repository evidence.
-- Added native interactive model selector in `aether-terminal` (`select_model_interactively`) backed by the Rainy model catalog with arrow-key navigation, query filtering, and non-interactive terminal fallback.
-
-### Changed
-
-- Enhanced candidate salience scoring in context selection to heavily prioritize active `WorkState` subgoal targets and failure diagnostics while penalizing stale items.
-- Introduced deterministic phase-aware adaptive context budgeting (10KB–24KB, expanding up to 32KB on active recovery/failure states).
-
-### Performance
-
-- Cut aggregate tool schema bytes by over 36% and total bytes shown to model by >30% across the deterministic evaluation suite.
-
-## Unreleased - 2026-08-29 (5) - Agent runtime phase baseline and control loop closure
-
-### Documentation
-
-- Established the immutable end-of-phase agent runtime baseline across deterministic regression, capability, and Zero-Waste control-loop evaluation suites.
-- Confirmed single-source-of-truth invariants across operational phase, workspace revisions, WorkState subgoals, evidence freshness, verification coverage, and dirty worktree preservation.
+- Updated installation, interactive/headless usage, model/authentication behavior, Rainy SDK
+  integration, security boundaries, dependency notices, performance evidence, and release
+  packaging documentation for the alpha-03 snapshot.
 
 ## v0.1.0-alpha-02 - 2026-08-29 (4) - Adaptive orchestration and evidence-fresh completion
 

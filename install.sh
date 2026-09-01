@@ -32,7 +32,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$version" ] || fail 'an explicit release version is required; use --version v0.1.0-alpha-02'
+[ -n "$version" ] || fail 'an explicit release version is required; use --version v0.1.0-alpha-03'
 case "$version" in
     v*.*.*) ;;
     *) fail "invalid release version: $version" ;;

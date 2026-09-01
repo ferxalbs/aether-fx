@@ -373,6 +373,17 @@ jobs:
           cat > release-notes.md <<EOF
           AETHER Fx ${GITHUB_REF_NAME} is an alpha preview and is not stable or production-ready software.
 
+          This alpha closes the adaptive coding runtime and introduces AETHER's native interactive terminal experience.
+
+          Highlights:
+
+          - Adaptive context and tool surfaces reduce agent overhead while progress-aware execution preserves evidence-gated completion.
+          - Native interactive shell with local slash-command discovery, including /model, /status, /context, /config, /auth, /sessions, /resume, /doctor, /help, /clear, and /exit.
+          - Live Rainy model selection with capability, context, access, reasoning, modality, and data-policy metadata.
+          - Secure configuration, authentication, session, resume, and headless/JSON behavior with API keys excluded from normal persisted and model-visible state.
+          - Rainy SDK 0.6.50 integration with minimal features, typed Responses streaming, bounded SDK-owned SSE handling, and safe transport behavior.
+          - Approximately 6.0 MiB release binary and frozen offline regression, capability, and control-loop evaluation gates passing.
+
           Install the version-pinned Unix installer with:
 
           \`\`\`sh

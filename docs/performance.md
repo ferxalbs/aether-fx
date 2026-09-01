@@ -223,36 +223,37 @@ the earlier 80.91% figure above is the frozen-runtime baseline from its separate
 
 The final locked release build after the Rainy SDK migration measured 6,320,592 bytes (6.03 MiB).
 The earlier 6,365,736-byte value in the preceding shell-experience record is retained as historical
-evidence; this final rebuild is the authoritative value for the migrated tree. Direct
-`/usr/bin/time -l` probes on the local macOS host measured the following:
+evidence; this final rebuild is the authoritative value for the migrated tree. Five direct
+`/usr/bin/time -l` probes per command on the local macOS host measured the following; the table
+reports medians with the observed range in parentheses:
 
 | Probe | Wall time | Maximum RSS |
 | --- | ---: | ---: |
-| `aether --version` | 0.06 s | 7,520,256 bytes |
-| `aether --help` | 0.05 s | 7,487,488 bytes |
-| EOF/minimal startup | 0.06 s | 7,802,880 bytes |
+| `aether --version` | 0.05 s (0.05–0.05) | 7,360,512 bytes (7,360,512–7,376,896) |
+| `aether --help` | 0.05 s (0.05–0.05) | 7,368,704 bytes (7,368,704–7,368,704) |
+| EOF/minimal startup | 0.15 s (0.15–0.15) | 7,655,424 bytes (7,643,136–7,671,808) |
 
 The complete release Criterion suite finished successfully using the Plotters backend because
-Gnuplot was not installed. Selected point estimates were 46.930 ms for process startup, 71.382 µs
-for a small-file read, 1.7173 ms for a large-file read, 1.5055 ms for directory listing, 785.60 µs
-for content search, 106.14 µs for tool dispatch, 59.324 µs for blocking dispatch, 13.895 µs for
-slash-palette filtering, 377.37 µs for filtering a 1,000-entry model catalog, 1.7432 ms for an
-atomic write, 1.9324 ms for staged patch application, and 5.3124 ms for session replay. These are
+Gnuplot was not installed. Selected point estimates were 48.008 ms for process startup, 74.148 µs
+for a small-file read, 1.7508 ms for a large-file read, 1.5275 ms for directory listing, 795.37 µs
+for content search, 107.16 µs for tool dispatch, 60.085 µs for blocking dispatch, 14.027 µs for
+slash-palette filtering, 381.69 µs for filtering a 1,000-entry model catalog, 1.7985 ms for an
+atomic write, 1.9262 ms for staged patch application, and 4.1539 ms for session replay. These are
 single-host diagnostics; the benchmark suite does not make Rainy network requests.
 
 The final dependency graph contained 242 locked packages, 190 unique normal-tree nodes, and one
 `rainy-sdk` version (`0.6.50`). Its migration removed the former `eventsource-stream`/`nom` parser
 path and did not enable Rainy's account/session, legacy, rate-limiting, or tracing features. The
 workspace `cargo deny check` and `cargo audit` runs passed with no banned-license, source, or
-security-advisory findings. The all-features LCOV run covered 22,030 of 27,762 lines (79.35%).
+security-advisory findings. The all-features LCOV run covered 22,049 of 27,781 lines (79.37%).
 
 The release deterministic evaluators passed the frozen 9/9 regression suite, the 5/5 capability
 suite, and the 2/2 control-loop ablation after the migration. The final regression trace used
-49/55 model requests, 39/40 executed tool calls, 39,976/50,118 context bytes, 199,365/338,813
+49/55 model requests, 39/40 executed tool calls, 39,995/50,147 context bytes, 199,384/338,842
 model-visible bytes, and 13 process spawns; the capability trace used 15 requests, 9 tools, and
-18,340 context bytes. The capability and control-loop gates also passed.
+18,345 context bytes. The capability and control-loop gates also passed.
 Offline native shell probes passed without a Rainy credential. No live provider smoke was run, so
 network latency and remote service behavior remain unverified in this local freeze.
 The final source-tree evaluator rerun reproduced the frozen 9/9 regression and 5/5 capability
-results, with diagnostic agent wall times of 17,295 ms and 8,166 ms respectively; these are local
+results, with diagnostic agent wall times of 17,223 ms and 8,219 ms respectively; these are local
 measurements rather than release-time guarantees.

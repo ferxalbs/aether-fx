@@ -76,6 +76,7 @@ The catalog cache uses a bounded five-minute TTL. Bootstrap refreshes stale entr
 
 The adapter tests exercise both the typed mapping seam and the SDK boundary with a local HTTP stream:
 fragmented transport bytes, CRLF/LF, multiple `data:` lines, a split UTF-8 character, unknown
-events, `[DONE]`, malformed JSON, oversized frames, and disconnect-after-partial-stream behavior.
+events, `[DONE]`, incomplete final frames, malformed JSON, oversized frames, and
+disconnect-after-partial-stream behavior.
 They also verify that a failed inference transport is attempted once. Rainy's own parser tests remain
 the full parser conformance suite; AETHER only checks the integration contract it consumes.
