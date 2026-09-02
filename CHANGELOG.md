@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased - 2026-09-02 (6) - Safe model tool access
+
+### Fixed
+
+- Models without confirmed tool support remain visible but cannot be selected for the coding
+  shell.
+- Rainy `TOOLS_NOT_ALLOWED` responses are treated as non-retryable model incompatibilities,
+  remembered for the current process, and surfaced as unavailable on the next model selection;
+  interactive sessions remain open so another model can be chosen.
+
 ## Unreleased - 2026-09-02 (5) - Follow-up workflow improvements
 
 No unreleased changes.

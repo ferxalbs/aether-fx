@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 
 const CATALOG_TTL: Duration = Duration::from_secs(300);
 const STREAM_CHANNEL_CAPACITY: usize = 64;
+const TOOLS_NOT_ALLOWED_CODE: &str = "TOOLS_NOT_ALLOWED";
 
 #[derive(Clone, Debug)]
 struct CatalogCache {
@@ -39,6 +40,7 @@ struct CatalogCache {
 pub struct RainyBackend {
     client: Arc<RainyClient>,
     catalog: Arc<Mutex<Option<CatalogCache>>>,
+    denied_tool_models: Arc<Mutex<HashSet<String>>>,
 }
 
 /// A three-valued capability used when the provider did not make a claim.
@@ -197,7 +199,7 @@ impl ModelView {
         !matches!(
             self.availability,
             ModelAvailability::OrganizationDenied | ModelAvailability::PrivacyIncompatible
-        ) && self.tools != CapabilityState::Unsupported
+        ) && self.tools == CapabilityState::Supported
             && (!self.modalities_reported
                 || self.input_modalities.iter().any(|value| value == "text"))
     }
@@ -249,11 +251,19 @@ impl RainyBackend {
         }
         let client =
             RainyClient::with_api_key(key).map_err(|error| map_rainy_error(&error, false))?;
-        Ok(Self { client: Arc::new(client), catalog: Arc::new(Mutex::new(None)) })
+        Ok(Self {
+            client: Arc::new(client),
+            catalog: Arc::new(Mutex::new(None)),
+            denied_tool_models: Arc::new(Mutex::new(HashSet::new())),
+        })
     }
 
     pub fn new(client: RainyClient) -> Self {
-        Self { client: Arc::new(client), catalog: Arc::new(Mutex::new(None)) }
+        Self {
+            client: Arc::new(client),
+            catalog: Arc::new(Mutex::new(None)),
+            denied_tool_models: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     async fn refresh_catalog(&self) -> Result<(), BackendError> {
@@ -278,12 +288,33 @@ impl RainyBackend {
 
     async fn catalog(&self) -> Result<Vec<ModelCatalogItem>, BackendError> {
         self.refresh_catalog().await?;
-        Ok(self.catalog.lock().await.as_ref().map(|cache| cache.models.clone()).unwrap_or_default())
+        let denied_tool_models = self.denied_tool_models.lock().await.clone();
+        let (mut models, mut views) = self
+            .catalog
+            .lock()
+            .await
+            .as_ref()
+            .map(|cache| (cache.models.clone(), cache.views.clone()))
+            .unwrap_or_default();
+        apply_tool_denials(&mut models, &mut views, &denied_tool_models);
+        Ok(models)
     }
 
     pub async fn discover_model_views(&self) -> Result<Vec<ModelView>, BackendError> {
         self.refresh_catalog().await?;
-        Ok(self.catalog.lock().await.as_ref().map(|cache| cache.views.clone()).unwrap_or_default())
+        let denied_tool_models = self.denied_tool_models.lock().await.clone();
+        let mut views =
+            self.catalog.lock().await.as_ref().map(|cache| cache.views.clone()).unwrap_or_default();
+        apply_tool_denials_to_views(&mut views, &denied_tool_models);
+        Ok(views)
+    }
+
+    async fn tools_denied_for(&self, model: &str) -> bool {
+        self.denied_tool_models.lock().await.contains(model)
+    }
+
+    async fn mark_tools_denied(&self, model: &str) {
+        self.denied_tool_models.lock().await.insert(model.to_owned());
     }
 
     async fn model_for(&self, requested: Option<String>) -> Result<String, BackendError> {
@@ -341,6 +372,29 @@ fn normalize_catalog(
         .collect::<Vec<_>>();
     normalized.sort_by(|left, right| left.1.id.cmp(&right.1.id));
     normalized.into_iter().unzip()
+}
+
+fn apply_tool_denials(
+    models: &mut [ModelCatalogItem],
+    views: &mut [ModelView],
+    denied_tool_models: &HashSet<String>,
+) {
+    apply_tool_denials_to_views(views, denied_tool_models);
+    for model in models.iter_mut() {
+        if denied_tool_models.contains(&model.id)
+            && let Some(view) = views.iter().find(|view| view.id == model.id)
+        {
+            model.capabilities = serde_json::to_value(view).unwrap_or(Value::Null);
+        }
+    }
+}
+
+fn apply_tool_denials_to_views(views: &mut [ModelView], denied_tool_models: &HashSet<String>) {
+    for view in views.iter_mut() {
+        if denied_tool_models.contains(&view.id) {
+            view.tools = CapabilityState::Unsupported;
+        }
+    }
 }
 
 fn bounded_identifier(value: &str) -> Option<String> {
@@ -532,23 +586,35 @@ impl ModelBackend for RainyBackend {
     fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
         Box::pin(async move {
             let model = self.model_for(request.model.clone()).await?;
+            if !request.tools.is_empty() && self.tools_denied_for(&model).await {
+                return Err(BackendError::FeatureUnavailable {
+                    feature: format!(
+                        "tools are not allowed for model {model} over {} ({TOOLS_NOT_ALLOWED_CODE}); choose another model with tool access using /model",
+                        protocol_for_model_id(&model).as_str()
+                    ),
+                });
+            }
             let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
             match protocol_for_model_id(&model) {
                 ModelProtocol::Responses => {
                     let continuation_attached = request.continuation.is_some();
                     let rainy_request = self.request(&request, model.clone())?;
-                    let stream = self.client.create_response_stream(rainy_request).await.map_err(
-                        |error| {
-                            map_model_error(
+                    let stream = match self.client.create_response_stream(rainy_request).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            if !request.tools.is_empty() && is_tools_not_allowed(&error) {
+                                self.mark_tools_denied(&model).await;
+                            }
+                            return Err(map_model_error(
                                 &error,
                                 continuation_attached,
                                 &model,
                                 ModelProtocol::Responses,
-                            )
-                        },
-                    )?;
+                            ));
+                        }
+                    };
                     tokio::spawn(async move {
-                        adapt_stream(stream, sender, continuation_attached).await;
+                        adapt_stream(stream, sender, continuation_attached, model).await;
                     });
                 }
                 ModelProtocol::ChatCompletions => {
@@ -560,13 +626,22 @@ impl ModelBackend for RainyBackend {
                         });
                     }
                     let rainy_request = self.chat_request(&request, model.clone())?;
-                    let stream = self
-                        .client
-                        .create_openai_chat_completion_stream(rainy_request)
-                        .await
-                        .map_err(|error| {
-                            map_model_error(&error, false, &model, ModelProtocol::ChatCompletions)
-                        })?;
+                    let stream =
+                        match self.client.create_openai_chat_completion_stream(rainy_request).await
+                        {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                if !request.tools.is_empty() && is_tools_not_allowed(&error) {
+                                    self.mark_tools_denied(&model).await;
+                                }
+                                return Err(map_model_error(
+                                    &error,
+                                    false,
+                                    &model,
+                                    ModelProtocol::ChatCompletions,
+                                ));
+                            }
+                        };
                     tokio::spawn(async move {
                         adapt_chat_stream(stream, sender, model).await;
                     });
@@ -648,6 +723,7 @@ async fn adapt_stream(
     >,
     sender: mpsc::Sender<Result<ModelEvent, BackendError>>,
     continuation_attached: bool,
+    model: String,
 ) {
     let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut completed_tool_calls = HashSet::new();
@@ -664,7 +740,14 @@ async fn adapt_stream(
                 let event = match event {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = sender.send(Err(map_rainy_error(&error, continuation_attached))).await;
+                        let _ = sender
+                            .send(Err(map_model_error(
+                                &error,
+                                continuation_attached,
+                                &model,
+                                ModelProtocol::Responses,
+                            )))
+                            .await;
                         return;
                     }
                 };
@@ -1041,6 +1124,13 @@ fn map_rainy_error(error: &RainyError, continuation_attached: bool) -> BackendEr
             message: "Rainy rejected previous_response_id".to_owned(),
         };
     }
+    if is_tools_not_allowed(error) {
+        return BackendError::FeatureUnavailable {
+            feature: format!(
+                "Rainy denied tool access ({TOOLS_NOT_ALLOWED_CODE}); choose another model with tool access using /model"
+            ),
+        };
+    }
     let code = error
         .code()
         .filter(|value| {
@@ -1075,8 +1165,15 @@ fn map_model_error(
         BackendError::InvalidContinuation { message } => BackendError::InvalidContinuation {
             message: format!("{message} (model={model} · transport={})", protocol.as_str()),
         },
+        BackendError::FeatureUnavailable { feature } => BackendError::FeatureUnavailable {
+            feature: format!("{feature} (model={model} · transport={})", protocol.as_str()),
+        },
         other => other,
     }
+}
+
+fn is_tools_not_allowed(error: &RainyError) -> bool {
+    error.code().is_some_and(|code| code.eq_ignore_ascii_case(TOOLS_NOT_ALLOWED_CODE))
 }
 
 fn rainy_error_kind(error: &RainyError) -> &'static str {
@@ -1129,7 +1226,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         ));
         let (sender, mut receiver) = mpsc::channel(16);
-        adapt_stream(stream, sender, false).await;
+        adapt_stream(stream, sender, false, "openai/test-model".to_owned()).await;
         let mut output = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             output.push(event);
@@ -1285,6 +1382,30 @@ mod tests {
                     Err(_) => break,
                 }
             }
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
+    fn spawn_access_denied_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            observed_requests.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let body = br#"{"error":{"code":"TOOLS_NOT_ALLOWED","message":"tool access denied"}}"#;
+            let headers = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(body).unwrap();
         });
         (format!("http://{address}"), requests, handle)
     }
@@ -1539,6 +1660,31 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn tools_not_allowed_marks_model_unavailable_without_retry() {
+        let (base_url, requests, handle) = spawn_access_denied_server();
+        let backend = test_backend(&base_url);
+        let result = backend.stream_step(test_chat_model_request()).await;
+        assert!(matches!(
+            result,
+            Err(BackendError::FeatureUnavailable { feature })
+                if feature.contains("TOOLS_NOT_ALLOWED")
+                    && feature.contains("model=tencent/hy3")
+                    && feature.contains("transport=Chat Completions")
+        ));
+
+        let repeated = backend.stream_step(test_chat_model_request()).await;
+        assert!(matches!(
+            repeated,
+            Err(BackendError::FeatureUnavailable { feature })
+                if feature.contains("TOOLS_NOT_ALLOWED")
+                    && feature.contains("tencent/hy3")
+                    && feature.contains("Chat Completions")
+        ));
+        handle.join().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn normalized_model_view_preserves_sdk_fields_and_marks_removed_metadata_unknown() {
         let item: RainyModelCatalogItem = serde_json::from_value(json!({
@@ -1683,6 +1829,7 @@ mod tests {
         assert_eq!(view("04-unknown").tools, CapabilityState::Unknown);
         assert_eq!(view("04-unknown").availability, ModelAvailability::Unknown);
         assert!(view("04-unknown").has_unknown_metadata());
+        assert!(!view("04-unknown").selectable());
         assert_eq!(view("05-context").context_length, Some(1000000));
         assert_eq!(view("05-context").model_context_length, Some(1000000));
         assert_eq!(view("05-context").plan_context_length, None);
@@ -1699,6 +1846,24 @@ mod tests {
         assert_eq!(view("13-v1-capabilities").tools, CapabilityState::Supported);
         assert_eq!(view("13-v1-capabilities").reasoning, CapabilityState::Unknown);
         assert_eq!(view("14-parameter-fallback").reasoning, CapabilityState::Supported);
+    }
+
+    #[test]
+    fn runtime_tool_denial_overrides_catalog_selectability() {
+        let item: RainyModelCatalogItem = serde_json::from_value(json!({
+            "id": "provider/model",
+            "name": "Model",
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "rainy_capabilities": {"tools": true}
+        }))
+        .unwrap();
+        let (mut models, mut views) = normalize_catalog(vec![item]);
+        let denied_tool_models = HashSet::from(["provider/model".to_owned()]);
+        apply_tool_denials(&mut models, &mut views, &denied_tool_models);
+
+        assert_eq!(views[0].tools, CapabilityState::Unsupported);
+        assert!(!views[0].selectable());
+        assert_eq!(models[0].capabilities["tools"], "unsupported");
     }
 
     #[test]
@@ -2023,7 +2188,8 @@ mod tests {
     async fn receiver_drop_stops_stream_consumption() {
         let stream = Box::pin(stream::pending::<Result<ResponsesStreamEvent, RainyError>>());
         let (sender, receiver) = mpsc::channel(1);
-        let task = tokio::spawn(adapt_stream(stream, sender, false));
+        let task =
+            tokio::spawn(adapt_stream(stream, sender, false, "openai/test-model".to_owned()));
         drop(receiver);
         tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
     }

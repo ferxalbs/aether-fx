@@ -34,8 +34,9 @@ The normalization order is the SDK's v1 capability flags, then exact supported p
 the SDK does not provide a flag. Missing facts remain `unknown`; no model-name or provider heuristic
 fills them in. Reasoning parameter names can identify separate `effort` and `budget` display modes,
 but the adapter does not invent effort values, numeric bounds, or effort-to-budget conversions.
-Explicit lack of tool support makes an entry unavailable for the coding shell; unknown metadata
-remains selectable only after an explicit acknowledgement. All catalog text is bounded and
+Only an entry with tool support explicitly reported as supported is selectable for the coding shell;
+unsupported or unknown tool metadata remains visible but unavailable. Unknown access, privacy, and
+other metadata may still require an explicit acknowledgement. All catalog text is bounded and
 terminal-sanitized before it reaches a selector.
 
 The primary selector is a two-line interaction: the human name is always shown first, with the model
@@ -59,6 +60,12 @@ Responses; every other model ID uses the OpenAI-compatible Chat Completions endp
 transport is displayed beside the model name and ID in the selector, status output, and successful
 model-switch message. Request failures include the selected model and transport so a denied tool
 capability is diagnosable without guessing which endpoint ran.
+
+The public catalog cannot prove account-level tool entitlement. If inference returns the structured
+`TOOLS_NOT_ALLOWED` denial, AETHER treats it as a non-retryable model capability failure, remembers
+the model as unavailable for tools for the lifetime of the backend, and shows it as unavailable on
+the next model selection. The interactive shell remains open so another model can be selected with
+`/model`; AETHER does not retry the denied request or silently send a coding turn without tools.
 
 Chat Completions receives the agent's bounded, protocol-neutral conversation history. That history
 contains user/developer messages, the assistant's assembled text and tool calls, and each bounded

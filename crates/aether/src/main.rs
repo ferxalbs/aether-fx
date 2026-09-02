@@ -941,7 +941,7 @@ impl SessionRuntime {
         if let Some(prompt) = initial_prompt
             && !prompt.trim().is_empty()
         {
-            self.run_turn(prompt).await?;
+            self.run_turn_or_report(prompt).await?;
             if single_pass {
                 return Ok(());
             }
@@ -953,7 +953,7 @@ impl SessionRuntime {
             match self.read_input().await? {
                 aether_terminal::ShellInput::Line(prompt) => {
                     if !prompt.trim().is_empty() {
-                        self.run_turn(prompt).await?;
+                        self.run_turn_or_report(prompt).await?;
                     }
                 }
                 aether_terminal::ShellInput::Command(command) => {
@@ -973,6 +973,16 @@ impl SessionRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn run_turn_or_report(&mut self, prompt: String) -> Result<(), AppError> {
+        match self.run_turn(prompt).await {
+            Err(error) if self.interactive_ui => {
+                eprintln!("AETHER Fx: {}", safe_message(&error.to_string()));
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     async fn read_input(&self) -> Result<aether_terminal::ShellInput, AppError> {
