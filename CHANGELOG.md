@@ -5,9 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased - 2026-09-02 (3) - Follow-up workflow improvements
+## Unreleased - 2026-09-02 (5) - Follow-up workflow improvements
 
 No unreleased changes.
+
+## v0.1.0-alpha-05 - 2026-09-02 (4) - Protocol-aware model workflow
+
+### Changed
+
+- Added explicit model transport visibility to the selector, status output, and model-switch
+  confirmation so the active model name, ID, and request protocol stay readable together.
+- Added a backend-neutral bounded conversation history so Chat Completions turns can replay
+  assistant tool calls and tool results without exposing provider-specific types to the agent.
+
+### Fixed
+
+- Routed OpenAI models through Responses and other Rainy model providers through Chat Completions,
+  including OpenAI-compatible tool schemas, fragmented tool-call assembly, usage, and terminal
+  handling.
+- Added model and transport context to Rainy operation failures so errors such as
+  `TOOLS_NOT_ALLOWED` identify what was actually attempted.
 
 ## v0.1.0-alpha-04 - 2026-09-02 (2) - Model-first terminal workflow
 

@@ -433,7 +433,7 @@ jobs:
           - Windows uses a short-lived validated handoff helper because a running executable cannot replace itself; the next launch confirms the installed version.
           - Live Rainy model selection with capability, context, access, reasoning, modality, and data-policy metadata.
           - Secure configuration, authentication, session, resume, and headless/JSON behavior with API keys excluded from normal persisted and model-visible state.
-          - Rainy SDK 0.6.50 integration with minimal features, typed Responses streaming, bounded SDK-owned SSE handling, and safe transport behavior.
+          - Rainy SDK 0.6.50 integration with minimal features, explicit Responses versus Chat Completions routing, bounded neutral tool history, typed streaming, and safe transport behavior.
           - Approximately 6.0 MiB release binary and frozen offline regression, capability, and control-loop evaluation gates passing.
 
           Install the version-pinned Unix installer with:

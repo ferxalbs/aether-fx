@@ -3,18 +3,23 @@
 //! The only AETHER crate that directly consumes the verified Rainy SDK.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use aether_agent::{BackendError, BackendFuture, ModelBackend, ModelCatalogItem};
-use aether_core::{ModelEvent, ModelRequest, OpaqueContinuation, ToolCallId, ToolDefinition};
+use aether_core::{
+    ModelEvent, ModelMessage, ModelRequest, OpaqueContinuation, ToolCallId, ToolDefinition,
+};
 use futures_util::StreamExt;
 use rainy_sdk::{
-    CapabilityFlag, ModelCatalogItem as RainyModelCatalogItem, RainyCapabilities, RainyClient,
-    RainyError, ResponsesEventType, ResponsesRequest, ResponsesStreamEvent,
+    CapabilityFlag, ChatCompletionStreamResponse, FunctionDefinition,
+    ModelCatalogItem as RainyModelCatalogItem, OpenAIChatCompletionRequest, OpenAIChatMessage,
+    OpenAIFunctionCall, OpenAIMessageContent, OpenAIMessageRole, OpenAIToolCall, RainyCapabilities,
+    RainyClient, RainyError, ResponsesEventType, ResponsesRequest, ResponsesStreamEvent, Tool,
+    ToolType,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -65,6 +70,26 @@ pub enum ModelAvailability {
     Unknown,
 }
 
+/// Wire protocol selected for a model request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProtocol {
+    /// OpenAI Responses-compatible model route.
+    Responses,
+    /// OpenAI-compatible Chat Completions model route.
+    ChatCompletions,
+}
+
+impl ModelProtocol {
+    /// Return the human-readable transport label shown in the terminal.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "Responses",
+            Self::ChatCompletions => "Chat Completions",
+        }
+    }
+}
+
 impl ModelAvailability {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -81,6 +106,7 @@ impl ModelAvailability {
 pub struct ModelView {
     pub id: String,
     pub display_name: String,
+    pub protocol: ModelProtocol,
     pub context_length: Option<u64>,
     pub model_context_length: Option<u32>,
     pub plan_context_length: Option<u64>,
@@ -128,6 +154,7 @@ impl ModelView {
         Some(Self {
             id,
             display_name,
+            protocol: protocol_for_model_id(&item.id),
             context_length: item.context_length.map(u64::from),
             model_context_length: item.context_length,
             plan_context_length: None,
@@ -198,7 +225,8 @@ impl ModelView {
             _ => String::new(),
         };
         format!(
-            "{context} · tools {} · reasoning {reasoning_detail}{budget_detail} · access {}{}",
+            "{context} · transport {} · tools {} · reasoning {reasoning_detail}{budget_detail} · access {}{}",
+            self.protocol.as_str(),
             self.tools.as_str(),
             self.availability.as_str(),
             if self.disclosure_required { " · disclosure" } else { "" }
@@ -275,6 +303,22 @@ impl RainyBackend {
                 rainy_request.with_previous_response_id(previous_response_id(continuation)?);
         }
         Ok(rainy_request)
+    }
+
+    fn chat_request(
+        &self,
+        request: &ModelRequest,
+        model: String,
+    ) -> Result<OpenAIChatCompletionRequest, BackendError> {
+        if request.conversation.is_empty() {
+            return Err(BackendError::Mapping {
+                message: "Chat Completions request omitted conversation history".to_owned(),
+            });
+        }
+        let messages =
+            request.conversation.iter().map(chat_message).collect::<Result<Vec<_>, _>>()?;
+        let tools = request.tools.iter().map(chat_tool_definition).collect::<Vec<_>>();
+        Ok(OpenAIChatCompletionRequest::new(model, messages).with_stream(true).with_tools(tools))
     }
 }
 
@@ -463,21 +507,71 @@ fn select_model(requested: Option<String>) -> Result<String, BackendError> {
     })
 }
 
+/// Resolve the Rainy wire protocol from its provider-qualified model identity.
+///
+/// Rainy's catalog currently describes capabilities but does not expose a protocol field. The
+/// provider prefix is therefore the stable routing contract: OpenAI uses Responses, while every
+/// other provider uses the OpenAI-compatible Chat Completions endpoint. Unqualified model IDs are
+/// kept usable for the common OpenAI naming forms; all other unqualified IDs use Chat Completions.
+fn protocol_for_model_id(model: &str) -> ModelProtocol {
+    let lower = model.to_ascii_lowercase();
+    if lower.split_once('/').is_some_and(|(provider, _)| provider == "openai")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.starts_with("chatgpt-")
+    {
+        ModelProtocol::Responses
+    } else {
+        ModelProtocol::ChatCompletions
+    }
+}
+
 impl ModelBackend for RainyBackend {
     fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
         Box::pin(async move {
             let model = self.model_for(request.model.clone()).await?;
-            let continuation_attached = request.continuation.is_some();
-            let rainy_request = self.request(&request, model)?;
-            let stream = self
-                .client
-                .create_response_stream(rainy_request)
-                .await
-                .map_err(|error| map_rainy_error(&error, continuation_attached))?;
             let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-            tokio::spawn(async move {
-                adapt_stream(stream, sender, continuation_attached).await;
-            });
+            match protocol_for_model_id(&model) {
+                ModelProtocol::Responses => {
+                    let continuation_attached = request.continuation.is_some();
+                    let rainy_request = self.request(&request, model.clone())?;
+                    let stream = self.client.create_response_stream(rainy_request).await.map_err(
+                        |error| {
+                            map_model_error(
+                                &error,
+                                continuation_attached,
+                                &model,
+                                ModelProtocol::Responses,
+                            )
+                        },
+                    )?;
+                    tokio::spawn(async move {
+                        adapt_stream(stream, sender, continuation_attached).await;
+                    });
+                }
+                ModelProtocol::ChatCompletions => {
+                    if request.continuation.is_some() {
+                        return Err(BackendError::InvalidContinuation {
+                            message: format!(
+                                "Chat Completions does not accept a Responses continuation for model {model}"
+                            ),
+                        });
+                    }
+                    let rainy_request = self.chat_request(&request, model.clone())?;
+                    let stream = self
+                        .client
+                        .create_openai_chat_completion_stream(rainy_request)
+                        .await
+                        .map_err(|error| {
+                            map_model_error(&error, false, &model, ModelProtocol::ChatCompletions)
+                        })?;
+                    tokio::spawn(async move {
+                        adapt_chat_stream(stream, sender, model).await;
+                    });
+                }
+            }
             Ok(receiver)
         })
     }
@@ -501,6 +595,50 @@ fn tool_definition(definition: &ToolDefinition) -> Value {
         "name": definition.name,
         "description": definition.description,
         "parameters": definition.input_schema
+    })
+}
+
+fn chat_tool_definition(definition: &ToolDefinition) -> Tool {
+    Tool {
+        r#type: ToolType::Function,
+        function: FunctionDefinition::new(definition.name.clone())
+            .with_description(definition.description.clone())
+            .with_parameters(definition.input_schema.clone()),
+    }
+}
+
+fn chat_message(message: &ModelMessage) -> Result<OpenAIChatMessage, BackendError> {
+    match message {
+        ModelMessage::System { content } => Ok(OpenAIChatMessage::system(content.clone())),
+        ModelMessage::Developer { content } => Ok(OpenAIChatMessage::developer(content.clone())),
+        ModelMessage::User { content } => Ok(OpenAIChatMessage::user(content.clone())),
+        ModelMessage::Assistant { content, tool_calls } => {
+            let mut message = OpenAIChatMessage::with_content(
+                OpenAIMessageRole::Assistant,
+                content.clone().map(OpenAIMessageContent::from),
+            );
+            if !tool_calls.is_empty() {
+                message.tool_calls =
+                    Some(tool_calls.iter().map(chat_tool_call).collect::<Result<Vec<_>, _>>()?);
+            }
+            Ok(message)
+        }
+        ModelMessage::Tool { call_id, content } => {
+            Ok(OpenAIChatMessage::tool(call_id.as_str(), content.clone()))
+        }
+    }
+}
+
+fn chat_tool_call(call: &aether_core::ModelToolCall) -> Result<OpenAIToolCall, BackendError> {
+    let arguments =
+        serde_json::to_string(&call.arguments).map_err(|error| BackendError::Mapping {
+            message: format!("Chat Completions tool arguments could not be serialized: {error}"),
+        })?;
+    Ok(OpenAIToolCall {
+        id: call.call_id.as_str().to_owned(),
+        r#type: "function".to_owned(),
+        function: OpenAIFunctionCall { name: call.name.clone(), arguments },
+        extra_content: None,
     })
 }
 
@@ -556,6 +694,166 @@ async fn adapt_stream(
             }
         }
     }
+}
+
+#[derive(Default)]
+struct ChatToolCallState {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+async fn adapt_chat_stream(
+    mut stream: std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<Item = Result<ChatCompletionStreamResponse, RainyError>>
+                + Send,
+        >,
+    >,
+    sender: mpsc::Sender<Result<ModelEvent, BackendError>>,
+    model: String,
+) {
+    let mut tool_calls = BTreeMap::<u32, ChatToolCallState>::new();
+    let mut terminal_seen = false;
+    let mut usage = None;
+    loop {
+        tokio::select! {
+            _ = sender.closed() => return,
+            chunk = stream.next() => {
+                let Some(chunk) = chunk else {
+                    if terminal_seen {
+                        if !emit_chat_tool_calls(tool_calls, &sender).await {
+                            return;
+                        }
+                        if let Some((input_tokens, output_tokens, total_tokens)) = usage
+                            && sender.send(Ok(ModelEvent::Usage {
+                                input_tokens: Some(input_tokens),
+                                output_tokens: Some(output_tokens),
+                                total_tokens: Some(total_tokens),
+                            })).await.is_err()
+                        {
+                            return;
+                        }
+                        let _ = sender.send(Ok(ModelEvent::Done { continuation: None })).await;
+                        return;
+                    }
+                    let _ = sender.send(Err(BackendError::IncompleteStream {
+                        message: format!(
+                            "Rainy Chat Completions stream for model {model} ended before a terminal chunk"
+                        ),
+                    })).await;
+                    return;
+                };
+                let chunk = match chunk {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sender.send(Err(map_model_error(
+                            &error,
+                            false,
+                            &model,
+                            ModelProtocol::ChatCompletions,
+                        ))).await;
+                        return;
+                    }
+                };
+                if let Some(value) = chunk.usage {
+                    usage = Some((value.prompt_tokens, value.completion_tokens, value.total_tokens));
+                }
+                if terminal_seen {
+                    continue;
+                }
+                let mut terminal = false;
+                for choice in chunk.choices {
+                    if let Some(content) = choice.delta.content
+                        && !content.is_empty()
+                        && sender.send(Ok(ModelEvent::TextDelta { text: content })).await.is_err()
+                    {
+                        return;
+                    }
+                    if let Some(deltas) = choice.delta.tool_calls {
+                        for delta in deltas {
+                            let state = tool_calls.entry(delta.index).or_default();
+                            if let Some(id) = delta.id.filter(|value| !value.is_empty()) {
+                                state.id = Some(id);
+                            }
+                            if let Some(function) = delta.function {
+                                if let Some(name) = function.name {
+                                    state.name.push_str(&name);
+                                }
+                                if let Some(arguments) = function.arguments {
+                                    state.arguments.push_str(&arguments);
+                                }
+                            }
+                        }
+                    }
+                    terminal |= choice
+                        .finish_reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.is_empty());
+                }
+                if !terminal {
+                    continue;
+                }
+                terminal_seen = true;
+            }
+        }
+    }
+}
+
+async fn emit_chat_tool_calls(
+    tool_calls: BTreeMap<u32, ChatToolCallState>,
+    sender: &mpsc::Sender<Result<ModelEvent, BackendError>>,
+) -> bool {
+    for (_, state) in tool_calls {
+        let call_id = match state.id.filter(|value| !value.is_empty()) {
+            Some(value) => value,
+            None => {
+                let _ = sender
+                    .send(Err(BackendError::Mapping {
+                        message: "Rainy Chat Completions tool call omitted its id".to_owned(),
+                    }))
+                    .await;
+                return false;
+            }
+        };
+        if state.name.is_empty() {
+            let _ = sender
+                .send(Err(BackendError::Mapping {
+                    message: "Rainy Chat Completions tool call omitted its name".to_owned(),
+                }))
+                .await;
+            return false;
+        }
+        let arguments = if state.arguments.is_empty() { "{}" } else { state.arguments.as_str() };
+        let arguments = match serde_json::from_str(arguments) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = sender
+                    .send(Err(BackendError::Mapping {
+                        message: "Rainy Chat Completions tool call arguments were not valid JSON"
+                            .to_owned(),
+                    }))
+                    .await;
+                return false;
+            }
+        };
+        let call_id = match ToolCallId::new(call_id) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ =
+                    sender.send(Err(BackendError::Mapping { message: error.to_string() })).await;
+                return false;
+            }
+        };
+        if sender
+            .send(Ok(ModelEvent::ToolCall { call_id, name: state.name, arguments }))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn map_event(
@@ -763,6 +1061,24 @@ fn map_rainy_error(error: &RainyError, continuation_attached: bool) -> BackendEr
     }
 }
 
+fn map_model_error(
+    error: &RainyError,
+    continuation_attached: bool,
+    model: &str,
+    protocol: ModelProtocol,
+) -> BackendError {
+    match map_rainy_error(error, continuation_attached) {
+        BackendError::Operation { message, retryable } => BackendError::Operation {
+            message: format!("{message} (model={model} · transport={})", protocol.as_str()),
+            retryable,
+        },
+        BackendError::InvalidContinuation { message } => BackendError::InvalidContinuation {
+            message: format!("{message} (model={model} · transport={})", protocol.as_str()),
+        },
+        other => other,
+    }
+}
+
 fn rainy_error_kind(error: &RainyError) -> &'static str {
     match error {
         RainyError::Authentication { .. } => "authentication",
@@ -791,12 +1107,15 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
     };
 
     use super::*;
-    use aether_core::{SessionId, StepId, TurnId};
+    use aether_core::{ModelMessage, SessionId, StepId, TurnId};
     use futures_util::stream;
     use rainy_sdk::ResponsesEvent;
 
@@ -823,9 +1142,44 @@ mod tests {
             session_id: SessionId::new("session-1").unwrap(),
             turn_id: TurnId::new("turn-1").unwrap(),
             step_id: StepId::new("step-1").unwrap(),
-            model: Some("test-model".to_owned()),
+            model: Some("openai/test-model".to_owned()),
             input: json!("hello"),
+            conversation: Arc::new(vec![ModelMessage::User { content: "hello".to_owned() }]),
             tools: Arc::new(Vec::new()),
+            continuation: None,
+        }
+    }
+
+    fn test_chat_model_request() -> ModelRequest {
+        let call_id = ToolCallId::new("call-1").unwrap();
+        ModelRequest {
+            session_id: SessionId::new("session-1").unwrap(),
+            turn_id: TurnId::new("turn-1").unwrap(),
+            step_id: StepId::new("step-1").unwrap(),
+            model: Some("tencent/hy3".to_owned()),
+            input: json!([{"type":"message","role":"user","content":"hello"}]),
+            conversation: Arc::new(vec![
+                ModelMessage::User { content: "hello".to_owned() },
+                ModelMessage::Assistant {
+                    content: None,
+                    tool_calls: vec![aether_core::ModelToolCall {
+                        call_id: call_id.clone(),
+                        name: "read".to_owned(),
+                        arguments: json!({"path":"README.md"}),
+                    }],
+                },
+                ModelMessage::Tool { call_id, content: "file contents".to_owned() },
+            ]),
+            tools: Arc::new(vec![ToolDefinition {
+                name: "read".to_owned(),
+                description: "Read a file".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+                permission: aether_core::PermissionClass::ReadOnly,
+            }]),
             continuation: None,
         }
     }
@@ -863,6 +1217,30 @@ mod tests {
             }
         });
         (format!("http://{address}"), handle)
+    }
+
+    fn spawn_observing_stream_server(
+        body: Vec<u8>,
+    ) -> (String, Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_request = Arc::clone(&observed);
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut buffer).map(|read| request.extend_from_slice(&buffer[..read]));
+            *observed_request.lock().unwrap() = request;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        (format!("http://{address}"), observed, handle)
     }
 
     async fn collect_backend_stream(
@@ -919,6 +1297,109 @@ mod tests {
         super::map_event(ResponsesEvent::new(None, value), tool_calls, completed_tool_calls)
     }
 
+    async fn collect_chat(events: Vec<Value>) -> Vec<Result<ModelEvent, BackendError>> {
+        let stream = Box::pin(stream::iter(events.into_iter().map(|value| {
+            Ok::<ChatCompletionStreamResponse, RainyError>(serde_json::from_value(value).unwrap())
+        })));
+        let (sender, mut receiver) = mpsc::channel(16);
+        adapt_chat_stream(stream, sender, "tencent/hy3".to_owned()).await;
+        let mut output = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            output.push(event);
+        }
+        output
+    }
+
+    #[test]
+    fn model_protocol_routes_only_openai_models_to_responses() {
+        assert_eq!(protocol_for_model_id("openai/gpt-5"), ModelProtocol::Responses);
+        assert_eq!(protocol_for_model_id("gpt-5"), ModelProtocol::Responses);
+        assert_eq!(protocol_for_model_id("tencent/hy3"), ModelProtocol::ChatCompletions);
+        assert_eq!(
+            protocol_for_model_id("anthropic/claude-sonnet"),
+            ModelProtocol::ChatCompletions
+        );
+        assert_eq!(protocol_for_model_id("x-ai/grok-4"), ModelProtocol::ChatCompletions);
+    }
+
+    #[test]
+    fn chat_request_replays_tool_history_and_uses_openai_shape() {
+        let backend = test_backend("http://127.0.0.1:1");
+        let request =
+            backend.chat_request(&test_chat_model_request(), "tencent/hy3".to_owned()).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["model"], "tencent/hy3");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][1]["role"], "assistant");
+        assert_eq!(value["messages"][1]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(value["messages"][2]["role"], "tool");
+        assert_eq!(value["messages"][2]["tool_call_id"], "call-1");
+        assert_eq!(value["tools"][0]["function"]["name"], "read");
+        assert_eq!(value["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_maps_text_usage_fragmented_tool_call_and_done() {
+        let output = collect_chat(vec![
+            json!({
+                "id":"chat-1","object":"chat.completion.chunk","created":1,"model":"tencent/hy3",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]
+            }),
+            json!({
+                "id":"chat-1","object":"chat.completion.chunk","created":1,"model":"tencent/hy3",
+                "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\""}}]},"finish_reason":null}]
+            }),
+            json!({
+                "id":"chat-1","object":"chat.completion.chunk","created":1,"model":"tencent/hy3",
+                "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"README.md\"}"}}]},"finish_reason":null}]
+            }),
+            json!({
+                "id":"chat-1","object":"chat.completion.chunk","created":1,"model":"tencent/hy3",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}
+            }),
+        ]).await;
+        assert!(matches!(&output[0], Ok(ModelEvent::TextDelta { text }) if text == "hello"));
+        assert!(
+            matches!(&output[1], Ok(ModelEvent::ToolCall { call_id, name, arguments }) if call_id.as_str() == "call-1" && name == "read" && arguments["path"] == "README.md"),
+            "{output:?}"
+        );
+        assert!(matches!(
+            &output[2],
+            Ok(ModelEvent::Usage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                total_tokens: Some(18)
+            })
+        ));
+        assert!(matches!(&output[3], Ok(ModelEvent::Done { continuation: None })));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_accepts_usage_chunk_after_terminal_chunk() {
+        let output = collect_chat(vec![
+            json!({
+                "id":"chat-1","object":"chat.completion.chunk","created":1,"model":"tencent/hy3",
+                "choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]
+            }),
+            json!({
+                "id":"chat-1","object":"chat.completion.chunk","created":1,"model":"tencent/hy3",
+                "choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}
+            }),
+        ])
+        .await;
+        assert!(matches!(&output[0], Ok(ModelEvent::TextDelta { text }) if text == "done"));
+        assert!(matches!(
+            &output[1],
+            Ok(ModelEvent::Usage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                total_tokens: Some(18)
+            })
+        ));
+        assert!(matches!(&output[2], Ok(ModelEvent::Done { continuation: None })));
+    }
+
     #[test]
     fn maps_text_delta_without_exposing_reasoning() {
         let mut calls = HashMap::new();
@@ -964,6 +1445,36 @@ mod tests {
             Ok(ModelEvent::Done { continuation: Some(continuation) })
                 if continuation.0["previous_response_id"] == "resp-1"
         ));
+    }
+
+    #[tokio::test]
+    async fn non_openai_models_use_chat_completions_endpoint() {
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"tencent/hy3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"tencent/hy3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (base_url, observed, handle) = spawn_observing_stream_server(body);
+        let backend = test_backend(&base_url);
+        let mut stream = backend.stream_step(test_chat_model_request()).await.unwrap();
+        let mut output = Vec::new();
+        while let Some(event) = stream.recv().await {
+            output.push(event);
+        }
+        handle.join().unwrap();
+        let request = String::from_utf8(observed.lock().unwrap().clone()).unwrap();
+        assert!(request.starts_with("POST /chat/completions "), "{request}");
+        assert!(request.contains("\"model\":\"tencent/hy3\""), "{request}");
+        assert!(request.contains("\"tool_calls\""), "{request}");
+        assert!(output.iter().any(|event| matches!(
+            event,
+            Ok(ModelEvent::TextDelta { text }) if text == "ok"
+        )));
+        assert!(
+            output.iter().any(|event| matches!(event, Ok(ModelEvent::Done { continuation: None })))
+        );
     }
 
     #[tokio::test]
@@ -1046,6 +1557,7 @@ mod tests {
         assert_eq!(view.display_name, "Frontier �[31mModel");
         assert_eq!(view.context_length, Some(128000));
         assert_eq!(view.model_context_length, Some(128000));
+        assert_eq!(view.protocol, ModelProtocol::ChatCompletions);
         assert_eq!(view.plan_context_length, None);
         assert_eq!(view.effective_context_length, None);
         assert_eq!(view.tier, None);
@@ -1062,6 +1574,7 @@ mod tests {
         assert!(!view.disclosure_required);
         assert_eq!(view.retention_days, None);
         assert!(view.detail().contains("access unknown"));
+        assert!(view.detail().contains("transport Chat Completions"));
         assert!(!view.detail().contains("tier"));
     }
 

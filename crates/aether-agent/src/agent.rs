@@ -6,9 +6,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use aether_core::{
-    AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelRequest,
-    ObservedFileState, OpaqueContinuation, SessionId, StepId, ToolExecutor, ToolInvocation,
-    ToolResult, TurnId, WorkspacePath,
+    AgentEvent, BoundedText, ContextSnapshot, DEFAULT_MAX_OUTPUT_BYTES, ModelEvent, ModelMessage,
+    ModelRequest, ModelToolCall, ObservedFileState, OpaqueContinuation, SessionId, StepId,
+    ToolExecutor, ToolInvocation, ToolResult, TurnId, WorkspacePath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -273,8 +273,10 @@ where
         let mut policy = AutonomousCodingPolicy::new();
         policy.set_optimizations_enabled(request.optimize);
         self.with_context(|engine| policy.refresh_candidates(engine));
-        let mut input =
-            assemble_user_input(&request.prompt, self.context_packet(continuation.is_some()));
+        let user_content =
+            assemble_user_content(&request.prompt, self.context_packet(continuation.is_some()));
+        let mut input = assemble_user_input_content(&user_content);
+        let mut conversation = vec![ModelMessage::User { content: user_content }];
         let mut steps = 0_u16;
         let mut reconstructed = false;
         let mut blocked_completions = 0_u8;
@@ -329,6 +331,7 @@ where
                 step_id,
                 model: request.model.clone(),
                 input: input.clone(),
+                conversation: Arc::new(conversation.clone()),
                 tools: Arc::clone(&active_tools),
                 continuation: continuation.clone(),
             };
@@ -390,7 +393,10 @@ where
                 {
                     continuation = None;
                     reconstructed = true;
-                    input = assemble_user_input(&request.prompt, Some(self.render_context(true)));
+                    let user_content =
+                        assemble_user_content(&request.prompt, Some(self.render_context(true)));
+                    input = assemble_user_input_content(&user_content);
+                    conversation = vec![ModelMessage::User { content: user_content }];
                     send_event(
                         &events,
                         AgentEvent::Warning {
@@ -483,6 +489,21 @@ where
                 });
             }
 
+            let assistant_tool_calls = tool_calls
+                .iter()
+                .map(|(call_id, name, arguments)| ModelToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })
+                .collect::<Vec<_>>();
+            if !step_text.is_empty() || !assistant_tool_calls.is_empty() {
+                conversation.push(ModelMessage::Assistant {
+                    content: (!step_text.is_empty()).then_some(step_text.clone()),
+                    tool_calls: assistant_tool_calls,
+                });
+            }
+
             let prepared_calls = tool_calls
                 .into_iter()
                 .map(|(call_id, name, input)| {
@@ -512,6 +533,7 @@ where
                     if blocked_completions >= 3 {
                         return Err(AgentError::CompletionBlocked);
                     }
+                    conversation.push(ModelMessage::Developer { content: feedback.clone() });
                     input = json!([{
                         "type": "message",
                         "role": "developer",
@@ -611,6 +633,7 @@ where
                     completed,
                     &mut metrics,
                     &mut outputs,
+                    &mut conversation,
                     &mut refresh_context,
                     false,
                 );
@@ -624,6 +647,7 @@ where
                     broker,
                     &mut metrics,
                     &mut outputs,
+                    &mut conversation,
                     &mut refresh_context,
                 )
                 .await?;
@@ -636,6 +660,9 @@ where
                         "role": "developer",
                         "content": format!("bounded evidence update:\n{context_update}"),
                     }));
+                    conversation.push(ModelMessage::Developer {
+                        content: format!("bounded evidence update:\n{context_update}"),
+                    });
                 }
             }
             if let Some(stall_message) =
@@ -647,8 +674,9 @@ where
                 outputs.push(json!({
                     "type": "message",
                     "role": "developer",
-                    "content": stall_message
+                    "content": stall_message.clone()
                 }));
+                conversation.push(ModelMessage::Developer { content: stall_message });
             }
             if policy.consecutive_no_progress() >= 6 {
                 let diagnostic = self.with_context(|engine| {
@@ -678,12 +706,14 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn consume_tool_result(
         &self,
         policy: &mut AutonomousCodingPolicy,
         completed: ScheduledToolResult,
         metrics: &mut Option<MetricsState>,
         outputs: &mut Vec<serde_json::Value>,
+        conversation: &mut Vec<ModelMessage>,
         refresh_context: &mut bool,
         automatic_verification: bool,
     ) -> bool {
@@ -789,7 +819,12 @@ where
                 "retryable": error.retryable,
             })),
         }));
+        conversation.push(ModelMessage::Tool {
+            call_id: result.call_id.clone(),
+            content: result.output.as_str().to_owned(),
+        });
         if let Some(feedback) = feedback {
+            conversation.push(ModelMessage::Developer { content: feedback.clone() });
             outputs.push(json!({"type":"message","role":"developer","content":feedback}));
         }
         mutation_succeeded
@@ -805,6 +840,7 @@ where
         broker: &P,
         metrics: &mut Option<MetricsState>,
         outputs: &mut Vec<serde_json::Value>,
+        conversation: &mut Vec<ModelMessage>,
         refresh_context: &mut bool,
     ) -> Result<(), AgentError> {
         for index in 0..aether_core::MAX_WORKFLOW_VERIFICATIONS {
@@ -861,6 +897,7 @@ where
                     completed,
                     metrics,
                     outputs,
+                    conversation,
                     refresh_context,
                     true,
                 );
@@ -1263,11 +1300,14 @@ fn new_target_has_discovered_parent(snapshot: &ContextSnapshot, path: &str) -> b
     })
 }
 
-fn assemble_user_input(prompt: &str, context_packet: Option<String>) -> serde_json::Value {
-    let content = match context_packet {
+fn assemble_user_content(prompt: &str, context_packet: Option<String>) -> String {
+    match context_packet {
         Some(packet) if !packet.trim().is_empty() => format!("{packet}\n\n{prompt}"),
         _ => prompt.to_owned(),
-    };
+    }
+}
+
+fn assemble_user_input_content(content: &str) -> serde_json::Value {
     json!([{"type":"message","role":"user","content": content}])
 }
 
@@ -1312,7 +1352,7 @@ mod tests {
     use crate::{BackendFuture, ModelCatalogItem, SessionPermissionBroker};
     use aether_core::tools::ToolFuture;
     use aether_core::{
-        InspectedFile, ModelEvent, ModelRequest, OpaqueContinuation, PermissionClass,
+        InspectedFile, ModelEvent, ModelMessage, ModelRequest, OpaqueContinuation, PermissionClass,
         PermissionDecision, ToolCallId, ToolDefinition, ToolExecutionContext, ToolInvocation,
         ToolResult, WorkflowVerification,
     };
@@ -1596,11 +1636,13 @@ mod tests {
     #[derive(Clone, Default)]
     struct WorkflowBackend {
         steps: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     impl ModelBackend for WorkflowBackend {
         fn stream_step<'a>(&'a self, request: ModelRequest) -> BackendFuture<'a> {
             let step = self.steps.fetch_add(1, Ordering::Relaxed);
+            self.requests.lock().unwrap().push(request.clone());
             Box::pin(async move {
                 let (sender, receiver) = mpsc::channel(4);
                 match step {
@@ -1721,7 +1763,9 @@ mod tests {
 
     #[tokio::test]
     async fn normal_coding_flow_completes_after_focused_verification() {
-        let agent = Agent::new(WorkflowBackend::default(), WorkflowTools);
+        let backend = WorkflowBackend::default();
+        let requests = Arc::clone(&backend.requests);
+        let agent = Agent::new(backend, WorkflowTools);
         let request = AgentRequest::new(
             SessionId::new("workflow-normal").unwrap(),
             TurnId::new("workflow-turn").unwrap(),
@@ -1733,6 +1777,22 @@ mod tests {
         assert_eq!(result.context.workflow.verification, WorkflowVerification::Passed);
         assert_eq!(result.context.workflow.progress.mutations, 1);
         assert!(result.context.workflow.unresolved_failures.is_empty());
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().skip(1).any(|request| {
+            request.conversation.iter().any(|message| {
+                matches!(
+                    message,
+                    ModelMessage::Assistant { tool_calls, .. }
+                        if tool_calls.iter().any(|call| call.call_id.as_str() == "workflow-read-1")
+                )
+            }) && request.conversation.iter().any(|message| {
+                matches!(
+                    message,
+                    ModelMessage::Tool { call_id, content }
+                        if call_id.as_str() == "workflow-read-1" && content.contains("src/lib.rs")
+                )
+            })
+        }));
     }
 
     #[tokio::test]

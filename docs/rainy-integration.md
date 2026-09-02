@@ -1,6 +1,6 @@
 # Rainy integration
 
-The only provider boundary is `aether-rainy`. It depends on the exact `rainy-sdk 0.6.50` crate and uses its `RainyClient`, `ResponsesRequest`, `create_response_stream`, and `get_models_catalog` APIs. The adapter consumes the SDK's typed public `ResponsesStreamEvent` stream and maps it into AETHER `ModelEvent` values without leaking SDK types.
+The only provider boundary is `aether-rainy`. It depends on the exact `rainy-sdk 0.6.50` crate and uses its `RainyClient`, `ResponsesRequest`, `OpenAIChatCompletionRequest`, both typed streaming APIs, and `get_models_catalog`. The adapter consumes the SDK's typed public Responses and OpenAI-compatible Chat Completions streams and maps them into AETHER `ModelEvent` values without leaking SDK types.
 
 The manifest keeps Rainy's minimal feature set with `default-features = false`; no account/session,
 legacy, rate-limiting, or tracing surface is enabled. AETHER keeps its own environment-key,
@@ -19,9 +19,10 @@ and `/model` remain explicit catalog-discovery paths.
 
 `RainyBackend::discover_model_views` converts the live SDK entries into one bounded `ModelView`
 projection shared by `/model`, `aether models`, `/status`, and JSON output. The projection consumes
-the SDK's authoritative fields rather than model-name heuristics:
+the SDK's authoritative fields and adds the explicit wire protocol selected for the model:
 
 - identity and display name;
+- the selected Responses or Chat Completions transport;
 - model context, tools, reasoning, supported parameters, and input/output modalities;
 - bounded display and selection metadata used by `/model`, `aether models`, `/status`, and JSON
   output;
@@ -45,10 +46,27 @@ normalized fields for machine consumers; it does not expose an unbounded copy of
 response.
 
 Rainy's authentication, redirect policy, request bounds, SSE parsing, and retry behavior remain
-Rainy's/SDK's responsibility. AETHER does not maintain a second SSE parser and calls the SDK's
-Responses stream once for each semantic model step; it adds no retry around inference. The adapter
-does not invent an idempotency field or provider routing layer. Reasoning and continuation fields
-remain opaque to the agent; raw chain-of-thought is never rendered or exposed as a tool result.
+Rainy's/SDK's responsibility. AETHER does not maintain a second SSE parser and calls one SDK stream
+once for each semantic model step; it adds no retry around inference. Reasoning fields remain opaque
+to the agent; raw chain-of-thought is never rendered or exposed as a tool result.
+
+## Protocol routing and Chat Completions history
+
+The catalog in `rainy-sdk 0.6.50` reports model capabilities but does not report a per-model wire
+protocol. AETHER therefore applies one centralized routing rule: a provider-qualified `openai/*`
+model, or a recognized unqualified OpenAI model ID such as `gpt-*` or `o1`/`o3`/`o4`, uses
+Responses; every other model ID uses the OpenAI-compatible Chat Completions endpoint. The chosen
+transport is displayed beside the model name and ID in the selector, status output, and successful
+model-switch message. Request failures include the selected model and transport so a denied tool
+capability is diagnosable without guessing which endpoint ran.
+
+Chat Completions receives the agent's bounded, protocol-neutral conversation history. That history
+contains user/developer messages, the assistant's assembled text and tool calls, and each bounded
+tool result. Tool schemas are translated to the OpenAI function wrapper, fragmented streaming tool
+call deltas are assembled by index, usage is forwarded when reported, and a terminal finish chunk is
+required before AETHER emits `Done`. Chat Completions has no Responses continuation ID; it returns
+`Done { continuation: None }` and relies on the next bounded conversation step. A stale Responses
+continuation is rejected once and the agent reconstructs the turn from local bounded context.
 
 ## Continuation invalidation and typed recovery
 

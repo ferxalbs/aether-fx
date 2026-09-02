@@ -1155,9 +1155,10 @@ impl SessionRuntime {
             self.model_view = Some(view.clone());
             self.model_name = Some(view.display_name.clone());
             println!(
-                "model: {} ({}) · already active",
+                "model: {} ({}) · transport {} · already active",
                 safe_message(&view.display_name),
-                safe_message(&view.id)
+                safe_message(&view.id),
+                view.protocol.as_str()
             );
             return Ok(());
         }
@@ -1165,7 +1166,7 @@ impl SessionRuntime {
             let reason = if view.disclosure_required {
                 "Rainy requires a data-disclosure acknowledgement for this model"
             } else {
-                "Rainy did not report complete capability or access metadata for this model"
+                "Rainy did not report complete capability or access metadata; verify before using this model"
             };
             let policy_detail = if view.disclosure_required {
                 format!(
@@ -1211,9 +1212,10 @@ impl SessionRuntime {
             context.model = self.model.clone();
         }
         println!(
-            "model: {} ({}) · ready for the next turn",
+            "model: {} ({}) · transport {} · ready for the next turn",
             safe_message(&view.display_name),
-            safe_message(&view.id)
+            safe_message(&view.id),
+            view.protocol.as_str()
         );
         Ok(())
     }
@@ -1321,6 +1323,7 @@ impl SessionRuntime {
             "workspace": safe_path(&self.root),
             "session": self.session_id,
             "model": self.model,
+            "model_protocol": self.model_view.as_ref().map(|view| view.protocol.as_str()),
             "model_name": self
                 .model_view
                 .as_ref()
@@ -1408,6 +1411,7 @@ impl SessionRuntime {
                 {
                     println!("model id: {}", safe_message(model));
                 }
+                println!("model transport: {}", view.protocol.as_str());
                 println!(
                     "model capabilities: {} · tools {} · reasoning {} · access {}",
                     view.effective_context_length

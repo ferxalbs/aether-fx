@@ -119,12 +119,13 @@ packets and contain only affected paths plus the newest bounded source windows.
 
 An interrupted or step-limited turn is appended as a `Checkpoint`, distinct from a completed `TurnSnapshot`. Checkpoints contain only the same minimized context and sanitized continuation allowed for normal session persistence. Resume therefore recovers the latest active work state, unresolved blockers, current workspace evidence, and completion status without relying on hidden conversation history. The runtime remains single-agent; the repository action planner is a bounded read-only optimization for high-confidence local evidence, not an additional model or project-management system.
 
-`aether-rainy` is the only crate that imports `rainy_sdk`. It consumes the SDK's typed public
-Responses stream and maps it into AETHER `ModelEvent` values; provider reasoning metadata remains
-outside the agent contract. A successful `ModelEvent::Done` requires a verified
-`response.completed` event and a response identity; failed, incomplete, transport-error, and
-unexpected-EOF paths remain backend errors. No provider endpoint, model catalog, or key appears
-elsewhere.
+`aether-rainy` is the only crate that imports `rainy_sdk`. It resolves each selected model to the
+OpenAI Responses or OpenAI-compatible Chat Completions protocol, translates the bounded neutral
+conversation and tool schemas, and maps both typed streams into AETHER `ModelEvent` values;
+provider reasoning metadata remains outside the agent contract. Responses requires a verified
+`response.completed` event and response identity; Chat Completions requires a terminal finish
+chunk. Failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No
+provider endpoint, model catalog, or key appears elsewhere.
 
 `aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
 

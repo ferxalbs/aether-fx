@@ -43,7 +43,7 @@ pub use error::{CoreError, CoreResult};
 pub use events::{AgentEvent, EventSequence, UsageMetadata};
 pub use ids::{SessionId, StepId, ToolCallId, TurnId};
 pub use limits::{BoundedText, DEFAULT_MAX_OUTPUT_BYTES, OutputLimit};
-pub use model::{ModelEvent, ModelRequest, OpaqueContinuation};
+pub use model::{ModelEvent, ModelMessage, ModelRequest, ModelToolCall, OpaqueContinuation};
 pub use path::{WorkspacePath, WorkspaceRoot};
 pub use permissions::{
     PermissionClass, PermissionDecision, PermissionEngine, PermissionPolicy, PermissionRequest,

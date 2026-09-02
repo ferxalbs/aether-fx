@@ -9,6 +9,33 @@ use crate::{AgentEvent, SessionId, StepId, ToolCallId, ToolDefinition, TurnId};
 #[serde(transparent)]
 pub struct OpaqueContinuation(pub serde_json::Value);
 
+/// A tool call preserved in the backend-neutral conversation history.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ModelToolCall {
+    /// Stable identifier echoed by the eventual tool result.
+    pub call_id: ToolCallId,
+    /// Model-visible tool name.
+    pub name: String,
+    /// JSON arguments assembled from the provider stream.
+    pub arguments: serde_json::Value,
+}
+
+/// One bounded conversation message that can be translated to a provider protocol.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum ModelMessage {
+    /// A system instruction.
+    System { content: String },
+    /// A runtime instruction or bounded workflow feedback.
+    Developer { content: String },
+    /// User-authored turn content.
+    User { content: String },
+    /// Assistant text and/or tool calls from the preceding model step.
+    Assistant { content: Option<String>, tool_calls: Vec<ModelToolCall> },
+    /// Tool output paired with the assistant call that requested it.
+    Tool { call_id: ToolCallId, content: String },
+}
+
 /// A backend-neutral model request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelRequest {
@@ -22,6 +49,8 @@ pub struct ModelRequest {
     pub model: Option<String>,
     /// Responses-style input assembled by the agent.
     pub input: serde_json::Value,
+    /// Bounded protocol-neutral history for providers using Chat Completions.
+    pub conversation: Arc<Vec<ModelMessage>>,
     /// Exact tool definitions visible to the model.
     pub tools: Arc<Vec<ToolDefinition>>,
     /// Opaque continuation from the previous model step.

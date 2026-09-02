@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aether"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aether-agent"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "aether-core",
  "blake3",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "blake3",
  "serde",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aether-eval"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "aether-rainy"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "aether-terminal"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "aether-core",
  "rustix",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tools"
-version = "0.1.0-alpha-04"
+version = "0.1.0-alpha-05"
 dependencies = [
  "aether-agent",
  "aether-core",
