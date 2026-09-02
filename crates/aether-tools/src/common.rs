@@ -737,16 +737,8 @@ pub(crate) fn install_replacement(
         return install_without_replacement(staged, create_only, cancellation);
     }
 
-    #[cfg(windows)]
-    {
-        platform::replace_existing(&staged.destination, &staged.temporary)?;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(&staged.temporary, &staged.destination)?;
-        Ok(())
-    }
+    crate::replace_existing_file(&staged.destination, &staged.temporary)?;
+    Ok(())
 }
 
 fn install_without_replacement(

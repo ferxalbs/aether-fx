@@ -2,6 +2,8 @@
 
 //! The exact nine model-visible local tools.
 
+use std::{io, path::Path};
+
 mod common;
 mod find;
 mod git;
@@ -14,6 +16,15 @@ mod schema;
 mod search;
 mod shell;
 mod write;
+
+/// Atomically replace an existing regular file with a same-directory replacement.
+///
+/// Unix uses the filesystem's atomic `rename` operation. Windows uses `ReplaceFileW` without a
+/// backup file. Callers must validate the destination and stage the replacement before invoking
+/// this function.
+pub fn replace_existing_file(destination: &Path, replacement: &Path) -> io::Result<()> {
+    platform::replace_existing(destination, replacement)
+}
 
 pub use common::Workspace;
 pub use find::{FindInput, FindOutput};

@@ -25,6 +25,7 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 
 mod config;
+mod updater;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SHELL_COMMANDS: usize = 32;
@@ -43,6 +44,8 @@ enum AppError {
     Session(#[from] SessionStoreError),
     #[error(transparent)]
     Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Update(#[from] updater::UpdateError),
     #[error("runtime initialization failed: {0}")]
     Runtime(String),
 }
@@ -57,6 +60,7 @@ enum Command {
     Doctor { network: bool },
     Config(ConfigCommand),
     Auth,
+    Update,
     Help(Option<String>),
     Version,
 }
@@ -85,8 +89,17 @@ struct SessionOptions {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    if let Some(exit_code) = updater::maybe_run_windows_helper() {
+        return exit_code;
+    }
+    let json_output = std::env::args_os().any(|argument| argument == "--json");
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(AppError::Update(error)) if json_output => {
+            println!("{}", error.json_line());
+            ExitCode::FAILURE
+        }
         Err(error) => {
             eprintln!("AETHER Fx: {}", safe_message(&error.to_string()));
             ExitCode::FAILURE
@@ -118,6 +131,7 @@ fn run() -> Result<(), AppError> {
             Ok(())
         }
         Command::Doctor { network } => doctor(&cli.root, cli.json, network),
+        Command::Update => with_runtime(|runtime| runtime.block_on(update_command(cli.json))),
         Command::Models => {
             with_runtime(|runtime| runtime.block_on(models(&cli.root, cli.json, cli.network)))
         }
@@ -257,6 +271,7 @@ fn parse_cli() -> Result<Cli, AppError> {
     let command = match first {
         "models" if positionals.len() == 1 => Command::Models,
         "doctor" if positionals.len() == 1 => Command::Doctor { network },
+        "update" if positionals.len() == 1 => Command::Update,
         "sessions" if positionals.len() == 1 => Command::Sessions,
         "config" if positionals.len() == 2 => match positionals[1].to_str() {
             Some("path") => Command::Config(ConfigCommand::Path),
@@ -329,11 +344,14 @@ fn print_help(topic: Option<&str>) {
         Some("doctor") => println!(
             "aether doctor [--network] /doctor\n\nRun local diagnostics. Network diagnostics require explicit --network."
         ),
+        Some("update") => println!(
+            "aether update [--json] /update\n\nCheck the official AETHER Fx release and install a newer validated binary without elevation."
+        ),
         Some(topic) => println!("no help topic named {}; run aether help", safe_message(topic)),
         None => println!(
             "AETHER Fx {VERSION}\n\n\
-             Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models [--json]\n  aether doctor [--network]\n  aether config path|show|edit\n  aether auth\n\n\
-             Interactive commands:\n  /model     Choose a live Rainy model\n  /status    Show session, model, workflow, and permission state\n  /context   Show bounded context and workflow evidence\n  /config    Show or update local preferences\n  /auth      Show credential status or enter a key for this process\n  /sessions  Pick a local session\n  /resume    Restore a local session\n  /doctor    Run offline diagnostics\n  /help      Show this help\n  /clear     Start a fresh local session\n  /exit      Finish and leave the shell\n\n\
+             Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models [--json]\n  aether doctor [--network]\n  aether update [--json]\n  aether config path|show|edit\n  aether auth\n\n\
+             Interactive commands:\n  /model     Choose a live Rainy model\n  /status    Show session, model, workflow, and permission state\n  /context   Show bounded context and workflow evidence\n  /config    Show or update local preferences\n  /auth      Show credential status or enter a key for this process\n  /sessions  Pick a local session\n  /resume    Restore a local session\n  /doctor    Run offline diagnostics\n  /update    Update AETHER Fx and leave the shell\n  /help      Show this help\n  /clear     Start a fresh local session\n  /exit      Finish and leave the shell\n\n\
              Options:\n  --model <id>       Select a Rainy model\n  --root <dir>       Set the workspace root\n  --json             Emit one JSON object per completed turn\n  --yolo             Allow tools without permission prompts\n  --non-interactive  Disable interactive selection and secret entry\n  --network          Allow doctor/model network discovery where applicable\n  --latest           Resume the newest valid local session\n  -h, --help         Show help\n  -V, --version      Show version\n\n\
              Sessions are stored as bounded JSONL in private OS application-state storage."
         ),
@@ -350,6 +368,7 @@ fn print_help_json(topic: Option<&str>) -> Result<(), AppError> {
         ("/sessions", "Pick a local session"),
         ("/resume", "Pick and restore a local session"),
         ("/doctor", "Run offline diagnostics"),
+        ("/update", "Update AETHER Fx and leave the shell"),
         ("/help", "Show local commands"),
         ("/clear", "Start a fresh local session"),
         ("/exit", "Finish and leave the shell"),
@@ -377,6 +396,11 @@ fn doctor(root: &Path, json_output: bool, network: bool) -> Result<(), AppError>
     let sessions = SessionStore::directory_for(&workspace)?;
     let config = config::load(&workspace);
     let git = git_branch(&workspace);
+    let update_status = updater::local_status_json();
+    let update_supported =
+        update_status.get("supported").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let update_reason =
+        update_status.get("reason").and_then(serde_json::Value::as_str).map(safe_message);
     let session_health = match SessionStore::summaries(&workspace) {
         Ok((summaries, issues)) => serde_json::json!({
             "status": "ok",
@@ -449,6 +473,7 @@ fn doctor(root: &Path, json_output: bool, network: bool) -> Result<(), AppError>
                 },
                 "sessions_health": session_health,
                 "config": config_status,
+                "update": update_status.clone(),
                 "network": network_result,
             }))
             .map_err(|error| AppError::Message(error.to_string()))?
@@ -516,6 +541,13 @@ fn doctor(root: &Path, json_output: bool, network: bool) -> Result<(), AppError>
         "session health: {}",
         session_health.get("status").and_then(serde_json::Value::as_str).unwrap_or("unknown")
     );
+    if update_supported {
+        println!("update: supported");
+    } else if let Some(reason) = update_reason {
+        println!("update: unavailable ({reason})");
+    } else {
+        println!("update: unavailable");
+    }
     if network {
         println!(
             "Rainy catalog: {}",
@@ -585,6 +617,14 @@ fn with_runtime(
         .build()
         .map_err(|error| AppError::Runtime(error.to_string()))?;
     operation(&runtime)
+}
+
+async fn update_command(json_output: bool) -> Result<(), AppError> {
+    let result = updater::run(json_output).await?;
+    if json_output {
+        println!("{}", result.json_line());
+    }
+    Ok(())
 }
 
 async fn models(root: &Path, json_output: bool, _network: bool) -> Result<(), AppError> {
@@ -921,7 +961,9 @@ impl SessionRuntime {
                     match self.run_command(&command).await {
                         Ok(ShellControl::Exit) => break,
                         Ok(ShellControl::Continue) => {}
-                        Err(error) if self.interactive_ui => {
+                        Err(error)
+                            if self.interactive_ui && !matches!(&error, AppError::Update(_)) =>
+                        {
                             eprintln!("AETHER Fx: {}", safe_message(&error.to_string()));
                         }
                         Err(error) => return Err(error),
@@ -970,6 +1012,13 @@ impl SessionRuntime {
             "/model" => self.choose_model(false).await?,
             "/sessions" | "/resume" => self.choose_session().await?,
             "/doctor" => doctor(&self.root, self.json_output, false)?,
+            "/update" => {
+                let result = updater::run(self.json_output).await?;
+                if self.json_output {
+                    println!("{}", result.json_line());
+                }
+                return Ok(ShellControl::Exit);
+            }
             "/clear" => self.clear_session().await?,
             "/exit" | "/quit" => return Ok(ShellControl::Exit),
             value => {
@@ -1662,6 +1711,7 @@ fn command_items() -> Vec<SelectorItem<String>> {
         ("/sessions", "Sessions", "Pick a local session"),
         ("/resume", "Resume", "Pick and restore a local session"),
         ("/doctor", "Doctor", "Run offline diagnostics"),
+        ("/update", "Update", "Update AETHER Fx and leave the shell"),
         ("/help", "Help", "Show local commands"),
         ("/clear", "Clear", "Finish this session and start a fresh one"),
         ("/exit", "Exit", "Finish this session and leave the shell"),

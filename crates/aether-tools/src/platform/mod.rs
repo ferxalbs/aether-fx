@@ -2,7 +2,7 @@
 mod unix;
 
 #[cfg(unix)]
-pub(crate) use unix::install_exclusive;
+pub(crate) use unix::{install_exclusive, replace_existing};
 
 #[cfg(windows)]
 #[allow(unsafe_code)]

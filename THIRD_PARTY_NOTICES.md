@@ -14,8 +14,11 @@ The direct dependency baseline is:
 | lexopt | 0.3.2 | MIT |
 | rainy-sdk | 0.6.50 | Apache-2.0 |
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 |
+| reqwest | 0.13.4 | MIT OR Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 OR MIT OR Apache-2.0 WITH LLVM-exception |
+| semver | 1.0.28 | MIT OR Apache-2.0 |
 | serde / serde_json | 1.0.229 / 1.0.151 | MIT OR Apache-2.0 |
+| sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | tokio | 1.53.1 | MIT |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |

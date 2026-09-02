@@ -43,7 +43,35 @@ Ctrl+C in a permission prompt is a terminal `CancelTurn` outcome: it cancels the
 
 ## Secrets and network
 
-`RAINY_API_KEY` is read only when a Rainy backend is requested. It is not stored in sessions, tool results, logs, panic diagnostics, or user-visible errors. AETHER has zero telemetry. The only normal outbound operation is an explicit Rainy inference or model-catalog request.
+`RAINY_API_KEY` is read only when a Rainy backend is requested. It is not stored in sessions, tool results, logs, panic diagnostics, or user-visible errors. AETHER has zero telemetry. Normal startup, `--version`, `--help`, `sessions`, and the default `doctor` are offline. Rainy inference and model-catalog requests remain explicit network operations.
+
+The explicit `aether update` command is a separate fixed-source network boundary. It requests
+public releases from `api.github.com/repos/ferxalbs/aether-fx/releases`, ignores drafts, accepts
+valid `v`-prefixed SemVer prereleases and stable releases, and selects the highest SemVer
+precedence. It constructs the matching GitHub release asset URLs itself and ignores download URLs
+from API JSON; no mirror, endpoint override, authorization header, Rainy key, or GitHub token is
+accepted. Reqwest uses Rustls, system certificates, and its system-proxy behavior, requires HTTPS
+for redirects, uses a ten-second connect limit, a sixty-second per-request limit, and one bounded
+retry for transient transport/status failures.
+
+Release metadata and `SHA256SUMS` are capped at 1 MiB. The direct target binary is capped at 128
+MiB, streamed into a same-directory temporary file, hashed with SHA-256, checked against one exact
+manifest entry, and executed only for a bounded exact `--version` check. The original executable
+is inspected as a regular non-link/non-reparse file and its content identity is rechecked before
+commit. The updater refuses read-only destinations, non-regular files, and paths that cannot stage
+a sibling file; it never invokes sudo, UAC, a package manager, or an installer. Temporary files are
+identifiable, removed after success/failure where possible, and
+stale files from the same destination are cleaned only on the next explicit update. A temporary
+file lock makes a concurrent updater fail clearly.
+
+Unix replaces the existing executable with a same-filesystem atomic rename while preserving its
+basic permissions. Windows validates a second temporary helper copy, launches it hidden, exits the
+current process, and lets the helper wait up to thirty seconds for the executable handle to be
+released before calling `ReplaceFileW`; the original remains intact if the handoff cannot finish.
+The Windows JSON `updated: true` result means that this validated handoff was accepted, not that
+the current process has already relaunched. HTTPS plus SHA-256 protects transport integrity and
+the published manifest relationship but is not an independent cryptographic signature; release
+provenance attestations remain optional for clients.
 
 ## Session persistence
 

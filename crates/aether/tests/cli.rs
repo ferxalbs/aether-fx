@@ -224,6 +224,7 @@ fn informational_commands_report_os_state_without_touching_workspace() {
             assert!(stdout.contains("RAINY_API_KEY: not configured"), "{stdout}");
             assert!(stdout.contains("AETHER_MODEL: not configured"), "{stdout}");
             assert!(stdout.contains("provider endpoint: SDK default HTTPS endpoint"), "{stdout}");
+            assert!(stdout.contains("update: supported"), "{stdout}");
             assert!(!stdout.contains("secret"), "{stdout}");
         }
         let _ = fs::remove_dir_all(&root);
@@ -249,6 +250,50 @@ fn json_version_is_one_structured_machine_record() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     assert!(!output.stdout.contains(&0x1b));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn update_help_documents_explicit_network_operation() {
+    let root = temp_root("update-help");
+    let output = run(&root, ["help", "update"].as_slice());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("aether update [--json]"), "{stdout}");
+    assert!(stdout.contains("/update"), "{stdout}");
+    assert!(!stdout.contains('\x1b'), "{stdout:?}");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn json_help_lists_update_command() {
+    let root = temp_root("json-help-update");
+    let output = run(&root, ["--json", "help"].as_slice());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["commands"].as_array().unwrap().iter().any(|command| {
+        command["name"] == "/update"
+            && command["description"] == "Update AETHER Fx and leave the shell"
+    }));
+    assert!(!output.stdout.contains(&0x1b));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn doctor_json_reports_local_update_capability_without_network() {
+    let root = temp_root("doctor-update");
+    let output = run(&root, ["doctor", "--json"].as_slice());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["update"]["source"], "github.com/ferxalbs/aether-fx");
+    assert_eq!(value["update"]["supported"], true);
+    assert!(value["update"]["current_executable"].as_str().is_some_and(|path| !path.is_empty()));
+    assert_eq!(value["update"]["reason"], serde_json::Value::Null);
+    assert!(!root.join(".aether").exists());
+    assert!(!root.join(".aether-fx").exists());
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(state_root(&root));
 }

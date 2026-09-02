@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## v0.1.0-alpha-03 - 2026-08-31 (1) - Adaptive runtime and native terminal experience
+## v0.1.0-alpha-03 - 2026-09-01 (1) - Native self-update and terminal reliability
 
 ### Added
 
@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the native AETHER Fx interactive shell with local `/` discovery and `/model`, `/status`,
   `/context`, `/config`, `/auth`, `/sessions`, `/resume`, `/doctor`, `/help`, `/clear`, and
   `/exit` commands.
+- Added the explicit `aether update` and `/update` commands with stable/prerelease SemVer
+  discovery, target-specific direct binaries, stable JSON output, and offline update capability
+  diagnostics in `aether doctor`.
 - Added live Rainy model catalog presentation with capability, access, context, reasoning,
   modality, and data-policy metadata, plus deterministic model selection and safe continuation
   invalidation on model changes.
@@ -22,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Unified interactive, one-shot, piped, JSON, and headless execution behind explicit terminal
   boundaries; local slash commands remain local and never reach the model.
+- Added HTTPS plus SHA-256 manifest verification, bounded streaming downloads, same-filesystem
+  atomic executable replacement, temporary update locking, and Windows handoff behavior without
+  elevation, persistent cache, permanent backups, telemetry, or a permanent helper.
+- Expanded each GitHub prerelease with a directly downloadable binary asset while retaining the
+  existing archive, SBOM, installer, checksum, and provenance contracts.
 - Migrated the provider boundary to `rainy-sdk 0.6.50` with `default-features = false`, typed
   Responses streaming, a single SDK-owned bounded SSE parser, typed reasoning semantics, and no
   obsolete adapter compatibility path.
@@ -41,18 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept API keys out of normal configuration, history, sessions, logs, JSON output, and model
   context; credential helpers and editors run without a shell, and remote catalog data is
   terminal-sanitized and bounded.
+- Kept the updater fixed to the official repository, without authorization headers or configurable
+  mirrors; it rejects links/reparse points, read-only or non-regular destinations, unverified
+  assets, malformed checksums, concurrent update attempts, and version mismatches.
 
 ### Performance
 
-- The locked stripped macOS release binary measured 6,320,592 bytes (6.03 MiB); deterministic
-  evaluation retained the frozen regression, capability, and control-loop gates while reducing
-  model-visible runtime overhead and tool-schema overhead.
+- The locked stripped macOS release binary measured 6,412,584 bytes (6.12 MiB) after adding the
+  explicit updater; deterministic evaluation retained the frozen regression, capability, and
+  control-loop gates while reducing model-visible runtime overhead and tool-schema overhead.
 
 ### Documentation
 
 - Updated installation, interactive/headless usage, model/authentication behavior, Rainy SDK
-  integration, security boundaries, dependency notices, performance evidence, and release
-  packaging documentation for the alpha-03 snapshot.
+  integration, self-update behavior, security boundaries, dependency notices, performance
+  evidence, and release packaging documentation for the alpha-03 snapshot.
 
 ## v0.1.0-alpha-02 - 2026-08-29 (4) - Adaptive orchestration and evidence-fresh completion
 

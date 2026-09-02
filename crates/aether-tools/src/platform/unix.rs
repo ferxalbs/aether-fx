@@ -1,5 +1,9 @@
 use std::{io, path::Path};
 
+pub(crate) fn replace_existing(destination: &Path, replacement: &Path) -> io::Result<()> {
+    std::fs::rename(replacement, destination)
+}
+
 pub(crate) fn install_exclusive(destination: &Path, replacement: &Path) -> io::Result<()> {
     exclusive_rename(destination, replacement)
 }

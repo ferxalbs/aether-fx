@@ -257,3 +257,11 @@ network latency and remote service behavior remain unverified in this local free
 The final source-tree evaluator rerun reproduced the frozen 9/9 regression and 5/5 capability
 results, with diagnostic agent wall times of 17,223 ms and 8,219 ms respectively; these are local
 measurements rather than release-time guarantees.
+
+## Native updater acceptance — 2026-09-01
+
+The locked stripped macOS `aether` release binary measured 6,412,584 bytes (6.12 MiB) after adding
+the explicit HTTPS/SHA-256 updater. Fresh local probes measured 0.06 seconds for `--version`,
+0.05 seconds for `--help`, and 0.06 seconds for EOF/minimal startup. The version and help paths do
+not construct the HTTP client; minimal startup also completed without a provider credential or
+network operation. These are single-host measurements, not cross-platform guarantees.

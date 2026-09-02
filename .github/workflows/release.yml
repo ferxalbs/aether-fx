@@ -118,26 +118,32 @@ jobs:
             runner: windows-2025
             name: windows-x86_64
             extension: zip
+            direct_extension: .exe
           - target: aarch64-pc-windows-msvc
             runner: windows-11-vs2026-arm
             name: windows-aarch64
             extension: zip
+            direct_extension: .exe
           - target: x86_64-apple-darwin
             runner: macos-26-intel
             name: macos-x86_64
             extension: tar.gz
+            direct_extension: ""
           - target: aarch64-apple-darwin
             runner: macos-26
             name: macos-aarch64
             extension: tar.gz
+            direct_extension: ""
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             name: linux-x86_64-gnu
             extension: tar.gz
+            direct_extension: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             name: linux-aarch64-gnu
             extension: tar.gz
+            direct_extension: ""
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -238,13 +244,16 @@ jobs:
           set -euo pipefail
           version="$GITHUB_REF_NAME"
           archive="aether-${version}-${{ matrix.name }}.tar.gz"
+          direct="aether-${version}-${{ matrix.name }}"
           rm -rf dist
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/aether" dist/package/aether
+          cp "target/${{ matrix.target }}/release/aether" "dist/${direct}"
           cp crates/aether/bom.json dist/package/aether.cdx.json
           cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/package/
           tar -C dist/package -czf "dist/${archive}" aether aether.cdx.json LICENSE NOTICE THIRD_PARTY_NOTICES.md
           (cd dist && sha256sum "$archive" > "${archive}.sha256")
+          test "$("dist/${direct}" --version)" = "${GITHUB_REF_NAME#v}"
           expected=$(printf '%s\n' aether aether.cdx.json LICENSE NOTICE THIRD_PARTY_NOTICES.md | sort)
           actual=$(tar -tzf "dist/${archive}" | sort)
           test "$actual" = "$expected"
@@ -260,11 +269,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = "aether-$env:GITHUB_REF_NAME-${{ matrix.name }}.zip"
+          $direct = "aether-$env:GITHUB_REF_NAME-${{ matrix.name }}.exe"
           $dist = Join-Path $pwd 'dist'
           $package = Join-Path $dist 'package'
           Remove-Item -LiteralPath $dist -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/aether.exe" (Join-Path $package 'aether.exe')
+          Copy-Item "target/${{ matrix.target }}/release/aether.exe" (Join-Path $dist $direct)
           Copy-Item crates/aether/bom.json (Join-Path $package 'aether.cdx.json')
           Copy-Item LICENSE, NOTICE, THIRD_PARTY_NOTICES.md -Destination $package
           Compress-Archive -Path (Join-Path $package 'aether.exe'), (Join-Path $package 'aether.cdx.json'), (Join-Path $package 'LICENSE'), (Join-Path $package 'NOTICE'), (Join-Path $package 'THIRD_PARTY_NOTICES.md') -DestinationPath (Join-Path $dist $archive)
@@ -276,6 +287,7 @@ jobs:
           $actual = @(Get-ChildItem -LiteralPath $check -File | Select-Object -ExpandProperty Name | Sort-Object)
           if ((Compare-Object $expected $actual).Count -ne 0) { throw 'archive member validation failed' }
           if ((& (Join-Path $check 'aether.exe') --version).Trim() -ne $env:GITHUB_REF_NAME.Substring(1)) { throw 'packaged --version check failed' }
+          if ((& (Join-Path $dist $direct) --version).Trim() -ne $env:GITHUB_REF_NAME.Substring(1)) { throw 'direct binary version check failed' }
           Remove-Item -LiteralPath $check -Recurse -Force
           Remove-Item -LiteralPath $package -Recurse -Force
 
@@ -290,6 +302,12 @@ jobs:
       - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:
           subject-path: dist/aether-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.extension }}
+
+      # Attest the directly downloadable binary as well as the archive.
+      # actions/attest-build-provenance v4.1.0
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: dist/aether-${{ github.ref_name }}-${{ matrix.name }}${{ matrix.direct_extension }}
 
   publish:
     name: Publish GitHub prerelease
@@ -333,16 +351,23 @@ jobs:
           mkdir -p release-assets
           for platform in "${platforms[@]}"; do
             case "$platform" in
-              windows-*) extension=zip ;;
-              *) extension=tar.gz ;;
+              windows-*)
+                extension=zip
+                direct="aether-${GITHUB_REF_NAME}-${platform}.exe"
+                ;;
+              *)
+                extension=tar.gz
+                direct="aether-${GITHUB_REF_NAME}-${platform}"
+                ;;
             esac
             archive="aether-${GITHUB_REF_NAME}-${platform}.${extension}"
             checksum="${archive}.sha256"
             directory="downloaded/package-${platform}"
-            expected_files=$(printf '%s\n' "$archive" "$checksum" | sort)
+            expected_files=$(printf '%s\n' "$archive" "$checksum" "$direct" | sort)
             actual_files=$(find "$directory" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
             test "$actual_files" = "$expected_files"
             cp "$directory/$archive" release-assets/
+            cp "$directory/$direct" release-assets/
             expected_hash=$(awk '{print $1}' "$directory/$checksum")
             actual_hash=$(sha256sum "release-assets/$archive" | awk '{print $1}')
             test "$actual_hash" = "$expected_hash"
@@ -350,9 +375,26 @@ jobs:
 
           (
             cd release-assets
-            sha256sum *.tar.gz *.zip | sort -k2 > SHA256SUMS
+            sha256sum *.tar.gz *.zip aether-${GITHUB_REF_NAME}-windows-x86_64.exe aether-${GITHUB_REF_NAME}-windows-aarch64.exe aether-${GITHUB_REF_NAME}-macos-x86_64 aether-${GITHUB_REF_NAME}-macos-aarch64 aether-${GITHUB_REF_NAME}-linux-x86_64-gnu aether-${GITHUB_REF_NAME}-linux-aarch64-gnu | sort -k2 > SHA256SUMS
           )
-          test "$(wc -l < release-assets/SHA256SUMS | tr -d ' ')" = 6
+          test "$(wc -l < release-assets/SHA256SUMS | tr -d ' ')" = 12
+          (cd release-assets && sha256sum -c SHA256SUMS)
+          expected_checksum_names=$(printf '%s\n' \
+            aether-${GITHUB_REF_NAME}-windows-x86_64.zip \
+            aether-${GITHUB_REF_NAME}-windows-aarch64.zip \
+            aether-${GITHUB_REF_NAME}-macos-x86_64.tar.gz \
+            aether-${GITHUB_REF_NAME}-macos-aarch64.tar.gz \
+            aether-${GITHUB_REF_NAME}-linux-x86_64-gnu.tar.gz \
+            aether-${GITHUB_REF_NAME}-linux-aarch64-gnu.tar.gz \
+            aether-${GITHUB_REF_NAME}-windows-x86_64.exe \
+            aether-${GITHUB_REF_NAME}-windows-aarch64.exe \
+            aether-${GITHUB_REF_NAME}-macos-x86_64 \
+            aether-${GITHUB_REF_NAME}-macos-aarch64 \
+            aether-${GITHUB_REF_NAME}-linux-x86_64-gnu \
+            aether-${GITHUB_REF_NAME}-linux-aarch64-gnu | sort)
+          actual_checksum_names=$(awk 'NF == 2 {print $2}' release-assets/SHA256SUMS | sort)
+          test "$actual_checksum_names" = "$expected_checksum_names"
+          test "$(awk 'NF == 2 {print $1}' release-assets/SHA256SUMS | sort -u | wc -l | tr -d ' ')" = 12
           cp install.sh install.ps1 release-assets/
 
           expected_assets=$(printf '%s\n' \
@@ -362,6 +404,12 @@ jobs:
             aether-${GITHUB_REF_NAME}-macos-aarch64.tar.gz \
             aether-${GITHUB_REF_NAME}-linux-x86_64-gnu.tar.gz \
             aether-${GITHUB_REF_NAME}-linux-aarch64-gnu.tar.gz \
+            aether-${GITHUB_REF_NAME}-windows-x86_64.exe \
+            aether-${GITHUB_REF_NAME}-windows-aarch64.exe \
+            aether-${GITHUB_REF_NAME}-macos-x86_64 \
+            aether-${GITHUB_REF_NAME}-macos-aarch64 \
+            aether-${GITHUB_REF_NAME}-linux-x86_64-gnu \
+            aether-${GITHUB_REF_NAME}-linux-aarch64-gnu \
             SHA256SUMS install.sh install.ps1 | sort)
           actual_assets=$(find release-assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
           test "$actual_assets" = "$expected_assets"
@@ -378,7 +426,9 @@ jobs:
           Highlights:
 
           - Adaptive context and tool surfaces reduce agent overhead while progress-aware execution preserves evidence-gated completion.
-          - Native interactive shell with local slash-command discovery, including /model, /status, /context, /config, /auth, /sessions, /resume, /doctor, /help, /clear, and /exit.
+          - Native interactive shell with local slash-command discovery, including /model, /status, /context, /config, /auth, /sessions, /resume, /doctor, /update, /help, /clear, and /exit.
+          - Explicit \`aether update\` checks the highest public stable or prerelease SemVer, verifies the direct target binary with HTTPS plus SHA-256, and replaces it atomically without elevation.
+          - Windows uses a short-lived validated handoff helper because a running executable cannot replace itself; the next launch confirms the installed version.
           - Live Rainy model selection with capability, context, access, reasoning, modality, and data-policy metadata.
           - Secure configuration, authentication, session, resume, and headless/JSON behavior with API keys excluded from normal persisted and model-visible state.
           - Rainy SDK 0.6.50 integration with minimal features, typed Responses streaming, bounded SDK-owned SSE handling, and safe transport behavior.

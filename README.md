@@ -46,6 +46,31 @@ Verify the archive before extracting it, then place `aether` or `aether.exe` in 
 directory on your PATH. Each archive contains only the executable, its CycloneDX SBOM, `LICENSE`,
 `NOTICE`, and `THIRD_PARTY_NOTICES.md`.
 
+### Update from the CLI
+
+After installing a direct binary, run the explicit updater whenever you want to check
+for a newer public AETHER Fx release:
+
+```sh
+aether update
+aether update --json
+```
+
+The updater includes stable releases and prereleases, selects the highest valid SemVer, downloads
+the direct binary for the current platform, and verifies it with HTTPS plus the release
+`SHA256SUMS` manifest before replacing the executable atomically. It uses no automatic startup
+check, cache, backup, telemetry, sudo, UAC, package-manager integration, or permanent helper.
+Only a regular writable executable can be updated; symbolic links, reparse points, read-only files,
+and non-writable parent directories are rejected. Custom installation directories and writable
+`target/debug` or `target/release` binaries are supported. Reqwest uses
+the operating system's certificate and proxy behavior, but the release source and asset identity
+remain fixed to this repository.
+
+On Windows, the validated replacement is handed to a short-lived hidden helper because the running
+`.exe` cannot replace itself synchronously. The command exits with the handoff accepted, and the
+next AETHER Fx start confirms the installed version. `/update` provides the same operation inside
+the shell and exits the shell after the result.
+
 ## Configure
 
 Installation and provider configuration are separate stages. Check the local setup without an API
@@ -118,15 +143,16 @@ aether --model <id> "inspect this repository and explain the highest-risk issue"
 
 The bare `aether` command opens the stateful shell only when stdin and stdout are terminals. A
 leading `/` opens the local command palette; slash commands such as `/model`, `/status`,
-`/context`, `/config`, `/auth`, `/sessions`, `/resume`, `/doctor`, `/help`, `/clear`, and `/exit`
+`/context`, `/config`, `/auth`, `/sessions`, `/resume`, `/doctor`, `/update`, `/help`, `/clear`, and `/exit`
 are handled locally and are never sent to Rainy. Natural text containing `/` remains ordinary
 prompt text. Arrow keys or `j`/`k` navigate selectors, Enter confirms, and Escape or Ctrl-C
 cancels.
 
 For scripts and CI, use `--non-interactive` or a pipe. `--json` emits structured records without
 a startup banner, prompt, selector, or ANSI decoration; local slash commands still remain local.
-The default `aether doctor` is offline. `aether models` explicitly retrieves the live Rainy
-catalog, while `aether doctor --network` adds an explicit catalog/reachability probe.
+The default `aether doctor` is offline and reports whether the local executable can be updated;
+it never contacts GitHub. `aether models` explicitly retrieves the live Rainy catalog, while
+`aether doctor --network` adds an explicit catalog/reachability probe.
 
 ## Resume
 
@@ -153,7 +179,8 @@ The alpha release provides native archives for:
 
 AETHER keeps filesystem operations inside a canonical workspace, bounds model-visible and process
 output, separates typed permissions from rendering, and never stores `RAINY_API_KEY`. The normal
-download flow verifies the archive against `SHA256SUMS`; `sha256sum` or `shasum -a 256` is used by
+download flow verifies the archive against `SHA256SUMS`; the CLI updater verifies a direct binary
+against the same release manifest before replacement. `sha256sum` or `shasum -a 256` is used by
 the Unix installer. GitHub CLI users may additionally verify an archive's build attestation:
 
 ```sh
