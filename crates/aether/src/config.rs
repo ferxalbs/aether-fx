@@ -326,20 +326,20 @@ fn reject_config_path(path: &Path) -> Result<(), ConfigError> {
     }
 }
 
-fn restrict_directory(path: &Path) -> Result<(), ConfigError> {
+fn restrict_directory(_path: &Path) -> Result<(), ConfigError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
-fn restrict_file(file: &File) -> Result<(), ConfigError> {
+fn restrict_file(_file: &File) -> Result<(), ConfigError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        _file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
