@@ -187,8 +187,7 @@ impl ModelView {
             .effective_context_length
             .or(self.context_length)
             .map(format_context)
-            .unwrap_or_else(|| "context ?".to_owned());
-        let tier = self.tier.as_deref().unwrap_or("tier ?");
+            .unwrap_or_else(|| "context not reported".to_owned());
         let reasoning_detail = if self.reasoning_modes.is_empty() {
             self.reasoning.as_str().to_owned()
         } else {
@@ -199,7 +198,7 @@ impl ModelView {
             _ => String::new(),
         };
         format!(
-            "{context} · {tier} · tools {} · reasoning {reasoning_detail}{budget_detail} · access {}{}",
+            "{context} · tools {} · reasoning {reasoning_detail}{budget_detail} · access {}{}",
             self.tools.as_str(),
             self.availability.as_str(),
             if self.disclosure_required { " · disclosure" } else { "" }
@@ -1063,6 +1062,7 @@ mod tests {
         assert!(!view.disclosure_required);
         assert_eq!(view.retention_days, None);
         assert!(view.detail().contains("access unknown"));
+        assert!(!view.detail().contains("tier"));
     }
 
     #[test]

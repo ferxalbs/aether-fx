@@ -37,9 +37,12 @@ Explicit lack of tool support makes an entry unavailable for the coding shell; u
 remains selectable only after an explicit acknowledgement. All catalog text is bounded and
 terminal-sanitized before it reaches a selector.
 
-The primary selector is intentionally compact: human name plus model ID, effective context, tier,
-tools, reasoning, and access. The JSON form retains the normalized fields for machine consumers;
-it does not expose an unbounded copy of the provider response.
+The primary selector is a two-line interaction: the human name is always shown first, with the model
+ID and capability summary directly below it. The current model is called out, filtering searches
+names and IDs, and visible entries can be chosen with number keys as well as the arrow or `j`/`k`
+controls. This keeps the identity readable even on a narrow terminal. The JSON form retains the
+normalized fields for machine consumers; it does not expose an unbounded copy of the provider
+response.
 
 Rainy's authentication, redirect policy, request bounds, SSE parsing, and retry behavior remain
 Rainy's/SDK's responsibility. AETHER does not maintain a second SSE parser and calls the SDK's

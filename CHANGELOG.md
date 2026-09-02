@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased - 2026-09-02 (3) - Follow-up workflow improvements
+
+No unreleased changes.
+
+## v0.1.0-alpha-04 - 2026-09-02 (2) - Model-first terminal workflow
+
+### Changed
+
+- Redesigned the interactive model picker so model names are the primary identity, with the stable
+  model ID and capability summary visible beneath each entry, current selection state, filtering,
+  unavailable-model feedback, and quick-select controls.
+- Updated human-readable catalog, status, and turn summaries to keep the active model identity
+  visible throughout the session.
+
+### Fixed
+
+- Made concurrent workspace state initialization collision-safe on Windows by retrying uniquely
+  sequenced temporary metadata files.
+
 ## v0.1.0-alpha-03 - 2026-09-01 (1) - Native self-update and terminal reliability
 
 ### Added

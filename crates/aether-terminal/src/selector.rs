@@ -74,6 +74,17 @@ impl<T> SelectorItem<T> {
         }
         self
     }
+
+    pub(crate) fn search_text(&self) -> &str {
+        &self.search_text
+    }
+
+    pub(crate) fn display_value(&self) -> String
+    where
+        T: fmt::Display,
+    {
+        bounded_display(&self.value, MAX_SELECTOR_TEXT_BYTES)
+    }
 }
 
 /// Outcome of a selector interaction.
@@ -134,10 +145,36 @@ pub fn select_from_items<R: Read, W: Write, T>(
 where
     T: Clone + PartialEq + std::fmt::Display,
 {
+    select_from_items_with_renderer(
+        reader,
+        writer,
+        title,
+        items,
+        default,
+        MAX_SELECTOR_VISIBLE_ITEMS,
+        render_lines,
+    )
+}
+
+/// Run a selector with a caller-provided bounded renderer.
+pub(crate) fn select_from_items_with_renderer<R: Read, W: Write, T, F>(
+    reader: &mut R,
+    writer: &mut W,
+    title: &str,
+    items: &[SelectorItem<T>],
+    default: Option<&T>,
+    visible_items: usize,
+    render: F,
+) -> io::Result<SelectorOutcome<T>>
+where
+    T: Clone + PartialEq + std::fmt::Display,
+    F: Fn(&str, &str, &[SelectorItem<T>], &[usize], usize, bool, usize) -> Vec<String>,
+{
     let items = &items[..items.len().min(MAX_SELECTOR_ITEMS)];
     if items.is_empty() {
         return Ok(SelectorOutcome::NoSelection);
     }
+    let visible_items = visible_items.max(1);
 
     let mut query = String::new();
     let mut selected_position = 0_usize;
@@ -163,8 +200,15 @@ where
         }
 
         clear_previous_lines(writer, previous_line_count)?;
-        let lines =
-            render_lines(title, &query, items, &filtered, selected_position, no_selectable_match);
+        let lines = render(
+            title,
+            &query,
+            items,
+            &filtered,
+            selected_position,
+            no_selectable_match,
+            visible_items,
+        );
         previous_line_count = lines.len();
         for (index, line) in lines.iter().enumerate() {
             writer.write_all(line.as_bytes())?;
@@ -237,18 +281,16 @@ where
                     && let Some(position) = (character as usize)
                         .checked_sub('1' as usize)
                         .and_then(|position| {
-                            visible_window(selected_position, filtered.len())
+                            visible_window(selected_position, filtered.len(), visible_items)
                                 .0
                                 .checked_add(position)
                                 .and_then(|position| filtered.get(position).copied())
                         })
                         .filter(|index| {
-                            let start = visible_window(selected_position, filtered.len()).0;
+                            let start =
+                                visible_window(selected_position, filtered.len(), visible_items).0;
                             filtered.iter().position(|candidate| candidate == index).is_some_and(
-                                |position| {
-                                    position >= start
-                                        && position < start + MAX_SELECTOR_VISIBLE_ITEMS
-                                },
+                                |position| position >= start && position < start + visible_items,
                             )
                         })
                         .filter(|index| !items[*index].disabled)
@@ -372,7 +414,7 @@ fn filtered_indices<T>(items: &[SelectorItem<T>], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            match_score(&query, &item.search_text).map(|score| (score, index))
+            match_score(&query, item.search_text()).map(|score| (score, index))
         })
         .collect::<Vec<_>>();
     matches.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
@@ -441,13 +483,18 @@ fn selected_or_next_enabled<T>(
     }
 }
 
-fn visible_window(selected_position: usize, item_count: usize) -> (usize, usize) {
-    if item_count <= MAX_SELECTOR_VISIBLE_ITEMS {
+pub(crate) fn visible_window(
+    selected_position: usize,
+    item_count: usize,
+    visible_items: usize,
+) -> (usize, usize) {
+    let visible_items = visible_items.max(1);
+    if item_count <= visible_items {
         return (0, item_count);
     }
-    let max_start = item_count - MAX_SELECTOR_VISIBLE_ITEMS;
-    let start = selected_position.saturating_sub(MAX_SELECTOR_VISIBLE_ITEMS / 2).min(max_start);
-    (start, (start + MAX_SELECTOR_VISIBLE_ITEMS).min(item_count))
+    let max_start = item_count - visible_items;
+    let start = selected_position.saturating_sub(visible_items / 2).min(max_start);
+    (start, (start + visible_items).min(item_count))
 }
 
 fn render_lines<T>(
@@ -457,6 +504,7 @@ fn render_lines<T>(
     filtered: &[usize],
     selected_position: usize,
     no_selectable_match: bool,
+    visible_items: usize,
 ) -> Vec<String>
 where
     T: std::fmt::Display,
@@ -468,7 +516,8 @@ where
     if filtered.is_empty() {
         lines.push("  (no matches)".to_owned());
     } else {
-        let (visible_start, visible_end) = visible_window(selected_position, filtered.len());
+        let (visible_start, visible_end) =
+            visible_window(selected_position, filtered.len(), visible_items);
         if visible_start > 0 {
             lines.push(format!("  … {} earlier", visible_start));
         }

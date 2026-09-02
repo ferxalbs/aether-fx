@@ -13,7 +13,7 @@ exclude = ["evals/fixtures"]
 default-members = ["crates/aether"]
 
 [workspace.package]
-version = "0.1.0-alpha-03"
+version = "0.1.0-alpha-04"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -28,11 +28,11 @@ dbg_macro = "deny"
 todo = "deny"
 
 [workspace.dependencies]
-aether-agent = { path = "crates/aether-agent", version = "0.1.0-alpha-03" }
-aether-core = { path = "crates/aether-core", version = "0.1.0-alpha-03" }
-aether-rainy = { path = "crates/aether-rainy", version = "0.1.0-alpha-03" }
-aether-terminal = { path = "crates/aether-terminal", version = "0.1.0-alpha-03" }
-aether-tools = { path = "crates/aether-tools", version = "0.1.0-alpha-03" }
+aether-agent = { path = "crates/aether-agent", version = "0.1.0-alpha-04" }
+aether-core = { path = "crates/aether-core", version = "0.1.0-alpha-04" }
+aether-rainy = { path = "crates/aether-rainy", version = "0.1.0-alpha-04" }
+aether-terminal = { path = "crates/aether-terminal", version = "0.1.0-alpha-04" }
+aether-tools = { path = "crates/aether-tools", version = "0.1.0-alpha-04" }
 
 blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
 criterion = "0.8.2"

@@ -335,59 +335,67 @@ fn ensure_workspace_metadata_std(
     layout: &WorkspaceLayout,
     bytes: &[u8],
 ) -> Result<(), SessionStoreError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     let path = layout.workspace_dir.join(state::WORKSPACE_METADATA);
     reject_indirect_file(&path, "workspace metadata")?;
-    let temporary = layout.workspace_dir.join(format!(
-        ".aether-fx-workspace-{}-{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io_err("name workspace metadata temporary", error))?
-            .as_nanos()
-    ));
-    reject_symlink(&temporary, "workspace metadata temporary file")?;
-    let mut options = open_options_nofollow();
-    options.write(true).create_new(true);
-    match options.open(&temporary) {
-        Ok(mut file) => {
-            let write = (|| {
-                file.write_all(bytes)?;
-                file.flush()?;
-                file.sync_all()
-            })();
-            if let Err(error) = write {
-                let _ = fs::remove_file(&temporary);
-                return Err(io_err("write workspace metadata", error));
+    let mut temporary = None;
+    let mut file = None;
+    for _ in 0..32 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = layout
+            .workspace_dir
+            .join(format!(".aether-fx-workspace-{}-{sequence}.tmp", std::process::id()));
+        reject_symlink(&candidate, "workspace metadata temporary file")?;
+        let mut options = open_options_nofollow();
+        options.write(true).create_new(true);
+        match options.open(&candidate) {
+            Ok(opened) => {
+                temporary = Some(candidate);
+                file = Some(opened);
+                break;
             }
-            drop(file);
-            match fs::hard_link(&temporary, &path) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&temporary);
-                    reject_indirect_file(&path, "workspace metadata")?;
-                    Ok(())
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&temporary);
-                    let mut options = open_options_nofollow();
-                    options.read(true);
-                    let mut installed = options
-                        .open(&path)
-                        .map_err(|error| io_err("open workspace metadata", error))?;
-                    let existing = read_bounded(&mut installed, "read workspace metadata")?;
-                    validate_workspace_metadata(&existing, &layout.workspace)
-                }
-                Err(error) => {
-                    let _ = fs::remove_file(&temporary);
-                    Err(io_err("install workspace metadata", error))
-                }
-            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_err("create workspace metadata temporary", error)),
+        }
+    }
+    let Some((temporary, mut file)) = temporary.zip(file) else {
+        return Err(SessionStoreError::Io {
+            operation: "create workspace metadata temporary".to_owned(),
+            message: "unable to allocate a collision-free temporary file".to_owned(),
+        });
+    };
+    let write = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temporary);
+        return Err(io_err("write workspace metadata", error));
+    }
+    drop(file);
+    match fs::hard_link(&temporary, &path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temporary);
+            reject_indirect_file(&path, "workspace metadata")?;
+            Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            Err(SessionStoreError::Invalid(
-                "workspace metadata temporary file already exists".to_owned(),
-            ))
+            let _ = fs::remove_file(&temporary);
+            let mut options = open_options_nofollow();
+            options.read(true);
+            let mut installed =
+                options.open(&path).map_err(|error| io_err("open workspace metadata", error))?;
+            let existing = read_bounded(&mut installed, "read workspace metadata")?;
+            validate_workspace_metadata(&existing, &layout.workspace)
         }
-        Err(error) => Err(io_err("create workspace metadata temporary", error)),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(io_err("install workspace metadata", error))
+        }
     }
 }
 

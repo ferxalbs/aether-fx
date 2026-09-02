@@ -427,6 +427,8 @@ jobs:
 
           - Adaptive context and tool surfaces reduce agent overhead while progress-aware execution preserves evidence-gated completion.
           - Native interactive shell with local slash-command discovery, including /model, /status, /context, /config, /auth, /sessions, /resume, /doctor, /update, /help, /clear, and /exit.
+          - Model-first selection keeps each model name, stable ID, and capability summary visible before the next turn is committed.
+          - Concurrent workspace initialization remains safe on Windows, including collision retries for temporary metadata files.
           - Explicit \`aether update\` checks the highest public stable or prerelease SemVer, verifies the direct target binary with HTTPS plus SHA-256, and replaces it atomically without elevation.
           - Windows uses a short-lived validated handoff helper because a running executable cannot replace itself; the next launch confirms the installed version.
           - Live Rainy model selection with capability, context, access, reasoning, modality, and data-policy metadata.

@@ -18,7 +18,7 @@ use aether_core::{
     SessionRecord, ToolExecutor, TurnId,
 };
 use aether_rainy::{ModelView, RainyBackend};
-use aether_terminal::{Renderer, SelectorItem, SelectorOutcome};
+use aether_terminal::{ModelSelectionItem, Renderer, SelectorItem, SelectorOutcome};
 use aether_tools::{ProcessShutdownReport, ToolRegistry};
 use thiserror::Error;
 use tokio::runtime::Builder;
@@ -645,18 +645,17 @@ async fn models(root: &Path, json_output: bool, _network: bool) -> Result<(), Ap
         );
         return Ok(());
     }
-    println!("ID\tNAME\tCONTEXT\tTIER\tTOOLS\tREASONING\tACCESS");
+    println!("NAME\tID\tCONTEXT\tTOOLS\tREASONING\tACCESS");
     for model in models {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            model.id,
+            "{}\t{}\t{}\t{}\t{}\t{}",
             model.display_name,
+            model.id,
             model
                 .effective_context_length
                 .or(model.context_length)
                 .map(format_model_context)
-                .unwrap_or_else(|| "?".to_owned()),
-            model.tier.as_deref().unwrap_or("unknown"),
+                .unwrap_or_else(|| "not reported".to_owned()),
             model.tools.as_str(),
             model.reasoning.as_str(),
             model.availability.as_str()
@@ -1099,7 +1098,7 @@ impl SessionRuntime {
             Err(error) => return Err(error),
         };
         if self.interactive_ui {
-            println!("loading live Rainy model catalog...");
+            println!("Fetching available models…");
         }
         let views = match backend.discover_model_views().await {
             Ok(views) => views,
@@ -1120,38 +1119,28 @@ impl SessionRuntime {
         let items = views
             .iter()
             .map(|view| {
-                let label = if view.display_name == view.id {
-                    view.id.clone()
-                } else {
-                    format!("{} [{}]", view.display_name, view.id)
-                };
-                SelectorItem::new(view.id.clone(), label, Some(view.detail()))
-                    .disabled(!view.selectable())
-                    .with_search_text(format!(
-                        "{} {} {}",
-                        view.tier.as_deref().unwrap_or_default(),
-                        view.billing_class.as_deref().unwrap_or_default(),
-                        view.detail()
-                    ))
+                ModelSelectionItem::new(
+                    view.id.clone(),
+                    view.display_name.clone(),
+                    Some(view.detail()),
+                )
+                .unavailable(!view.selectable())
             })
             .collect::<Vec<_>>();
         let outcome = tokio::task::spawn_blocking(move || {
-            let default = current.as_ref();
-            aether_terminal::select_interactively("Models", &items, default)
+            let default = current.as_deref();
+            aether_terminal::select_model_interactively(&items, default)
         })
         .await
         .map_err(|error| AppError::Message(format!("model selector worker failed: {error}")))?
         .map_err(AppError::Io)?;
         let selected = match outcome {
-            SelectorOutcome::Selected(value) => value,
-            SelectorOutcome::Cancelled => {
+            Some(value) => value,
+            None => {
                 if initial {
                     return Err(AppError::Message("model selection cancelled".to_owned()));
                 }
                 return Ok(());
-            }
-            SelectorOutcome::EndOfInput | SelectorOutcome::NoSelection => {
-                return Err(AppError::Message("Rainy returned no selectable models".to_owned()));
             }
         };
         let view = views.iter().find(|view| view.id == selected).ok_or_else(|| {
@@ -1165,6 +1154,11 @@ impl SessionRuntime {
         if self.model.as_deref() == Some(view.id.as_str()) {
             self.model_view = Some(view.clone());
             self.model_name = Some(view.display_name.clone());
+            println!(
+                "model: {} ({}) · already active",
+                safe_message(&view.display_name),
+                safe_message(&view.id)
+            );
             return Ok(());
         }
         if view.has_unknown_metadata() || view.disclosure_required {
@@ -1190,7 +1184,8 @@ impl SessionRuntime {
             } else {
                 String::new()
             };
-            let prompt = format!("{reason}: {}.{} Continue?", view.id, policy_detail);
+            let identity = format_model_identity(Some(view.id.as_str()), Some(view), None);
+            let prompt = format!("{reason}: {identity}.{} Continue?", policy_detail);
             let confirmed =
                 tokio::task::spawn_blocking(move || aether_terminal::confirm(&prompt, false))
                     .await
@@ -1215,7 +1210,11 @@ impl SessionRuntime {
             context.continuation = None;
             context.model = self.model.clone();
         }
-        println!("model: {} · selected for future turns", safe_message(&view.display_name));
+        println!(
+            "model: {} ({}) · ready for the next turn",
+            safe_message(&view.display_name),
+            safe_message(&view.id)
+        );
         Ok(())
     }
 
@@ -1293,7 +1292,8 @@ impl SessionRuntime {
                         .map_err(|error| AppError::Message(error.to_string()))?
                     );
                 } else if self.interactive_ui {
-                    print_turn_summary(&turn_id, &result.context);
+                    let model_identity = self.model_identity();
+                    print_turn_summary(&turn_id, &result.context, &model_identity);
                 }
                 persist_completed_turn(store, &turn_id, &result).await?;
                 self.continuation = result.continuation.clone();
@@ -1401,23 +1401,24 @@ impl SessionRuntime {
         } else {
             println!("workspace: {}", safe_message(&self.root.display().to_string()));
             println!("session: {}", self.session_id.as_ref().map_or("pending", SessionId::as_str));
-            println!(
-                "model: {}",
-                self.model.as_deref().map_or_else(|| "unset".to_owned(), safe_message)
-            );
             if let Some(view) = self.model_view.as_ref() {
+                println!("model: {}", safe_message(&view.display_name));
+                if let Some(model) = self.model.as_deref()
+                    && view.display_name != model
+                {
+                    println!("model id: {}", safe_message(model));
+                }
                 println!(
-                    "model details: {} · {} · {} · tools {} · reasoning {} · access {}",
-                    safe_message(&view.display_name),
+                    "model capabilities: {} · tools {} · reasoning {} · access {}",
                     view.effective_context_length
                         .or(view.context_length)
-                        .map(format_model_context)
-                        .unwrap_or_else(|| "context ?".to_owned()),
-                    view.tier.as_deref().unwrap_or("tier ?"),
+                        .map_or_else(|| "context not reported".to_owned(), format_model_context),
                     view.tools.as_str(),
                     view.reasoning.as_str(),
                     view.availability.as_str()
                 );
+            } else {
+                println!("model: {}", self.model_identity());
             }
             println!(
                 "permission mode: {}",
@@ -1455,6 +1456,14 @@ impl SessionRuntime {
             .unwrap_or_else(|| {
                 ContextSnapshot::new(self.root.display().to_string(), self.model.clone())
             })
+    }
+
+    fn model_identity(&self) -> String {
+        format_model_identity(
+            self.model.as_deref(),
+            self.model_view.as_ref(),
+            self.model_name.as_deref(),
+        )
     }
 
     fn print_context(&self) -> Result<(), AppError> {
@@ -1724,10 +1733,11 @@ fn command_items() -> Vec<SelectorItem<String>> {
     .collect()
 }
 
-fn print_turn_summary(turn_id: &TurnId, context: &ContextSnapshot) {
+fn print_turn_summary(turn_id: &TurnId, context: &ContextSnapshot, model: &str) {
     println!(
-        "turn {} · phase {} · verification {} · inspected {} · modified {}",
+        "turn {} · model {} · phase {} · verification {} · inspected {} · modified {}",
         turn_id,
+        model,
         context.workflow.director.phase.as_str(),
         context.workflow.verification.as_str(),
         context.inspected.len(),
@@ -1742,11 +1752,29 @@ fn print_identity(state: &SessionRuntime) {
         git_branch(&state.root).as_deref().unwrap_or("none")
     );
     println!(
-        "model: {} · permissions: {} · catalog: /model",
-        state.model.as_deref().map_or_else(|| "unset".to_owned(), safe_message),
+        "model: {} · permissions: {} · change model: /model",
+        state.model_identity(),
         if state.yolo { "yolo" } else { "prompt" }
     );
     println!("type / for local commands; startup is offline");
+}
+
+fn format_model_identity(
+    model: Option<&str>,
+    view: Option<&ModelView>,
+    fallback_name: Option<&str>,
+) -> String {
+    let name = view
+        .map(|view| view.display_name.as_str())
+        .or(fallback_name)
+        .or(model)
+        .map(safe_message)
+        .unwrap_or_else(|| "not selected".to_owned());
+    let id = model.map(safe_message);
+    match id {
+        Some(id) if id != name => format!("{name} ({id})"),
+        _ => name,
+    }
 }
 
 fn compact_path(path: &Path) -> String {
