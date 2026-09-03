@@ -473,11 +473,13 @@ fn bounded(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    #[cfg(unix)]
     fn fake_mcp_script(protocol: &str) -> String {
         let initialize = json!({
             "jsonrpc": "2.0",
