@@ -31,6 +31,13 @@ pub struct ObscuraArtifact {
     pub profile_argument: Option<&'static str>,
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
+    all(target_os = "windows", target_arch = "x86_64"),
+))]
 macro_rules! artifact {
     ($target:literal, $asset:literal, $url:literal, $size:literal, $sha:literal, $format:expr, $binary:literal, $worker:literal) => {
         ObscuraArtifact {
