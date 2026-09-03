@@ -1,6 +1,6 @@
 # Toolchain and dependency baseline
 
-Verified on 2026-09-02 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.51` crate, and the official Rainy SDK documentation. Versions below are exact manifest selections, not floating requirements. Cargo.lock is authoritative for the transitive graph.
+Verified on 2026-09-03 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.51` crate, the pinned `wasm-bindgen 0.2.127` toolchain, and the official Rainy SDK documentation. Versions below are exact manifest selections, not floating requirements. Cargo.lock is authoritative for the transitive graph.
 
 | Component | Resolved version | License | Why it exists | Hot path? |
 | --- | --- | --- | --- | --- |
@@ -26,6 +26,7 @@ Verified on 2026-09-02 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.5
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | Streaming SHA-256 verification against the release `SHA256SUMS` manifest | Update command only |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Consume the Rainy SDK stream without async-trait | Rainy stream |
 | rainy-sdk | 0.6.51 | Apache-2.0 | Official Rainy API boundary; typed Responses and Chat Completions streams, catalog, reasoning, and error APIs | Network path |
+| wasm-bindgen | 0.2.127 | MIT OR Apache-2.0 | Expose the bounded `aether-web` Rust runtime to the static browser host | Browser build only |
 | url | 2.5.8 | MIT OR Apache-2.0 | HTTP(S) browser URL parsing, origin sanitization, and scheme/credential boundary | Browser path only |
 | zip | 2.4.2 | MIT | Strict Windows Obscura archive extraction | Install path only |
 | tar | 0.4.46 | MIT OR Apache-2.0 | Strict Unix Obscura archive extraction | Install path only |
@@ -41,8 +42,10 @@ SDK-owned safe-operation retries to Rainy.
 
 The AETHER updater uses the direct `reqwest 0.13.4`, `semver 1.0.28`, and `sha2 0.10.9` dependencies. The optional `aether-obscura` installer reuses the workspace `reqwest` and `sha2` boundary and adds `url 2.5.8`, `zip 2.4.2`, `tar 0.4.46`, and `flate2 1.1.10` only for URL validation and verified archive installation. `reqwest` is compiled with `default-features = false` plus `rustls` and `system-proxy`; neither updater nor Obscura installer constructs a client for `--version`, `--help`, `doctor`, `sessions`, or normal shell startup. The archive parsers are not loaded by the inactive browser path at runtime beyond their compiled code; they are exercised only after explicit installation consent. `aether-agent` continues to use `blake3` for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, MCP SDK, WebMCP/OpenAI dependency, or unpublished Rainy SDK version is used. This is an intentional v1 decision: the official [RMCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) was reviewed, but its generic client/service layer is broader than the fixed, bounded Obscura adapter; RMCP remains a future option if a measured WebMCP integration justifies its additional surface.
 
-The interactive shell/model work adds no further package beyond the optional Obscura boundary. The Rainy 0.6.50
-upgrade removes its former `eventsource-stream`/`nom` parser path and adds only the rand 0.9 family
+The interactive shell/model work adds no further package beyond the optional Obscura boundary. The alpha-06 browser
+vertical slice adds only `wasm-bindgen 0.2.127` for its Rust/WASM export; it does not compile a browser agent,
+network client, MCP SDK, or native tool adapter. The prior Rainy 0.6.50
+migration removed its former `eventsource-stream`/`nom` parser path and added only the rand 0.9 family
 and its platform support dependencies; the workspace still has no second SSE parser. The existing
 workspace `serde` dependency is now declared directly by `aether` for bounded config and machine
 output, and by `aether-rainy` for the normalized catalog projection; this is serialization on

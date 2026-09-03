@@ -45,3 +45,23 @@ the first-use session permission. `BrowserAction` is reserved for future sensiti
 is not part of this surface. Results are bounded for the live turn and reduced to status-only
 summaries before session persistence. See [`obscura-provider.md`](obscura-provider.md) for the
 static release manifest, MCP handshake, network policy, and lifecycle contract.
+
+## Hosted WebMCP surface
+
+The hosted browser vertical slice is a separate `aether-web` WASM/static surface. It does not add
+tools to the native CLI registry and does not connect to the native workspace, Rainy, or Obscura.
+When the host supports `document.modelContext.registerTool`, the page registers six bounded tools:
+
+| Tool | Read-only hint | Contract |
+| --- | --- | --- |
+| `inspect_workspace` | `true` | Four-file in-memory inventory, active task, and exact suggested patch |
+| `read_file` | `true` | One bounded demo-file excerpt with line numbers |
+| `search_workspace` | `true` | Case-insensitive literal search with bounded matches |
+| `propose_patch` | `false` | One exact-match staged proposal; never applies it |
+| `verify_patch` | `false` | Browser-safe contract checks against staged or accepted state |
+| `get_task_state` | `true` | Shared task, diff, evidence, workflow, and verification state |
+
+The JavaScript host and Rust/WASM runtime both reject unknown fields, unsafe relative paths,
+secret-like patch content, and over-limit values. `accept_patch` and `reject_patch` are visible UI
+operations only. The human gate is therefore outside the model-visible tool set. See
+[`webmcp.md`](webmcp.md) for the state flow, build, compatibility behavior, and deployment notes.

@@ -139,7 +139,7 @@ provider reasoning metadata remains outside the agent contract. Responses requir
 chunk. Failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No
 provider endpoint, model catalog, or key appears elsewhere.
 
-`aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. When a validated Obscura supervisor is active, the registry is rebuilt at a turn boundary with exactly six additional fixed browser definitions. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
+`aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. When a validated Obscura supervisor is active, the registry is rebuilt at a turn boundary with exactly six additional fixed browser definitions. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails. The hosted WebMCP surface does not enter this registry.
 
 `aether-obscura` is the only crate that knows the external browser wire contract. It owns the
 static v0.2.1 artifact manifest, consent-gated installation, archive verification, absolute
@@ -173,7 +173,28 @@ memory.
 
 `aether-terminal` owns raw input, restoration, ANSI/VT presentation, incremental buffer rendering, and platform modules. Tools and agent code never write ANSI.
 
-There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in this bootstrap.
+There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in
+the native bootstrap. Alpha-06 adds `aether-web` as a separately built `cdylib`/`rlib` for a static
+browser demo; it is not linked into the `aether` binary and has no native bridge.
+
+## Hosted WebMCP vertical slice
+
+The browser surface is deliberately a different deployment boundary from the native graph:
+
+```text
+static HTML/CSS/JS
+       ├── document.modelContext.registerTool ──> six page tool callbacks
+       └── wasm-bindgen JS ──> aether-web::BrowserRuntime ──> aether-core::WorkflowState
+                                                     └── bounded in-memory demo repository
+```
+
+The page's visible controls and WebMCP callbacks call the same runtime operation functions. Read
+tools inspect the fixture; `propose_patch` stores an exact-match, hash-bound staged view; and
+`verify_patch` runs fixed browser-safe contract checks. A visible human Accept or Reject operation
+is not registered as a WebMCP tool. The browser path cannot read the checkout, spawn a process,
+contact Rainy, use Obscura, or persist credentials. Unsupported WebMCP hosts receive a visible
+compatibility notice while the page remains usable. Full implementation and the challenge demo
+script are in [`docs/webmcp.md`](webmcp.md) and [`docs/webmcp-challenge.md`](webmcp-challenge.md).
 
 The bounded Turn Director projects observed state into Discover, Understand, Implement, Recover,
 Verify, Review, or Done; it never accepts a model phase claim and does not script the model's

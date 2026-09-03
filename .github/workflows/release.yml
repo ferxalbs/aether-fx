@@ -82,6 +82,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Build WebMCP browser bundle
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install --locked --version 0.2.127 wasm-bindgen-cli
+          npm --prefix web run build:wasm
+          npm --prefix web run build
+          node --check web/app.js
+          test -s web/wasm/aether_web.js
+          test -s web/wasm/aether_web_bg.wasm
+          test -f web/dist/index.html
+          test -f web/dist/wasm/aether_web_bg.wasm
+
       - name: Deterministic coding-agent evaluations
         env:
           CARGO_NET_OFFLINE: "true"
@@ -421,7 +433,7 @@ jobs:
           cat > release-notes.md <<EOF
           AETHER Fx ${GITHUB_REF_NAME} is an alpha preview and is not stable or production-ready software.
 
-          This alpha closes the adaptive coding runtime and introduces AETHER's native interactive terminal experience.
+          This alpha keeps the native terminal and optional Obscura provider intact while adding an experimental WebMCP browser surface.
 
           Highlights:
 
@@ -433,8 +445,9 @@ jobs:
           - Windows uses a short-lived validated handoff helper because a running executable cannot replace itself; the next launch confirms the installed version.
           - Live Rainy model selection with capability, context, access, reasoning, modality, and data-policy metadata.
           - Secure configuration, authentication, session, resume, and headless/JSON behavior with API keys excluded from normal persisted and model-visible state.
-          - Rainy SDK 0.6.50 integration with minimal features, explicit Responses versus Chat Completions routing, bounded neutral tool history, typed streaming, and safe transport behavior.
-          - Approximately 6.0 MiB release binary and frozen offline regression, capability, and control-loop evaluation gates passing.
+          - Rainy SDK 0.6.51 integration with minimal features, explicit Responses versus Chat Completions routing, bounded neutral tool history, typed streaming, and safe transport behavior.
+          - A standalone Rust/WASM demo workspace with six bounded WebMCP tools, shared visible/agent state, staged exact-match patches, browser-safe verification, and a human Accept/Reject gate.
+          - Native release artifacts, browser/WASM bundle checks, and frozen offline regression, capability, and control-loop evaluation gates passing.
 
           Install the version-pinned Unix installer with:
 

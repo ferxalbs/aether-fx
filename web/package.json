@@ -1,0 +1,10 @@
+{
+  "name": "aether-web",
+  "private": true,
+  "version": "0.1.0-alpha-06",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:wasm": "cd .. && cargo build -p aether-web --release --target wasm32-unknown-unknown --locked && wasm-bindgen target/wasm32-unknown-unknown/release/aether_web.wasm --target web --out-dir web/wasm --no-typescript"
+  }
+}

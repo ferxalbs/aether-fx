@@ -1,0 +1,20 @@
+[package]
+name = "aether-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AETHER Fx bounded experimental browser/WASM workspace runtime"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+aether-core.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true

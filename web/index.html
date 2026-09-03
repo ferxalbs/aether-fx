@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101b31">
+    <meta name="description" content="AETHER Fx shared engineering workspace powered by WebMCP.">
+    <title>AETHER Fx — Shared engineering workspace</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="AETHER Fx home">
+          <span class="brand-mark" aria-hidden="true">λ</span>
+          <span>AETHER <em>Fx</em></span>
+        </a>
+        <div class="topbar-meta">
+          <span class="eyebrow">ENGINEERING WORKSPACE</span>
+          <span class="status-pill status-neutral" id="webmcp-status">WebMCP: checking</span>
+        </div>
+      </header>
+
+      <main class="workspace-grid">
+        <aside class="sidebar" aria-label="Repository files">
+          <div class="repo-heading">
+            <div>
+              <p class="section-label">REPOSITORY</p>
+              <h1>aether-auth-demo</h1>
+            </div>
+            <span class="branch-chip">demo</span>
+          </div>
+
+          <form class="search-form" id="search-form">
+            <label class="sr-only" for="search-input">Search the workspace</label>
+            <input id="search-input" name="query" type="search" maxlength="256" placeholder="Search workspace">
+            <button class="icon-button" type="submit" aria-label="Search workspace">⌕</button>
+          </form>
+          <div class="search-results" id="search-results" hidden></div>
+
+          <div class="file-tree" id="file-tree">
+            <p class="loading-copy">Loading repository…</p>
+          </div>
+
+          <div class="sidebar-note">
+            <span class="note-mark" aria-hidden="true">●</span>
+            <p>Deterministic demo repository.<br>Nothing leaves this browser tab.</p>
+          </div>
+        </aside>
+
+        <section class="main-column" aria-label="Shared task workspace">
+          <div class="page-intro">
+            <div>
+              <p class="section-label">AETHER WEB / ALPHA-06</p>
+              <h2>Shared state, inspectable work.</h2>
+              <p class="intro-copy">A browser agent can inspect and propose. You decide what lands.</p>
+            </div>
+            <button class="ghost-button" id="inspect-button" type="button">
+              <span aria-hidden="true">↗</span> Inspect workspace
+            </button>
+          </div>
+
+          <div class="compatibility-notice" id="webmcp-notice" role="status" hidden></div>
+
+          <article class="task-card" id="task-card">
+            <div class="task-topline">
+              <div>
+                <p class="section-label accent-label">ACTIVE TASK</p>
+                <h3 id="task-title">Reject blank API tokens before gateway handoff</h3>
+              </div>
+              <span class="status-pill status-neutral" id="task-status">Ready</span>
+            </div>
+            <p class="task-objective" id="task-objective">Loading the bounded task state…</p>
+            <div class="task-flow" aria-label="Task flow">
+              <div class="flow-step flow-complete"><span>01</span><strong>Inspect</strong><small>Evidence</small></div>
+              <div class="flow-connector"></div>
+              <div class="flow-step" id="flow-propose"><span>02</span><strong>Propose</strong><small>Stage only</small></div>
+              <div class="flow-connector"></div>
+              <div class="flow-step" id="flow-verify"><span>03</span><strong>Verify</strong><small>Current view</small></div>
+            </div>
+            <div class="task-footer">
+              <span class="task-id" id="task-id">task / loading</span>
+              <button class="primary-button" id="stage-button" type="button">Stage suggested fix <span aria-hidden="true">→</span></button>
+            </div>
+          </article>
+
+          <section class="content-card file-card">
+            <div class="card-heading">
+              <div>
+                <p class="section-label">SOURCE EVIDENCE</p>
+                <h3 id="file-heading">src/auth.rs</h3>
+              </div>
+              <span class="mini-label" id="file-meta">read-only view</span>
+            </div>
+            <pre class="code-view" id="file-view" tabindex="0"><code>Choose a file to inspect.</code></pre>
+          </section>
+
+          <section class="content-card diff-card">
+            <div class="card-heading">
+              <div>
+                <p class="section-label">PROPOSED DIFF</p>
+                <h3 id="diff-heading">No staged change</h3>
+              </div>
+              <span class="status-pill status-neutral" id="diff-state">Waiting</span>
+            </div>
+            <div class="diff-meta" id="diff-meta">Agent proposals stay staged until you choose Accept.</div>
+            <pre class="diff-view" id="diff-view"><code>Use “Stage suggested fix” or ask the browser agent to call propose_patch.</code></pre>
+          </section>
+        </section>
+
+        <aside class="right-column" aria-label="Evidence and human controls">
+          <section class="side-card gate-card">
+            <div class="card-heading compact-heading">
+              <div>
+                <p class="section-label accent-label">HUMAN GATE</p>
+                <h3>Review before apply</h3>
+              </div>
+              <span class="gate-icon" aria-hidden="true">✓</span>
+            </div>
+            <p class="side-copy">The browser agent can prepare a change. Only this gate can apply it to the shared repository.</p>
+            <div class="decision-row">
+              <span class="decision-label">Decision</span>
+              <strong id="human-decision">No proposal</strong>
+            </div>
+            <div class="gate-actions">
+              <button class="accept-button" id="accept-button" type="button" disabled>Accept</button>
+              <button class="reject-button" id="reject-button" type="button" disabled>Reject</button>
+            </div>
+          </section>
+
+          <section class="side-card verification-card">
+            <div class="card-heading compact-heading">
+              <div>
+                <p class="section-label">VERIFICATION</p>
+                <h3>Evidence, not a claim</h3>
+              </div>
+              <span class="status-dot dot-neutral" id="verification-dot" aria-hidden="true"></span>
+            </div>
+            <p class="verification-summary" id="verification-summary">No verification has run for the current view.</p>
+            <div class="check-list" id="check-list"></div>
+            <div class="verify-actions">
+              <button class="small-button" id="verify-staged-button" type="button" disabled>Verify staged</button>
+              <button class="small-button" id="verify-accepted-button" type="button" disabled>Verify accepted</button>
+            </div>
+          </section>
+
+          <section class="side-card evidence-card">
+            <div class="card-heading compact-heading">
+              <div>
+                <p class="section-label">EVIDENCE LEDGER</p>
+                <h3>What the agent observed</h3>
+              </div>
+              <span class="count-badge" id="evidence-count">0</span>
+            </div>
+            <ul class="evidence-list" id="evidence-list">
+              <li class="empty-state">Evidence will appear as the workspace is inspected.</li>
+            </ul>
+          </section>
+
+          <section class="side-card trace-card">
+            <div class="card-heading compact-heading">
+              <div>
+                <p class="section-label">TOOL TRACE</p>
+                <h3>Shared with the agent</h3>
+              </div>
+              <span class="trace-signal" aria-hidden="true"></span>
+            </div>
+            <ul class="trace-list" id="trace-list">
+              <li class="empty-state">No tool calls yet.</li>
+            </ul>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="footer-bar">
+        <span><strong>Same page. Same state.</strong> WebMCP tools call the functions behind this UI.</span>
+        <span class="footer-links"><a href="https://github.com/ferxalbs/aether-fx" rel="noreferrer">Open source</a><span aria-hidden="true">·</span><span>Experimental browser surface</span></span>
+      </footer>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

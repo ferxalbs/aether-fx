@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aether-agent"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-core",
  "blake3",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "blake3",
  "serde",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "aether-eval"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "aether-obscura"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-core",
  "flate2",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "aether-rainy"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "aether-terminal"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-core",
  "rustix",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tools"
-version = "0.1.0-alpha-05"
+version = "0.1.0-alpha-06"
 dependencies = [
  "aether-agent",
  "aether-core",
@@ -129,6 +129,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "aether-web"
+version = "0.1.0-alpha-06"
+dependencies = [
+ "aether-core",
+ "blake3",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

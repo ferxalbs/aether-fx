@@ -289,3 +289,24 @@ fixed browser schemas are added at activation, and browser calls are serialized 
 Obscura benchmark or cross-platform RSS claim is published here yet. Release validation should
 record fresh-process wall time/RSS for `--version`, normal EOF, `/browser status`, provider launch,
 and one bounded audit, with the external process identified separately.
+
+## Alpha-06 release-preparation measurements — 2026-09-03
+
+On the local x86_64 macOS host with Rust `1.98.0`, the stripped native release binary measured
+6,806,872 bytes before the alpha-06 version bump and browser extension and 6,810,960 bytes after
+the full change, a delta of 4,088 bytes (+0.06%). The `aether-web` crate is not linked into that
+binary. These are local artifact measurements, not cross-platform guarantees.
+
+The checked-in browser bundle measured 8,362 bytes for the generated JavaScript glue and 171,256
+bytes for the optimized WASM module. The complete static output (`index.html`, CSS, app JavaScript,
+and the adjacent WASM bundle) was 225,245 bytes before filesystem block rounding. `npm --prefix web
+run build:wasm`, `npm --prefix web run build`, and `node --check web/app.js` completed successfully.
+
+The release-preparation run passed the four required locked native gates, 366/366 tests under
+`cargo nextest`, both deterministic evaluator suites (9/9 regression fixtures, 5/5 capability
+fixtures, and 2/2 control-loop checks), `cargo deny check`, `cargo audit`, and the full all-features
+LCOV run. Browser QA in the Codex in-app browser registered six tools and exercised inspect,
+read, search, propose, staged verification, human Accept, human Reject, and shared-state rendering.
+The browser automation backend could not directly invoke page tools because its WebMCP command
+surface is unsupported by the selected model; registration was verified by the page's own status
+badge and the visible workflow was tested through the same callbacks.

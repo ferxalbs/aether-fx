@@ -212,7 +212,17 @@ instructions. Durable session state keeps only status summaries such as `browser
 cookies/storage state is private provider state, while page bodies, HTML, authorization headers,
 complete MCP payloads, request/process IDs, and page instructions are not persisted.
 
-WebMCP is not dynamically enabled by this integration. A future page-tool adapter must validate
-origin, tab, document, and schema identity, invalidate page tools after navigation, and treat
-page-provided descriptions as untrusted content. It must not add a private OpenAI API dependency
-or let a page, Obscura, or the model grant its own permissions.
+The native Obscura integration does not dynamically import page tools. Separately, alpha-06 ships a
+public `aether-web` WASM demo whose own page registers six explicit WebMCP tools when the host
+supports `document.modelContext.registerTool`. That page uses only a deterministic in-memory
+fixture: it cannot access the native checkout, invoke a process, contact Rainy/Obscura, read a
+secret, or grant itself permissions. `inspect_workspace`, `read_file`, `search_workspace`, and
+`get_task_state` are read-only; `propose_patch` only stages; `verify_patch` records bounded
+browser-safe evidence; and `accept_patch`/`reject_patch` remain visible UI-only operations.
+
+The page validates every tool input in JavaScript and again in Rust, rejects unknown fields and
+workspace escapes, caps requests/results/files/lines, rejects secret-like patch markers, and marks
+page content as untrusted in the tool annotations. It feature-detects the API and shows a
+compatibility notice when registration is unavailable or partial. The browser surface is not a
+native workspace bridge and does not weaken any native permission, containment, hash, session, or
+provenance control. See [`webmcp.md`](webmcp.md) for the complete boundary.

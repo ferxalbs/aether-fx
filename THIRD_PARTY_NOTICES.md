@@ -27,6 +27,7 @@ The direct dependency baseline is:
 | tokio | 1.53.1 | MIT |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 |
+| wasm-bindgen | 0.2.127 | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 
 The resolved Rainy transitive graph includes webpki-roots under CDLA-Permissive-2.0; that permissive license is explicitly allowed in deny.toml. cargo-deny also reports explainable duplicate transitive versions, but no banned source/license/advisory.
@@ -48,4 +49,4 @@ are embedded in `crates/aether-obscura/src/manifest.rs` and documented in
 
 AETHER Fx is licensed under Apache-2.0. Direct dependency versions and their declared licenses are recorded in `docs/toolchain-baseline.md`; the complete resolved dependency graph is `Cargo.lock`.
 
-The dependency policy is enforced by `deny.toml`. CI runs `cargo deny check` and `cargo audit` when those tools are available in the workflow environment. This file is intentionally not a hand-copied license bundle; release jobs generate an SBOM and must retain the corresponding dependency metadata.
+The dependency policy is enforced by `deny.toml`. CI runs `cargo deny check` and `cargo audit` when those tools are available in the workflow environment. This file is intentionally not a hand-copied license bundle; release jobs generate an SBOM and must retain the corresponding dependency metadata. The browser-only `aether-web` crate uses `wasm-bindgen 0.2.127` to expose its bounded Rust runtime to static JavaScript; it does not add a browser SDK, network client, or native capability.

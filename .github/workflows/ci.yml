@@ -13,6 +13,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  webmcp:
+    name: WebMCP browser bundle
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Add WebAssembly target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install --locked --version 0.2.127 wasm-bindgen-cli
+
+      - name: Build and check browser bundle
+        run: |
+          npm --prefix web run build:wasm
+          npm --prefix web run build
+          node --check web/app.js
+          test -s web/wasm/aether_web.js
+          test -s web/wasm/aether_web_bg.wasm
+          test -f web/dist/index.html
+          test -f web/dist/wasm/aether_web_bg.wasm
+
   quality:
     name: Quality and policy
     runs-on: ubuntu-24.04

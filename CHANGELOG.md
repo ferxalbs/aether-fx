@@ -5,14 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased - 2026-09-02 (8) - Optional Obscura browser provider
+## Unreleased - 2026-09-03 (1) - Inspectable WebMCP browser workflow
 
 ### Added
 
+- Added the separate `aether-web` Rust/WASM crate and static `web/` vertical slice. The hosted
+  page contains a deterministic four-file repository, active task, source evidence, proposed
+  diff, verification checks, evidence ledger, tool trace, and visible human Accept/Reject gate.
+- Added six provider-side WebMCP tools: `inspect_workspace`, `read_file`, `search_workspace`,
+  `propose_patch`, `verify_patch`, and `get_task_state`. Visible controls and WebMCP callbacks use
+  the same bounded in-memory runtime and workflow state.
 - Added the opt-in `aether-obscura` boundary with a static Obscura v0.2.1 manifest, explicit
   installation consent, SHA-256/size/version verification, atomic activation, private
   workspace-scoped provider state, and one supervised MCP `stdio` session.
-- Added the six fixed `browser.*` tools, `BrowserRead`/`BrowserAction` permission classes,
+- Added the six fixed native `browser.*` tools, `BrowserRead`/`BrowserAction` permission classes,
   `BrowserSession` scheduler footprints, and the read-only `ExternalResearch` turn mode.
 - Added `/browser`, `/browser status`, `/browser stop`, and `/browser update` lifecycle commands;
   `/browser <task>` can perform bounded web research without repository mutation or repository
@@ -20,46 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Browser tools are registered only after a validated provider starts; the inactive model surface
-  remains exactly nine tools. Provider schemas and descriptions cannot expand AETHER's model
-  surface.
-- `/clear`, `/exit`, and normal session shutdown stop Obscura while retaining its private profile;
-  `/resume` does not reanimate the provider or restore active tabs.
-
-### Security
-
-- Added bounded newline-delimited MCP framing, fixed-schema validation, stderr draining, timeout
-  and cancellation invalidation, direct spawn without a shell, cleared provider environment, and
-  fail-closed handling for unsupported server messages and dynamic tool-list changes.
-- Added HTTP(S) URL and credential checks, private/link-local/metadata literal-address rejection,
-  status-only browser persistence, and a fixed internal performance evaluator with no arbitrary
-  JavaScript or generic MCP passthrough.
-
-### Performance
-
-- Kept Obscura, its browser engine, and its network cost on the cold optional path; one provider
-  process and one serialized browser session are reused across turns rather than started per call.
-
-### Documentation
-
-- Documented the v0.2.1 artifact manifest, release licensing, fixed MCP mapping, lifecycle,
-  network limitation, persistence boundary, WebMCP preparation, and separate AETHER/provider
-  performance accounting.
-
-### Known Limitations
-
-- Obscura v0.2.1 publishes no Windows aarch64 asset and its safe default has no loopback-only
-  allowlist. AETHER therefore supports the five published targets and public HTTP/HTTPS only;
-  localhost auditing awaits a narrow upstream contract.
-
-## Unreleased - 2026-09-02 (7) - Rainy SDK compatibility refresh
-
-### Changed
-
+- Bumped the workspace release identity to `0.1.0-alpha-06` and kept the native terminal, nine
+  native tools, Rainy adapter, workflow safeguards, and optional Obscura path intact.
 - Updated the provider boundary to `rainy-sdk 0.6.51` with `default-features = false`; the
   existing typed Responses and Chat Completions streams remain in use.
-
-## Unreleased - 2026-09-02 (6) - Safe model tool access
+- Browser tools are registered only after a validated native provider starts; the native inactive
+  model surface remains exactly nine tools. Provider schemas and descriptions cannot expand it.
+- Added pinned WASM/static bundle checks to CI and release preflight. Vercel publishes `web/dist`
+  without a server, native bridge, or runtime secret.
+- `/clear`, `/exit`, and normal session shutdown stop Obscura while retaining its private profile;
+  `/resume` does not reanimate the provider or restore active tabs.
 
 ### Fixed
 
@@ -69,9 +45,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remembered for the current process, and surfaced as unavailable on the next model selection;
   interactive sessions remain open so another model can be chosen.
 
-## Unreleased - 2026-09-02 (5) - Follow-up workflow improvements
+### Security
 
-No unreleased changes.
+- The WebMCP surface validates strict `additionalProperties: false` schemas in JavaScript and Rust,
+  bounds requests/results/files/lines, rejects path escapes and secret-like patch markers, and
+  keeps `accept_patch`/`reject_patch` outside the model-visible tool set.
+- The browser fixture cannot read the checkout, spawn a process, contact Rainy or Obscura, persist
+  credentials, or execute arbitrary JavaScript. Unsupported WebMCP hosts receive a compatibility
+  notice and never gain a fallback capability.
+- Added bounded newline-delimited MCP framing, fixed-schema validation, stderr draining, timeout
+  and cancellation invalidation, direct spawn without a shell, cleared provider environment, and
+  fail-closed handling for unsupported server messages and dynamic tool-list changes.
+- Added HTTP(S) URL and credential checks, private/link-local/metadata literal-address rejection,
+  status-only browser persistence, and a fixed internal performance evaluator with no arbitrary
+  JavaScript or generic MCP passthrough.
+
+### Performance
+
+- Kept the WebMCP page free of a frontend framework and kept its demo data in bounded in-memory
+  Rust/WASM state; the native binary does not link the browser crate.
+- Kept Obscura, its browser engine, and its network cost on the cold optional path; one provider
+  process and one serialized browser session are reused across turns rather than started per call.
+
+### Documentation
+
+- Documented the WebMCP boundary, local WASM/static build, compatibility behavior, public hosting
+  handoff, prior work versus challenge work, submission text, and short demo script.
+- Documented the Obscura v0.2.1 artifact manifest, release licensing, fixed MCP mapping, lifecycle,
+  network limitation, persistence boundary, and separate AETHER/provider performance accounting.
+
+### Known Limitations
+
+- The WebMCP API and browser support are experimental. The hosted slice demonstrates a fixed
+  in-memory repository rather than arbitrary local checkout access or Cargo execution; a verified
+  public Vercel URL and challenge video still require the release handoff step.
+- Obscura v0.2.1 publishes no Windows aarch64 asset and its safe default has no loopback-only
+  allowlist. AETHER therefore supports the five published targets and public HTTP/HTTPS only;
+  localhost auditing awaits a narrow upstream contract.
 
 ## v0.1.0-alpha-05 - 2026-09-02 (4) - Protocol-aware model workflow
 

@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "buildCommand": "npm --prefix web run build",
+  "outputDirectory": "web/dist",
+  "installCommand": "npm --prefix web install --ignore-scripts --no-audit --no-fund"
+}

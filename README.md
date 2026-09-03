@@ -5,8 +5,19 @@ bounded set of filesystem, process, search, patch, and Git tools.
 
 ## Alpha status
 
-`v0.1.0-alpha-05` is an alpha preview. It is not stable or production-ready software. This
-release is distributed only through GitHub Releases and supports the six platforms listed below.
+`v0.1.0-alpha-06` is an alpha preview. It is not stable or production-ready software. This
+release is distributed through GitHub Releases for the six native platforms listed below and adds
+an experimental static WebMCP browser vertical slice.
+
+### Experimental WebMCP browser surface
+
+The [AETHER WebMCP vertical slice](docs/webmcp.md) is a small deterministic browser workspace,
+not a web IDE. It runs a four-file demo repository in Rust/WASM, registers six bounded page tools
+when the host supports `document.modelContext.registerTool`, and routes visible UI and agent calls
+through the same state. An agent can inspect, read, search, propose, and verify; only the visible
+human Accept/Reject gate can apply the staged patch. It has no native filesystem, shell, network,
+credentials, or browser-to-CLI bridge. The public deployment URL is recorded in the linked
+challenge submission kit when verified.
 
 ## Install
 
@@ -17,8 +28,8 @@ archive with `SHA256SUMS`, installs to `$HOME/.local/bin`, and does not edit she
 
 ```sh
 curl -fsSL \
-  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-05/install.sh \
-  | sh -s -- --version v0.1.0-alpha-05
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-06/install.sh \
+  | sh -s -- --version v0.1.0-alpha-06
 ```
 
 Use `--dir <path>` to choose another user-owned installation directory.
@@ -30,10 +41,10 @@ Download the tagged installer, then run it with the explicit prerelease version.
 
 ```powershell
 Invoke-WebRequest `
-  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-05/install.ps1 `
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-06/install.ps1 `
   -OutFile install.ps1
 
-.\install.ps1 -Version v0.1.0-alpha-05
+.\install.ps1 -Version v0.1.0-alpha-06
 ```
 
 Use `-Dir <path>` to choose another user-owned installation directory.
@@ -41,7 +52,7 @@ Use `-Dir <path>` to choose another user-owned installation directory.
 ### Manual archive installation
 
 Download the archive for your platform and `SHA256SUMS` from the
-[v0.1.0-alpha-05 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-05).
+[v0.1.0-alpha-06 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-06).
 Verify the archive before extracting it, then place `aether` or `aether.exe` in a user-owned
 directory on your PATH. Each archive contains only the executable, its CycloneDX SBOM, `LICENSE`,
 `NOTICE`, and `THIRD_PARTY_NOTICES.md`.
@@ -154,7 +165,7 @@ The default `aether doctor` is offline and reports whether the local executable 
 it never contacts GitHub. `aether models` explicitly retrieves the live Rainy catalog, while
 `aether doctor --network` adds an explicit catalog/reachability probe.
 
-### Optional browser provider
+### Optional native browser provider
 
 Obscura is an optional external provider. Use `/browser` to install the exact pinned release after
 an explicit consent prompt, or `/browser <task>` for bounded, read-only web research. Installation
@@ -202,7 +213,7 @@ against the same release manifest before replacement. `sha256sum` or `shasum -a 
 the Unix installer. GitHub CLI users may additionally verify an archive's build attestation:
 
 ```sh
-gh attestation verify aether-v0.1.0-alpha-05-linux-x86_64-gnu.tar.gz \
+gh attestation verify aether-v0.1.0-alpha-06-linux-x86_64-gnu.tar.gz \
   --repo ferxalbs/aether-fx
 ```
 
@@ -220,6 +231,20 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run --locked -p aether -- --version
 ```
+
+To rebuild the experimental browser bundle, install the pinned WASM target and
+`wasm-bindgen-cli`, then run:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install --locked --version 0.2.127 wasm-bindgen-cli
+npm --prefix web run build:wasm
+npm --prefix web run build
+```
+
+The static output is `web/dist`; `web/wasm` is checked in so a static host does not need Rust.
+See [`docs/webmcp-challenge.md`](docs/webmcp-challenge.md) for the challenge description and
+short demo script.
 
 The release workflow builds the production binaries on matching GitHub runners; a locally built
 `target/release/aether` is not a release artifact.
