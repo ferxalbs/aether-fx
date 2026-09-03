@@ -33,6 +33,20 @@ pub const MAX_POLICY_OBSERVED_PATHS: usize = 16;
 /// Confidence required before a mutation may be admitted by the policy.
 pub const MIN_MUTATION_CONFIDENCE: u8 = 40;
 
+const EXTERNAL_RESEARCH_TOOLS: [&str; 11] = [
+    "read",
+    "list",
+    "find",
+    "search",
+    "git",
+    "browser.tabs",
+    "browser.navigate",
+    "browser.snapshot",
+    "browser.find",
+    "browser.wait",
+    "browser.performance_audit",
+];
+
 /// Bounded action ranking exposed for tests, diagnostics, and model adapters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedAction {
@@ -261,7 +275,28 @@ impl AutonomousCodingPolicy {
             return all_tools.to_vec();
         }
         let active = determine_active_tool_names(snapshot);
-        all_tools.iter().filter(|tool| active.contains(&tool.name.as_str())).cloned().collect()
+        all_tools
+            .iter()
+            .filter(|tool| active.contains(&tool.name.as_str()) || is_browser_tool(&tool.name))
+            .cloned()
+            .collect()
+    }
+
+    /// Select a surface for a repository turn or the explicitly read-only research mode.
+    pub fn select_tool_surface_for_mode(
+        &self,
+        snapshot: &ContextSnapshot,
+        all_tools: &[ToolDefinition],
+        mode: crate::TurnMode,
+    ) -> Vec<ToolDefinition> {
+        if mode == crate::TurnMode::ExternalResearch {
+            return all_tools
+                .iter()
+                .filter(|tool| EXTERNAL_RESEARCH_TOOLS.contains(&tool.name.as_str()))
+                .cloned()
+                .collect();
+        }
+        self.select_tool_surface(snapshot, all_tools)
     }
 
     /// Generate structured feedback when repeated no-progress actions are detected.
@@ -472,6 +507,13 @@ impl AutonomousCodingPolicy {
     /// Apply final workflow completion and keep the persisted recommendation synchronized.
     pub fn finish_turn(&mut self, engine: &mut ContextEngine) -> bool {
         let complete = engine.finish_turn();
+        self.update_next_action(engine);
+        complete
+    }
+
+    /// Finish a read-only research turn without applying repository completion criteria.
+    pub fn finish_external_research(&mut self, engine: &mut ContextEngine) -> bool {
+        let complete = engine.finish_external_research();
         self.update_next_action(engine);
         complete
     }
@@ -1428,6 +1470,18 @@ fn determine_active_tool_names(snapshot: &ContextSnapshot) -> Vec<&'static str> 
     names
 }
 
+fn is_browser_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "browser.tabs"
+            | "browser.navigate"
+            | "browser.snapshot"
+            | "browser.find"
+            | "browser.wait"
+            | "browser.performance_audit"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,6 +1530,44 @@ mod tests {
         let after_inspection = policy.select_tool_surface(&inspected, &definitions);
         assert!(after_inspection.iter().any(|tool| tool.name == "write"));
         assert!(after_inspection.iter().any(|tool| tool.name == "patch"));
+    }
+
+    #[test]
+    fn external_research_surface_excludes_mutating_and_process_tools() {
+        let definitions = [
+            "read",
+            "list",
+            "find",
+            "search",
+            "write",
+            "patch",
+            "shell",
+            "process",
+            "git",
+            "browser.tabs",
+            "browser.navigate",
+            "browser.snapshot",
+            "browser.find",
+            "browser.wait",
+            "browser.performance_audit",
+        ]
+        .into_iter()
+        .map(|name| ToolDefinition {
+            name: name.to_owned(),
+            description: String::new(),
+            input_schema: json!({}),
+            permission: PermissionClass::ReadOnly,
+        })
+        .collect::<Vec<_>>();
+        let selected = AutonomousCodingPolicy::new().select_tool_surface_for_mode(
+            &ContextSnapshot::new("/workspace", None),
+            &definitions,
+            crate::TurnMode::ExternalResearch,
+        );
+        assert_eq!(
+            selected.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            EXTERNAL_RESEARCH_TOOLS
+        );
     }
 
     #[test]

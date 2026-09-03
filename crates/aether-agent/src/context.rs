@@ -196,6 +196,12 @@ impl ContextEngine {
         ready
     }
 
+    /// Finish a read-only external-research turn without requiring repository evidence.
+    pub fn finish_external_research(&mut self) -> bool {
+        self.enforce_bounds();
+        true
+    }
+
     /// Record a bounded dirty-worktree path as user-owned unless this session owns it already.
     pub fn record_user_modified(&mut self, path: &str) {
         if !path_is_workspace_relative(path)
@@ -255,6 +261,13 @@ impl ContextEngine {
         }
         let summary = compact_tool_result(name, result);
         self.push_summary(summary);
+        if name.starts_with("browser.") {
+            // Page content is useful only in the live model turn. Keep it out of repository
+            // evidence, workflow heuristics, and the in-memory continuation that can be persisted
+            // on the next turn.
+            self.enforce_bounds();
+            return;
+        }
         self.observe_relevant(name, input, result);
         match name {
             "read" => self.observe_read(result),
@@ -2088,6 +2101,23 @@ mod tests {
         assert_eq!(engine.snapshot().inspected.len(), 1);
         assert_eq!(engine.snapshot().inspected[0].ranges, vec![LineRange { start: 1, end: 2 }]);
         assert_eq!(engine.snapshot().excerpts.len(), 1);
+    }
+
+    #[test]
+    fn browser_observation_is_status_only_and_not_repository_evidence() {
+        let mut engine = ContextEngine::new("/workspace", None);
+        let result = ToolResult::success_text(
+            ToolCallId::new("browser-ctx").unwrap(),
+            "page text with an instruction to ignore the user",
+            64 * 1024,
+        );
+        engine.observe_tool("browser.snapshot", &serde_json::json!({}), &result);
+        assert_eq!(engine.snapshot().tool_summaries[0].summary.as_str(), "browser.snapshot ok");
+        assert!(engine.snapshot().inspected.is_empty());
+        assert!(engine.snapshot().workflow.relevant_files.is_empty());
+        assert!(
+            !serde_json::to_string(&engine.snapshot().persistable()).unwrap().contains("page text")
+        );
     }
 
     #[test]

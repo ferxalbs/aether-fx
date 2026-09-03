@@ -9,14 +9,19 @@ use aether_core::{
 };
 use serde_json::json;
 
+use aether_obscura::{ObscuraSupervisor, sanitized_origin};
+
 use crate::{common::Workspace, find, git, list, patch, process, read, search, shell, write};
 
 pub const TOOL_NAMES: [&str; 9] =
     ["read", "list", "find", "search", "write", "patch", "shell", "process", "git"];
 
+pub use aether_obscura::BROWSER_TOOL_NAMES;
+
 pub struct ToolRegistry {
     workspace: Arc<Workspace>,
-    definitions: &'static [ToolDefinition],
+    definitions: Arc<Vec<ToolDefinition>>,
+    obscura: Option<Arc<ObscuraSupervisor>>,
 }
 
 #[derive(Clone)]
@@ -30,6 +35,72 @@ enum PreparedToolInput {
     Shell(crate::ShellInput),
     Process(crate::ProcessInput),
     Git(crate::GitInput),
+    Browser(BrowserToolInput),
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "kind", content = "input")]
+enum BrowserToolInput {
+    Tabs(BrowserTabsInput),
+    Navigate(BrowserNavigateInput),
+    Snapshot(BrowserSnapshotInput),
+    Find(BrowserFindInput),
+    Wait(BrowserWaitInput),
+    PerformanceAudit(BrowserPerformanceAuditInput),
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserTabsInput {}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserNavigateInput {
+    url: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserSnapshotInput {
+    max_chars: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserFindInput {
+    query: String,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default = "default_browser_limit")]
+    limit: u64,
+    #[serde(default = "default_browser_context_chars")]
+    context_chars: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserWaitInput {
+    selector: String,
+    #[serde(default = "default_browser_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserPerformanceAuditInput {
+    url: String,
+}
+
+const fn default_browser_limit() -> u64 {
+    10
+}
+
+const fn default_browser_context_chars() -> u64 {
+    80
+}
+
+const fn default_browser_timeout_ms() -> u64 {
+    30_000
 }
 
 impl ToolRegistry {
@@ -38,7 +109,22 @@ impl ToolRegistry {
     }
 
     pub fn with_workspace(workspace: Workspace) -> Self {
-        Self { workspace: Arc::new(workspace), definitions: definitions() }
+        Self {
+            workspace: Arc::new(workspace),
+            definitions: Arc::new(definitions().to_vec()),
+            obscura: None,
+        }
+    }
+
+    /// Construct the active surface after a supervisor has completed its MCP handshake.
+    pub fn with_obscura(workspace: Workspace, obscura: Arc<ObscuraSupervisor>) -> Self {
+        let mut definitions = definitions().to_vec();
+        definitions.extend(browser_definitions().iter().cloned());
+        Self {
+            workspace: Arc::new(workspace),
+            definitions: Arc::new(definitions),
+            obscura: Some(obscura),
+        }
     }
 
     pub fn with_policy(
@@ -56,7 +142,7 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
-        self.definitions
+        self.definitions.as_slice()
     }
 
     /// Parse and classify a model call exactly once at the tool boundary.
@@ -65,6 +151,19 @@ impl ToolRegistry {
         let mut action = PreparedAction::fallback(invocation, permission);
         let parsed = parse_prepared_input(&action.tool, &action.normalized_input);
         if let Some(parsed) = parsed {
+            if let PreparedToolInput::Browser(browser) = &parsed {
+                action.effects = self.browser_footprint();
+                action.paths.clear();
+                action.classification = ActionClassification::Read;
+                action.permission_request =
+                    Some(browser_permission_request(&action.call_id, &action.tool, browser));
+                action.requirements = ActionRequirements {
+                    permission: PermissionClass::BrowserRead,
+                    user_authorization: true,
+                    current_workspace_evidence: false,
+                };
+                return action.with_typed_input(parsed);
+            }
             let command_effects = command_effects_for_input(&parsed);
             action.permission_request =
                 permission_request_for_input(&action.call_id, &action.tool, permission, &parsed);
@@ -126,10 +225,13 @@ impl ToolRegistry {
                 process::execute(&self.workspace, call_id, invocation.input, context).await
             }
             "git" => git::execute(&self.workspace, call_id, invocation.input, context).await,
+            name if BROWSER_TOOL_NAMES.contains(&name) => {
+                self.dispatch_browser(invocation, context).await
+            }
             _ => ToolResult::failure(
                 call_id,
                 "unknown_tool",
-                "tool is not in the v0.1 registry",
+                "tool is not in the active registry",
                 false,
                 self.workspace.max_output_bytes(),
             ),
@@ -178,6 +280,126 @@ impl ToolRegistry {
             PreparedToolInput::Git(input) => {
                 git::execute_parsed(&self.workspace, call_id, input, context).await
             }
+            PreparedToolInput::Browser(input) => {
+                self.dispatch_browser_input(call_id, input, context).await
+            }
+        }
+    }
+
+    async fn dispatch_browser(
+        &self,
+        invocation: ToolInvocation,
+        context: ToolExecutionContext,
+    ) -> ToolResult {
+        let call_id = invocation.call_id.clone();
+        let Some(input) = parse_prepared_input(&invocation.name, &invocation.input) else {
+            return ToolResult::failure(
+                call_id,
+                "invalid_input",
+                "browser input does not match the fixed schema",
+                false,
+                self.workspace.max_output_bytes(),
+            );
+        };
+        let PreparedToolInput::Browser(input) = input else {
+            return ToolResult::failure(
+                call_id,
+                "invalid_input",
+                "browser input does not match the fixed schema",
+                false,
+                self.workspace.max_output_bytes(),
+            );
+        };
+        self.dispatch_browser_input(call_id, input, context).await
+    }
+
+    async fn dispatch_browser_input(
+        &self,
+        call_id: aether_core::ToolCallId,
+        input: BrowserToolInput,
+        context: ToolExecutionContext,
+    ) -> ToolResult {
+        let Some(obscura) = self.obscura.as_ref() else {
+            return ToolResult::failure(
+                call_id,
+                "provider_inactive",
+                "Obscura is inactive; use /browser to activate it",
+                true,
+                self.workspace.max_output_bytes(),
+            );
+        };
+        if !obscura.is_healthy() {
+            return ToolResult::failure(
+                call_id,
+                "provider_inactive",
+                "Obscura is no longer healthy; use /browser to start it again",
+                true,
+                self.workspace.max_output_bytes(),
+            );
+        }
+        if let Err(error) = self.workspace.require_permit(
+            &context,
+            &call_id,
+            browser_tool_name(&input),
+            PermissionClass::BrowserRead,
+        ) {
+            return self.workspace.result_error(call_id, error);
+        }
+        let result = match input {
+            BrowserToolInput::Tabs(_) => obscura.tabs(context.cancellation()).await,
+            BrowserToolInput::Navigate(input) => {
+                obscura.navigate(&input.url, context.cancellation()).await
+            }
+            BrowserToolInput::Snapshot(input) => {
+                obscura.snapshot(input.max_chars, context.cancellation()).await
+            }
+            BrowserToolInput::Find(input) => {
+                obscura
+                    .find(
+                        &input.query,
+                        input.case_sensitive,
+                        input.limit,
+                        input.context_chars,
+                        context.cancellation(),
+                    )
+                    .await
+            }
+            BrowserToolInput::Wait(input) => {
+                obscura.wait(&input.selector, input.timeout_ms, context.cancellation()).await
+            }
+            BrowserToolInput::PerformanceAudit(input) => {
+                obscura.performance_audit(&input.url, context.cancellation()).await
+            }
+        };
+        match result {
+            Ok(output) => {
+                ToolResult::success_text(call_id, output, self.workspace.max_output_bytes())
+            }
+            Err(error) => ToolResult::failure(
+                call_id,
+                error.code(),
+                error.to_string(),
+                error.retryable(),
+                self.workspace.max_output_bytes(),
+            ),
+        }
+    }
+
+    fn browser_footprint(&self) -> ToolFootprint {
+        self.obscura.as_ref().map_or_else(ToolFootprint::unknown, |obscura| {
+            ToolFootprint::from_effects(vec![ToolEffect::Exclusive(ToolResource::BrowserSession(
+                obscura.session_id(),
+            ))])
+        })
+    }
+
+    fn browser_footprint_for_invocation(&self, invocation: &ToolInvocation) -> ToolFootprint {
+        if parse_prepared_input(&invocation.name, &invocation.input)
+            .is_some_and(|input| matches!(input, PreparedToolInput::Browser(_)))
+        {
+            self.browser_footprint()
+        } else {
+            ToolFootprint::unknown()
         }
     }
 
@@ -214,6 +436,9 @@ impl ToolRegistry {
             self.definitions.iter().find(|definition| definition.name == invocation.name)?;
         if definition.permission == PermissionClass::ReadOnly {
             return None;
+        }
+        if definition.permission == PermissionClass::BrowserRead {
+            return Some(browser_permission_request_for_invocation(invocation));
         }
         let details = match invocation.name.as_str() {
             "write" => serde_json::from_value::<crate::WriteInput>(invocation.input.clone())
@@ -283,6 +508,24 @@ fn parse_prepared_input(tool: &str, input: &serde_json::Value) -> Option<Prepare
         "shell" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Shell),
         "process" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Process),
         "git" => serde_json::from_value(input.clone()).ok().map(PreparedToolInput::Git),
+        "browser.tabs" => serde_json::from_value(input.clone())
+            .ok()
+            .map(|input| PreparedToolInput::Browser(BrowserToolInput::Tabs(input))),
+        "browser.navigate" => serde_json::from_value(input.clone())
+            .ok()
+            .map(|input| PreparedToolInput::Browser(BrowserToolInput::Navigate(input))),
+        "browser.snapshot" => serde_json::from_value(input.clone())
+            .ok()
+            .map(|input| PreparedToolInput::Browser(BrowserToolInput::Snapshot(input))),
+        "browser.find" => serde_json::from_value(input.clone())
+            .ok()
+            .map(|input| PreparedToolInput::Browser(BrowserToolInput::Find(input))),
+        "browser.wait" => serde_json::from_value(input.clone())
+            .ok()
+            .map(|input| PreparedToolInput::Browser(BrowserToolInput::Wait(input))),
+        "browser.performance_audit" => serde_json::from_value(input.clone())
+            .ok()
+            .map(|input| PreparedToolInput::Browser(BrowserToolInput::PerformanceAudit(input))),
         _ => None,
     }
 }
@@ -336,6 +579,66 @@ fn permission_request_for_input(
     })
 }
 
+fn browser_tool_name(input: &BrowserToolInput) -> &'static str {
+    match input {
+        BrowserToolInput::Tabs(_) => "browser.tabs",
+        BrowserToolInput::Navigate(_) => "browser.navigate",
+        BrowserToolInput::Snapshot(_) => "browser.snapshot",
+        BrowserToolInput::Find(_) => "browser.find",
+        BrowserToolInput::Wait(_) => "browser.wait",
+        BrowserToolInput::PerformanceAudit(_) => "browser.performance_audit",
+    }
+}
+
+fn browser_permission_request_for_invocation(invocation: &ToolInvocation) -> PermissionRequest {
+    let details = if invocation.name == "browser.navigate" {
+        let origin = serde_json::from_value::<BrowserNavigateInput>(invocation.input.clone())
+            .ok()
+            .and_then(|input| sanitized_origin(&input.url));
+        serde_json::json!({
+            "origin": origin.unwrap_or_else(|| "invalid".to_owned()),
+            "scope": "active browser session"
+        })
+    } else {
+        serde_json::json!({"scope": "active browser session"})
+    };
+    PermissionRequest {
+        call_id: invocation.call_id.clone(),
+        tool: invocation.name.clone(),
+        class: PermissionClass::BrowserRead,
+        operation: "use browser session".to_owned(),
+        target: details.get("origin").and_then(serde_json::Value::as_str).map(str::to_owned),
+        details,
+    }
+}
+
+fn browser_permission_request(
+    call_id: &aether_core::ToolCallId,
+    tool: &str,
+    input: &BrowserToolInput,
+) -> PermissionRequest {
+    let invocation = ToolInvocation {
+        call_id: call_id.clone(),
+        name: tool.to_owned(),
+        input: match input {
+            BrowserToolInput::Tabs(_) => json!({}),
+            BrowserToolInput::Navigate(value) => json!({"url": value.url}),
+            BrowserToolInput::Snapshot(value) => json!({"max_chars": value.max_chars}),
+            BrowserToolInput::Find(value) => json!({
+                "query": value.query,
+                "case_sensitive": value.case_sensitive,
+                "limit": value.limit,
+                "context_chars": value.context_chars
+            }),
+            BrowserToolInput::Wait(value) => {
+                json!({"selector": value.selector, "timeout_ms": value.timeout_ms})
+            }
+            BrowserToolInput::PerformanceAudit(value) => json!({"url": value.url}),
+        },
+    };
+    browser_permission_request_for_invocation(&invocation)
+}
+
 fn classification_for_input(input: &PreparedToolInput) -> ActionClassification {
     match input {
         PreparedToolInput::Read(_)
@@ -369,6 +672,7 @@ fn classification_for_input(input: &PreparedToolInput) -> ActionClassification {
             | crate::ProcessOperation::Signal
             | crate::ProcessOperation::Kill => ActionClassification::Mutation,
         },
+        PreparedToolInput::Browser(_) => ActionClassification::Read,
     }
 }
 
@@ -388,6 +692,7 @@ fn command_effects_for_input(input: &PreparedToolInput) -> Option<aether_core::C
                 input.cwd.as_deref().unwrap_or(""),
             ))
         }
+        PreparedToolInput::Browser(_) => None,
         _ => None,
     }
 }
@@ -438,6 +743,7 @@ fn paths_for_input(input: &PreparedToolInput) -> Vec<String> {
             _ => Vec::new(),
         },
         PreparedToolInput::Git(input) => input.path.clone().into_iter().collect(),
+        PreparedToolInput::Browser(_) => Vec::new(),
     }
 }
 
@@ -468,6 +774,7 @@ fn footprint_for_input(input: &PreparedToolInput) -> ToolFootprint {
         )
         .footprint(),
         PreparedToolInput::Process(input) => process_footprint(input),
+        PreparedToolInput::Browser(_) => ToolFootprint::unknown(),
     }
 }
 
@@ -490,7 +797,7 @@ fn bounded_arguments(arguments: Vec<String>) -> Vec<String> {
 
 impl ToolExecutor for ToolRegistry {
     fn definitions(&self) -> &[ToolDefinition] {
-        self.definitions
+        self.definitions.as_slice()
     }
 
     fn prepare(&self, invocation: ToolInvocation) -> PreparedAction {
@@ -550,6 +857,9 @@ impl ToolExecutor for ToolRegistry {
             "process" => serde_json::from_value::<crate::ProcessInput>(invocation.input.clone())
                 .map(|input| process_footprint(&input))
                 .unwrap_or_else(|_| ToolFootprint::unknown()),
+            name if BROWSER_TOOL_NAMES.contains(&name) => {
+                self.browser_footprint_for_invocation(invocation)
+            }
             _ => ToolFootprint::unknown(),
         }
     }
@@ -803,6 +1113,88 @@ fn definitions() -> &'static [ToolDefinition] {
         .as_slice()
 }
 
+fn browser_definitions() -> &'static [ToolDefinition] {
+    static DEFINITIONS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    DEFINITIONS
+        .get_or_init(|| {
+            vec![
+                ToolDefinition {
+                    name: "browser.tabs".to_owned(),
+                    description: "List limited information about the active browser tabs.".to_owned(),
+                    permission: PermissionClass::BrowserRead,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                },
+                ToolDefinition {
+                    name: "browser.navigate".to_owned(),
+                    description: "Navigate the active browser tab to a public HTTP or HTTPS URL.".to_owned(),
+                    permission: PermissionClass::BrowserRead,
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["url"],
+                        "properties": {"url": {"type": "string", "minLength": 1}},
+                        "additionalProperties": false
+                    }),
+                },
+                ToolDefinition {
+                    name: "browser.snapshot".to_owned(),
+                    description: "Read bounded visible text, title, URL, and minimal page metadata.".to_owned(),
+                    permission: PermissionClass::BrowserRead,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"max_chars": {"type": "integer", "minimum": 0, "maximum": 64000}},
+                        "additionalProperties": false
+                    }),
+                },
+                ToolDefinition {
+                    name: "browser.find".to_owned(),
+                    description: "Find a bounded number of matches in visible page text.".to_owned(),
+                    permission: PermissionClass::BrowserRead,
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string", "minLength": 1, "maxLength": 4096},
+                            "case_sensitive": {"type": "boolean"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                            "context_chars": {"type": "integer", "minimum": 0, "maximum": 512}
+                        },
+                        "additionalProperties": false
+                    }),
+                },
+                ToolDefinition {
+                    name: "browser.wait".to_owned(),
+                    description: "Wait for a bounded interval until a page selector appears.".to_owned(),
+                    permission: PermissionClass::BrowserRead,
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["selector"],
+                        "properties": {
+                            "selector": {"type": "string", "minLength": 1, "maxLength": 1024},
+                            "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 60000}
+                        },
+                        "additionalProperties": false
+                    }),
+                },
+                ToolDefinition {
+                    name: "browser.performance_audit".to_owned(),
+                    description: "Run a bounded read-only performance audit for a public HTTP or HTTPS URL.".to_owned(),
+                    permission: PermissionClass::BrowserRead,
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["url"],
+                        "properties": {"url": {"type": "string", "minLength": 1}},
+                        "additionalProperties": false
+                    }),
+                },
+            ]
+        })
+        .as_slice()
+}
+
 #[cfg(test)]
 mod command_footprint_tests {
     use super::*;
@@ -879,5 +1271,21 @@ mod tests {
             definitions.iter().map(|definition| definition.name.as_str()).collect::<Vec<_>>(),
             TOOL_NAMES
         );
+    }
+
+    #[test]
+    fn browser_surface_has_exactly_six_fixed_tools() {
+        let definitions = browser_definitions();
+        assert_eq!(definitions.len(), BROWSER_TOOL_NAMES.len());
+        assert_eq!(
+            definitions.iter().map(|definition| definition.name.as_str()).collect::<Vec<_>>(),
+            BROWSER_TOOL_NAMES
+        );
+        assert!(
+            definitions
+                .iter()
+                .all(|definition| definition.permission == PermissionClass::BrowserRead)
+        );
+        assert!(!definitions.iter().any(|definition| definition.name == "browser.click"));
     }
 }

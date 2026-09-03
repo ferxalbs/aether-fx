@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased - 2026-09-02 (8) - Optional Obscura browser provider
+
+### Added
+
+- Added the opt-in `aether-obscura` boundary with a static Obscura v0.2.1 manifest, explicit
+  installation consent, SHA-256/size/version verification, atomic activation, private
+  workspace-scoped provider state, and one supervised MCP `stdio` session.
+- Added the six fixed `browser.*` tools, `BrowserRead`/`BrowserAction` permission classes,
+  `BrowserSession` scheduler footprints, and the read-only `ExternalResearch` turn mode.
+- Added `/browser`, `/browser status`, `/browser stop`, and `/browser update` lifecycle commands;
+  `/browser <task>` can perform bounded web research without repository mutation or repository
+  evidence requirements.
+
+### Changed
+
+- Browser tools are registered only after a validated provider starts; the inactive model surface
+  remains exactly nine tools. Provider schemas and descriptions cannot expand AETHER's model
+  surface.
+- `/clear`, `/exit`, and normal session shutdown stop Obscura while retaining its private profile;
+  `/resume` does not reanimate the provider or restore active tabs.
+
+### Security
+
+- Added bounded newline-delimited MCP framing, fixed-schema validation, stderr draining, timeout
+  and cancellation invalidation, direct spawn without a shell, cleared provider environment, and
+  fail-closed handling for unsupported server messages and dynamic tool-list changes.
+- Added HTTP(S) URL and credential checks, private/link-local/metadata literal-address rejection,
+  status-only browser persistence, and a fixed internal performance evaluator with no arbitrary
+  JavaScript or generic MCP passthrough.
+
+### Performance
+
+- Kept Obscura, its browser engine, and its network cost on the cold optional path; one provider
+  process and one serialized browser session are reused across turns rather than started per call.
+
+### Documentation
+
+- Documented the v0.2.1 artifact manifest, release licensing, fixed MCP mapping, lifecycle,
+  network limitation, persistence boundary, WebMCP preparation, and separate AETHER/provider
+  performance accounting.
+
+### Known Limitations
+
+- Obscura v0.2.1 publishes no Windows aarch64 asset and its safe default has no loopback-only
+  allowlist. AETHER therefore supports the five published targets and public HTTP/HTTPS only;
+  localhost auditing awaits a narrow upstream contract.
+
 ## Unreleased - 2026-09-02 (7) - Rainy SDK compatibility refresh
 
 ### Changed

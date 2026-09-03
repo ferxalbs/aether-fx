@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 aether-agent.workspace = true
 aether-core.workspace = true
+aether-obscura.workspace = true
 aether-rainy.workspace = true
 aether-terminal.workspace = true
 aether-tools.workspace = true

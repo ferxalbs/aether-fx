@@ -5,6 +5,7 @@ members = [
     "crates/aether-core",
     "crates/aether-agent",
     "crates/aether-eval",
+    "crates/aether-obscura",
     "crates/aether-rainy",
     "crates/aether-tools",
     "crates/aether-terminal",
@@ -30,6 +31,7 @@ todo = "deny"
 [workspace.dependencies]
 aether-agent = { path = "crates/aether-agent", version = "0.1.0-alpha-05" }
 aether-core = { path = "crates/aether-core", version = "0.1.0-alpha-05" }
+aether-obscura = { path = "crates/aether-obscura", version = "0.1.0-alpha-05" }
 aether-rainy = { path = "crates/aether-rainy", version = "0.1.0-alpha-05" }
 aether-terminal = { path = "crates/aether-terminal", version = "0.1.0-alpha-05" }
 aether-tools = { path = "crates/aether-tools", version = "0.1.0-alpha-05" }
@@ -52,6 +54,7 @@ semver = { version = "1.0.28", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", default-features = false }
+url = "2.5.7"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 windows-sys = { version = "0.61.2", default-features = false, features = [

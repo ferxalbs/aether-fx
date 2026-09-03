@@ -265,3 +265,27 @@ the explicit HTTPS/SHA-256 updater. Fresh local probes measured 0.06 seconds for
 0.05 seconds for `--help`, and 0.06 seconds for EOF/minimal startup. The version and help paths do
 not construct the HTTP client; minimal startup also completed without a provider credential or
 network operation. These are single-host measurements, not cross-platform guarantees.
+
+## Optional Obscura provider — inactive/active measurement boundary
+
+The Obscura integration is designed as a cold optional path. `aether --version`, `--help`, normal
+startup, and turns without `/browser` do not spawn Obscura, open an MCP channel, create a browser
+profile, or query Obscura release metadata. The compiled adapter contributes to AETHER's binary
+and baseline startup only; the browser engine, its process memory, and its browser work are not
+part of AETHER's idle RSS measurement.
+
+Provider measurements must be reported separately for these states:
+
+| State | Include | Do not attribute to AETHER idle cost |
+| --- | --- | --- |
+| AETHER inactive | AETHER RSS, startup, schemas, and local state checks | Obscura process or browser engine |
+| AETHER + adapter | AETHER RSS and binary/schema delta with no provider process | Browser engine memory or network |
+| Obscura active | AETHER plus the one Obscura process and MCP session | None; report parent and external RSS separately |
+| Obscura/browser engine | External process RSS, startup, navigation, and page cost | AETHER binary or inactive RSS |
+
+The active path reuses one Obscura process and one browser session for all turns. Only the six
+fixed browser schemas are added at activation, and browser calls are serialized over one
+`BrowserSession`; starting a fresh browser per turn would violate this resource goal. No live
+Obscura benchmark or cross-platform RSS claim is published here yet. Release validation should
+record fresh-process wall time/RSS for `--version`, normal EOF, `/browser status`, provider launch,
+and one bounded audit, with the external process identified separately.

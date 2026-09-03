@@ -558,6 +558,34 @@ fn piped_shell_has_no_banner_prompt_or_ansi_and_keeps_slash_commands_local() {
 }
 
 #[test]
+fn browser_status_is_offline_and_does_not_create_provider_state() {
+    let root = temp_root("browser-status");
+    let state = state_root(&root);
+    let output = run_piped(&root, &[], &state, b"/browser status\n/exit\n");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Obscura: installed=no active=no healthy=no"), "{stdout}");
+    assert!(!state.exists(), "browser status must not create the provider state root");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn browser_install_requires_interactive_consent_even_with_yolo() {
+    let root = temp_root("browser-consent");
+    let state = state_root(&root);
+    let output = run_piped(&root, ["--yolo"].as_slice(), &state, b"/browser\n/exit\n");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("explicit interactive consent"), "{combined}");
+    assert!(!state.exists(), "declined/non-interactive install must not create provider state");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn piped_json_shell_emits_structured_local_help_without_decoration() {
     let root = temp_root("piped-json");
     let output = run_piped(&root, ["--json"].as_slice(), &state_root(&root), b"/help\n/exit\n");

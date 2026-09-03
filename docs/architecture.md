@@ -1,6 +1,9 @@
 # Architecture
 
-AETHER Fx remains one binary and one process. Tokio stays on the current-thread scheduler; potentially slow filesystem and CPU work is isolated in bounded `spawn_blocking` operations.
+AETHER Fx remains one binary and one process on the inactive path. The optional browser path adds
+one separately supervised Obscura process only after `/browser` consent. Tokio stays on the
+current-thread scheduler; potentially slow filesystem and CPU work is isolated in bounded
+`spawn_blocking` operations.
 
 ```text
 aether
@@ -9,8 +12,11 @@ aether
   ├── aether-rainy
   │     ├── aether-agent (implements ModelBackend)
   │     └── rainy-sdk
-  ├── aether-tools
+  ├── aether-obscura
   │     └── aether-core
+  ├── aether-tools
+  │     ├── aether-core
+  │     └── aether-obscura
   └── aether-terminal
         └── aether-core
 ```
@@ -20,6 +26,7 @@ The runtime path is:
 ```text
 terminal input → aether-agent → ModelBackend → aether-rainy → Rainy SDK → Rainy API
                          └────── ToolExecutor → aether-tools
+                                                   └────── optional stdio MCP → Obscura → browser engine
 agent events ───────────────────────────────────────→ aether-terminal
 ```
 
@@ -89,6 +96,11 @@ process subsystem
   └── confirmed termination with bounded shutdown waits
 Rainy adapter
   └── verified terminal Responses events and opaque continuation data
+optional Obscura provider
+  ├── fixed release manifest and verified private installation
+  ├── one process + one serialized newline-delimited MCP channel per session
+  ├── validated six-tool allowlist over `BrowserSession(id)`
+  └── bounded shutdown and status-only durable summaries
 ```
 
 `aether-core` owns IDs, bounded values, typed errors, paths, permissions, events, context snapshot types, and model/tool request primitives. It has no terminal, Rainy, or platform dependency.
@@ -127,7 +139,30 @@ provider reasoning metadata remains outside the agent contract. Responses requir
 chunk. Failed, incomplete, transport-error, and unexpected-EOF paths remain backend errors. No
 provider endpoint, model catalog, or key appears elsewhere.
 
-`aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
+`aether-tools` owns exactly nine model-visible tools and implements workspace containment, output bounds, permit validation, filesystem, process, search, patch, and read-oriented Git behavior. When a validated Obscura supervisor is active, the registry is rebuilt at a turn boundary with exactly six additional fixed browser definitions. Filesystem-heavy work runs in one bounded blocking operation per tool call. `write` and `patch` share a weak-reference per-destination coordinator; multi-file patches acquire normalized keys in sorted order, then stage and revalidate before sequential commit. Persistent process registry locks cover only lookup/insert/remove/count; no process I/O is awaited while holding them. Finite commands and persistent stream reads share `ProcessRuntime` deadline/output ceilings; handles retain drain-task ownership and remain registered when kill or wait confirmation fails.
+
+`aether-obscura` is the only crate that knows the external browser wire contract. It owns the
+static v0.2.1 artifact manifest, consent-gated installation, archive verification, absolute
+process spawn, newline-delimited MCP framing, schema validation, bounded stderr/result handling,
+fixed performance audit, storage-state persistence, and shutdown. Obscura's advertised catalog is
+never copied into the AETHER model registry: provider operations map to six compiled definitions,
+and the internal evaluator used by `browser.performance_audit` is not model-visible.
+
+The optional runtime sequence is:
+
+```text
+/browser ──consent──> verify/install ──> spawn once ──> initialize/tools-list ──> active
+    │                                                                                 │
+    ├── /browser <task> → ExternalResearch (read-only)                               │
+    ├── normal prompt  → Repository mode, with browser tools still available          │
+    ├── /browser stop  → shutdown + retain private profile                            │
+    └── /clear,/exit  → shutdown + close AETHER session                               │
+```
+
+The `ExternalResearch` mode changes completion and surface policy only for the turn started by
+`/browser <task>`. It does not create a second agent or Rainy backend. Rebuilding the `Agent` for
+provider activation, stop, or model selection keeps the context snapshot, continuation identity,
+and the still-healthy supervisor separate from the agent value.
 
 Repository inventory discovery packs all Git paths into one UTF-8 slab with 32-bit ranges. Only
 bounded selected metadata is promoted to `PathBuf`s, so a 100k-file repository does not create
@@ -155,6 +190,13 @@ fact is missing or stale. None of these freshness or completion controls bypasse
 permission, canonical-path, containment, permit, or expected-hash checks.
 
 Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json` plus `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 5 stores `Started`, committed `TurnSnapshot` records, resumable `Checkpoint` records, and `Finished`. Each turn record contains only bounded metadata, minimized context (paths/hashes/ranges, structured work state, and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the latest committed turn or checkpoint, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
+
+The Obscura profile is a separate child of that same private state root, keyed by the canonical
+workspace ID. It contains only adapter-managed provider storage state; it is not part of the
+repository session JSONL and is not interpreted as AETHER context. Stopping or clearing the
+session retains that profile for a later explicit activation, while process identity, active tabs,
+and MCP request state are intentionally ephemeral. `/resume` never starts the provider merely
+because a profile exists.
 
 Context bounds (also documented on the constants in `aether-core::context`):
 

@@ -98,7 +98,9 @@ impl SessionPermissionBroker {
         let Some(pending) = state.pending.remove(call_id) else {
             return false;
         };
-        if decision == PermissionDecision::AllowSession {
+        if decision == PermissionDecision::AllowSession
+            && pending.request.class != PermissionClass::BrowserAction
+        {
             state.session_grants.insert((pending.request.tool, pending.request.class));
         }
         pending.sender.send(decision).is_ok()
@@ -197,5 +199,20 @@ mod tests {
         broker.cancel(&request.call_id);
         assert_eq!(broker.pending_count(), 0);
         assert_eq!(decision.await, PermissionDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn browser_action_allow_session_never_creates_a_session_grant() {
+        let broker = SessionPermissionBroker::new();
+        let action_request =
+            request("browser-action-1", "browser.click", PermissionClass::BrowserAction);
+        let decision = broker.decide(action_request.clone());
+        assert!(broker.resolve(&action_request.call_id, PermissionDecision::AllowSession));
+        assert_eq!(decision.await, PermissionDecision::AllowSession);
+        assert!(broker.needs_prompt(&request(
+            "browser-action-2",
+            "browser.click",
+            PermissionClass::BrowserAction
+        )));
     }
 }

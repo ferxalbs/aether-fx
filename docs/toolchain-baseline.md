@@ -26,6 +26,11 @@ Verified on 2026-09-02 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.5
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | Streaming SHA-256 verification against the release `SHA256SUMS` manifest | Update command only |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Consume the Rainy SDK stream without async-trait | Rainy stream |
 | rainy-sdk | 0.6.51 | Apache-2.0 | Official Rainy API boundary; typed Responses and Chat Completions streams, catalog, reasoning, and error APIs | Network path |
+| url | 2.5.8 | MIT OR Apache-2.0 | HTTP(S) browser URL parsing, origin sanitization, and scheme/credential boundary | Browser path only |
+| zip | 2.4.2 | MIT | Strict Windows Obscura archive extraction | Install path only |
+| tar | 0.4.46 | MIT OR Apache-2.0 | Strict Unix Obscura archive extraction | Install path only |
+| flate2 | 1.1.10 | MIT OR Apache-2.0 | Rust-backend gzip decoding for Unix Obscura archives | Install path only |
+| aether-obscura | workspace | Apache-2.0 | First-party static manifest, consent-gated installer, stdio MCP supervisor, fixed browser adapter, and private provider state | Optional browser path |
 | criterion | 0.8.2 | Apache-2.0 OR MIT | Reproducible local benchmarks | Benchmark only |
 
 The verified Rainy SDK is exactly `rainy-sdk 0.6.51`, declared with `default-features = false`. Its
@@ -34,9 +39,9 @@ disabled. The adapter consumes the public typed Responses and OpenAI-compatible 
 streams and leaves SSE framing, redirect blocking, authentication, request/response bounds, and
 SDK-owned safe-operation retries to Rainy.
 
-The updater adds only the direct `reqwest 0.13.4`, `semver 1.0.28`, and `sha2 0.10.9` dependencies. `reqwest` is compiled with `default-features = false` plus `rustls` and `system-proxy`; it does not construct a client for `--version`, `--help`, `doctor`, `sessions`, or normal shell startup. `aether-agent` continues to use `blake3` for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, or unpublished Rainy SDK version is used.
+The AETHER updater uses the direct `reqwest 0.13.4`, `semver 1.0.28`, and `sha2 0.10.9` dependencies. The optional `aether-obscura` installer reuses the workspace `reqwest` and `sha2` boundary and adds `url 2.5.8`, `zip 2.4.2`, `tar 0.4.46`, and `flate2 1.1.10` only for URL validation and verified archive installation. `reqwest` is compiled with `default-features = false` plus `rustls` and `system-proxy`; neither updater nor Obscura installer constructs a client for `--version`, `--help`, `doctor`, `sessions`, or normal shell startup. The archive parsers are not loaded by the inactive browser path at runtime beyond their compiled code; they are exercised only after explicit installation consent. `aether-agent` continues to use `blake3` for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, MCP SDK, WebMCP/OpenAI dependency, or unpublished Rainy SDK version is used.
 
-The interactive shell/model work adds no package to the resolved dependency graph. The Rainy 0.6.50
+The interactive shell/model work adds no further package beyond the optional Obscura boundary. The Rainy 0.6.50
 upgrade removes its former `eventsource-stream`/`nom` parser path and adds only the rand 0.9 family
 and its platform support dependencies; the workspace still has no second SSE parser. The existing
 workspace `serde` dependency is now declared directly by `aether` for bounded config and machine

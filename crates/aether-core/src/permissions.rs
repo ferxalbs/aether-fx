@@ -20,6 +20,10 @@ pub enum PermissionClass {
     OutsideWorkspace,
     /// A future network mutation.
     NetworkMutation,
+    /// Read-only browser access through the explicitly activated provider.
+    BrowserRead,
+    /// A future sensitive browser action, never session-scoped.
+    BrowserAction,
 }
 
 impl std::fmt::Display for PermissionClass {
@@ -32,6 +36,8 @@ impl std::fmt::Display for PermissionClass {
             Self::GitMutate => "git_mutate",
             Self::OutsideWorkspace => "outside_workspace",
             Self::NetworkMutation => "network_mutation",
+            Self::BrowserRead => "browser_read",
+            Self::BrowserAction => "browser_action",
         })
     }
 }
@@ -67,6 +73,7 @@ pub struct PermissionRequest {
 
 /// Explicit permission policy. Read-only workspace operations are allowed by default.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
 pub struct PermissionPolicy {
     /// Allow read-only operations.
     pub read_only: bool,
@@ -82,6 +89,10 @@ pub struct PermissionPolicy {
     pub outside_workspace: bool,
     /// Allow network mutations.
     pub network_mutation: bool,
+    /// Allow read-only browser operations after an explicit session decision.
+    pub browser_read: bool,
+    /// Allow sensitive browser actions. Kept false in the v1 surface.
+    pub browser_action: bool,
 }
 
 impl Default for PermissionPolicy {
@@ -94,6 +105,8 @@ impl Default for PermissionPolicy {
             git_mutate: false,
             outside_workspace: false,
             network_mutation: false,
+            browser_read: false,
+            browser_action: false,
         }
     }
 }
@@ -109,6 +122,8 @@ impl PermissionPolicy {
             git_mutate: true,
             outside_workspace: true,
             network_mutation: true,
+            browser_read: true,
+            browser_action: true,
         }
     }
 
@@ -121,6 +136,8 @@ impl PermissionPolicy {
             PermissionClass::GitMutate => self.git_mutate,
             PermissionClass::OutsideWorkspace => self.outside_workspace,
             PermissionClass::NetworkMutation => self.network_mutation,
+            PermissionClass::BrowserRead => self.browser_read,
+            PermissionClass::BrowserAction => self.browser_action,
         }
     }
 }
@@ -177,5 +194,22 @@ mod tests {
         };
         assert!(engine.requires_confirmation(&request));
         assert!(engine.authorize(&request).is_err());
+    }
+
+    #[test]
+    fn browser_read_is_confirmation_gated_and_browser_action_is_not_session_policy() {
+        let engine = PermissionEngine::new(PermissionPolicy::default());
+        let request = PermissionRequest {
+            call_id: ToolCallId::new("browser-call").unwrap(),
+            tool: "browser.navigate".to_owned(),
+            class: PermissionClass::BrowserRead,
+            operation: "use browser session".to_owned(),
+            target: Some("https://example.com".to_owned()),
+            details: serde_json::json!({"origin": "https://example.com"}),
+        };
+        assert!(engine.requires_confirmation(&request));
+        assert!(engine.authorize(&request).is_err());
+        assert!(!PermissionPolicy::default().browser_action);
+        assert!(PermissionPolicy::allow_all().browser_action);
     }
 }

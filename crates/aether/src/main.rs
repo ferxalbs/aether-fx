@@ -10,12 +10,16 @@ use std::sync::{Arc, Mutex};
 use aether_agent::{
     Agent, AgentError, AgentRequest, AgentRunResult, AllowAllPermissionBroker, CancellationToken,
     ModelBackend, NoPermissionBroker, PermissionBroker, PersistCheckpoint, PersistTurn,
-    ResumableSession, SessionPermissionBroker, SessionStore, SessionStoreError, persist_checkpoint,
-    persist_turn,
+    ResumableSession, SessionPermissionBroker, SessionStore, SessionStoreError, TurnMode,
+    persist_checkpoint, persist_turn,
 };
 use aether_core::{
     AgentEvent, BoundedText, ContextSnapshot, OpaqueContinuation, PermissionRequest, SessionId,
     SessionRecord, ToolExecutor, TurnId,
+};
+use aether_obscura::{
+    ObscuraError, ObscuraInstallationStatus, ObscuraPaths, ObscuraStatus, ObscuraSupervisor,
+    current_artifact, inspect_installation, install_obscura,
 };
 use aether_rainy::{ModelView, RainyBackend};
 use aether_terminal::{ModelSelectionItem, Renderer, SelectorItem, SelectorOutcome};
@@ -46,6 +50,8 @@ enum AppError {
     Config(#[from] config::ConfigError),
     #[error(transparent)]
     Update(#[from] updater::UpdateError),
+    #[error(transparent)]
+    Obscura(#[from] ObscuraError),
     #[error("runtime initialization failed: {0}")]
     Runtime(String),
 }
@@ -347,14 +353,20 @@ fn print_help(topic: Option<&str>) {
         Some("update") => println!(
             "aether update [--json] /update\n\nCheck the official AETHER Fx release and install a newer validated binary without elevation."
         ),
+        Some("browser") => println!(
+            "aether /browser [task|status|stop|update]\n\nInstall or start the pinned Obscura MCP browser after explicit consent. Browser research is read-only; the provider remains active until /browser stop, /clear, /exit, or normal session close."
+        ),
         Some(topic) => println!("no help topic named {}; run aether help", safe_message(topic)),
-        None => println!(
-            "AETHER Fx {VERSION}\n\n\
+        None => {
+            println!(
+                "AETHER Fx {VERSION}\n\n\
              Usage:\n  aether [OPTIONS] [PROMPT]\n  aether resume <session>|--latest\n  aether sessions\n  aether models [--json]\n  aether doctor [--network]\n  aether update [--json]\n  aether config path|show|edit\n  aether auth\n\n\
              Interactive commands:\n  /model     Choose a live Rainy model\n  /status    Show session, model, workflow, and permission state\n  /context   Show bounded context and workflow evidence\n  /config    Show or update local preferences\n  /auth      Show credential status or enter a key for this process\n  /sessions  Pick a local session\n  /resume    Restore a local session\n  /doctor    Run offline diagnostics\n  /update    Update AETHER Fx and leave the shell\n  /help      Show this help\n  /clear     Start a fresh local session\n  /exit      Finish and leave the shell\n\n\
              Options:\n  --model <id>       Select a Rainy model\n  --root <dir>       Set the workspace root\n  --json             Emit one JSON object per completed turn\n  --yolo             Allow tools without permission prompts\n  --non-interactive  Disable interactive selection and secret entry\n  --network          Allow doctor/model network discovery where applicable\n  --latest           Resume the newest valid local session\n  -h, --help         Show help\n  -V, --version      Show version\n\n\
              Sessions are stored as bounded JSONL in private OS application-state storage."
-        ),
+            );
+            println!("  /browser   Install/start Obscura or run read-only web research");
+        }
     }
 }
 
@@ -369,6 +381,7 @@ fn print_help_json(topic: Option<&str>) -> Result<(), AppError> {
         ("/resume", "Pick and restore a local session"),
         ("/doctor", "Run offline diagnostics"),
         ("/update", "Update AETHER Fx and leave the shell"),
+        ("/browser", "Install/start Obscura or run read-only web research"),
         ("/help", "Show local commands"),
         ("/clear", "Start a fresh local session"),
         ("/exit", "Finish and leave the shell"),
@@ -848,6 +861,7 @@ struct SessionRuntime {
     backend: Option<RainyBackend>,
     agent: Option<Agent<RainyBackend, ToolRegistry>>,
     workspace: Option<Arc<aether_tools::Workspace>>,
+    obscura: Option<Arc<ObscuraSupervisor>>,
     store: Option<Arc<Mutex<SessionStore>>>,
     session_id: Option<SessionId>,
     continuation: Option<OpaqueContinuation>,
@@ -919,6 +933,7 @@ impl SessionRuntime {
             backend: None,
             agent: None,
             workspace: None,
+            obscura: None,
             store: None,
             session_id,
             continuation,
@@ -976,7 +991,15 @@ impl SessionRuntime {
     }
 
     async fn run_turn_or_report(&mut self, prompt: String) -> Result<(), AppError> {
-        match self.run_turn(prompt).await {
+        self.run_turn_or_report_mode(prompt, TurnMode::Repository).await
+    }
+
+    async fn run_turn_or_report_mode(
+        &mut self,
+        prompt: String,
+        mode: TurnMode,
+    ) -> Result<(), AppError> {
+        match self.run_turn_mode(prompt, mode).await {
             Err(error) if self.interactive_ui => {
                 eprintln!("AETHER Fx: {}", safe_message(&error.to_string()));
                 Ok(())
@@ -1006,6 +1029,10 @@ impl SessionRuntime {
     }
 
     async fn run_command(&mut self, command: &str) -> Result<ShellControl, AppError> {
+        if is_browser_command(command) {
+            self.run_browser_command(command).await?;
+            return Ok(ShellControl::Continue);
+        }
         match command {
             "/help" => {
                 if self.json_output {
@@ -1046,6 +1073,226 @@ impl SessionRuntime {
             }
         }
         Ok(ShellControl::Continue)
+    }
+
+    async fn run_browser_command(&mut self, command: &str) -> Result<(), AppError> {
+        let argument = command.strip_prefix("/browser").unwrap_or_default().trim();
+        match argument {
+            "" => {
+                self.ensure_obscura().await?;
+                self.print_browser_status().await
+            }
+            "status" => self.print_browser_status().await,
+            "stop" => self.stop_obscura().await,
+            "update" => self.update_obscura().await,
+            task => {
+                self.ensure_obscura().await?;
+                self.run_turn_or_report_mode(task.to_owned(), TurnMode::ExternalResearch).await
+            }
+        }
+    }
+
+    fn obscura_paths(&self) -> Result<ObscuraPaths, AppError> {
+        let artifact = current_artifact()?;
+        let config_path = SessionStore::config_path(&self.root)?;
+        let state_root = config_path
+            .parent()
+            .ok_or_else(|| AppError::Message("AETHER state root has no parent".to_owned()))?;
+        let workspace_id = SessionStore::workspace_id(&self.root)?;
+        Ok(ObscuraPaths::for_workspace(state_root, workspace_id, artifact))
+    }
+
+    async fn ensure_obscura(&mut self) -> Result<(), AppError> {
+        if let Some(provider) = self.obscura.as_ref()
+            && provider.status().await?.active
+            && provider.is_healthy()
+        {
+            return Ok(());
+        }
+        if let Some(provider) = self.obscura.take() {
+            let _ = provider.shutdown().await;
+        }
+
+        let paths = self.obscura_paths()?;
+        let status = inspect_installation(&paths).await?;
+        if status.installed_version.is_some() && !status.version_matches {
+            return Err(AppError::Message(format!(
+                "the installed Obscura pin does not match AETHER's fixed {} pin; run /browser update before using it",
+                paths.artifact().version
+            )));
+        }
+        if !status.installed {
+            self.confirm_obscura_install(paths.artifact()).await?;
+            let report = install_obscura(&paths).await?;
+            if !self.json_output {
+                println!(
+                    "installed Obscura {} for {}",
+                    safe_message(&report.version),
+                    safe_message(&report.target)
+                );
+            }
+        }
+
+        let had_agent = self.agent.is_some();
+        let provider = ObscuraSupervisor::launch(paths).await?;
+        if had_agent && let Err(error) = self.reset_agent_for_model_switch().await {
+            let _ = provider.shutdown().await;
+            return Err(error);
+        }
+        self.obscura = Some(provider);
+        if had_agent {
+            self.ensure_agent().await?;
+        }
+        if !self.json_output {
+            println!("Obscura {} is active", safe_message(self.obscura_version()));
+        }
+        Ok(())
+    }
+
+    async fn confirm_obscura_install(
+        &self,
+        artifact: &'static aether_obscura::ObscuraArtifact,
+    ) -> Result<(), AppError> {
+        if !self.json_output {
+            println!("Obscura is not installed for this AETHER build.");
+            println!("  version: {}", safe_message(artifact.version));
+            println!("  target: {}", safe_message(artifact.target));
+            println!("  asset: {}", safe_message(artifact.asset_name));
+            println!("  size: {} bytes", artifact.archive_size);
+            println!("  source: {}", safe_message(artifact.url));
+            println!("  SHA-256: {}", safe_message(artifact.sha256));
+            println!("  MCP: {}", safe_message(artifact.mcp_protocol_version));
+        }
+        if !self.interactive_ui {
+            return Err(AppError::Message(
+                "Obscura installation requires explicit interactive consent; no files or process were created"
+                    .to_owned(),
+            ));
+        }
+        let prompt =
+            format!("Install verified Obscura {} for {}?", artifact.version, artifact.target);
+        let accepted =
+            tokio::task::spawn_blocking(move || aether_terminal::confirm(&prompt, false))
+                .await
+                .map_err(|error| {
+                    AppError::Message(format!("installation confirmation worker failed: {error}"))
+                })?
+                .map_err(AppError::Io)?
+                .unwrap_or(false);
+        if !accepted {
+            return Err(AppError::Message(
+                "Obscura installation was not approved; no files or process were created"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn print_browser_status(&mut self) -> Result<(), AppError> {
+        let status = if let Some(provider) = self.obscura.as_ref() {
+            provider.status().await?
+        } else {
+            let paths = self.obscura_paths()?;
+            let installation = inspect_installation(&paths).await?;
+            obscura_status_from_installation(&paths, installation)
+        };
+        let object = serde_json::json!({
+            "provider": "obscura",
+            "target": current_artifact()?.target,
+            "fixed_version": status.expected_version,
+            "installed": status.installed,
+            "installed_version": status.installed_version,
+            "active": status.active,
+            "healthy": status.healthy,
+            "mcp_protocol": status.mcp_protocol_version,
+            "profile": status.profile_id,
+        });
+        if self.json_output {
+            println!(
+                "{}",
+                serde_json::to_string(&object)
+                    .map_err(|error| AppError::Message(error.to_string()))?
+            );
+        } else {
+            println!(
+                "Obscura: installed={} active={} healthy={} version={} MCP={} profile={}",
+                if status.installed { "yes" } else { "no" },
+                if status.active { "yes" } else { "no" },
+                if status.healthy { "yes" } else { "no" },
+                safe_message(&status.expected_version),
+                status
+                    .mcp_protocol_version
+                    .as_deref()
+                    .map_or_else(|| "inactive".to_owned(), safe_message),
+                safe_message(&status.profile_id)
+            );
+            if let Some(installed) = status.installed_version.as_deref()
+                && installed != status.expected_version
+            {
+                println!("installed pin: {installed} (run /browser update)");
+            }
+        }
+        Ok(())
+    }
+
+    async fn stop_obscura(&mut self) -> Result<(), AppError> {
+        let provider = self.obscura.take();
+        let had_agent = self.agent.is_some();
+        let shutdown_error =
+            if let Some(provider) = provider { provider.shutdown().await.err() } else { None };
+        if had_agent {
+            self.reset_agent_for_model_switch().await?;
+            self.ensure_agent().await?;
+        }
+        if let Some(error) = shutdown_error {
+            return Err(AppError::Obscura(error));
+        }
+        if !self.json_output {
+            println!("Obscura stopped; the private browser profile was preserved");
+        }
+        Ok(())
+    }
+
+    async fn update_obscura(&mut self) -> Result<(), AppError> {
+        if let Some(provider) = self.obscura.as_ref()
+            && provider.status().await?.active
+        {
+            return Err(AppError::Message(
+                "Obscura is active; run /browser stop before /browser update".to_owned(),
+            ));
+        }
+        if let Some(provider) = self.obscura.take() {
+            let _ = provider.shutdown().await;
+        }
+        let paths = self.obscura_paths()?;
+        let status = inspect_installation(&paths).await?;
+        if status.installed && status.version_matches {
+            if !self.json_output {
+                println!("Obscura {} is already installed", paths.artifact().version);
+            }
+            return Ok(());
+        }
+        self.confirm_obscura_install(paths.artifact()).await?;
+        let report = install_obscura(&paths).await?;
+        if self.json_output {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "provider": "obscura",
+                    "updated": report.updated,
+                    "version": report.version,
+                    "target": report.target,
+                }))
+                .map_err(|error| AppError::Message(error.to_string()))?
+            );
+        } else {
+            println!("Obscura {} is ready; run /browser to start it", report.version);
+        }
+        Ok(())
+    }
+
+    fn obscura_version(&self) -> &str {
+        self.obscura.as_ref().map_or("unknown", |provider| provider.artifact().version)
     }
 
     async fn ensure_backend(&mut self) -> Result<&RainyBackend, AppError> {
@@ -1236,7 +1483,7 @@ impl SessionRuntime {
             return Ok(());
         }
         let backend = self.ensure_backend().await?.clone();
-        let tools = new_tool_registry(self.root.clone()).await?;
+        let tools = new_tool_registry(self.root.clone(), self.obscura.clone()).await?;
         self.workspace = Some(Arc::new(tools.workspace().clone()));
         self.agent = Some(Agent::new(backend, tools));
         let session_id = self.session_id.clone().unwrap_or(new_session_id()?);
@@ -1250,7 +1497,7 @@ impl SessionRuntime {
         Ok(())
     }
 
-    async fn run_turn(&mut self, prompt: String) -> Result<(), AppError> {
+    async fn run_turn_mode(&mut self, prompt: String, mode: TurnMode) -> Result<(), AppError> {
         self.ensure_agent().await?;
         self.turn_number = self.turn_number.saturating_add(1);
         let session_id = self.session_id.clone().expect("session initialized");
@@ -1264,6 +1511,7 @@ impl SessionRuntime {
         request.workspace_root = Some(self.root.display().to_string());
         request.context_seed = self.context_seed.clone();
         request.metrics = self.json_output;
+        request.mode = mode;
         let no_permissions = NoPermissionBroker;
         let allow_all = AllowAllPermissionBroker;
         let broker: &dyn PermissionBroker = if self.yolo {
@@ -1321,8 +1569,25 @@ impl SessionRuntime {
             Err(error) => {
                 let agent = self.agent.as_ref().expect("agent initialized");
                 persist_incomplete_turn(store, &turn_id, agent, false).await?;
+                self.detach_unhealthy_obscura().await?;
                 return Err(error);
             }
+        }
+        self.detach_unhealthy_obscura().await?;
+        Ok(())
+    }
+
+    async fn detach_unhealthy_obscura(&mut self) -> Result<(), AppError> {
+        let unhealthy = self.obscura.as_ref().is_some_and(|provider| !provider.is_healthy());
+        if !unhealthy {
+            return Ok(());
+        }
+        if let Some(provider) = self.obscura.take() {
+            let _ = provider.shutdown().await;
+        }
+        if self.agent.is_some() {
+            self.reset_agent_for_model_switch().await?;
+            self.ensure_agent().await?;
         }
         Ok(())
     }
@@ -1665,6 +1930,11 @@ impl SessionRuntime {
 
     async fn close_current(&mut self) -> Result<(), AppError> {
         let mut first_error = None;
+        if let Some(provider) = self.obscura.take()
+            && let Err(error) = provider.shutdown().await
+        {
+            first_error = Some(AppError::Obscura(error));
+        }
         if let Some(store) = self.store.take()
             && let Err(error) = persist_finished(&store).await
         {
@@ -1705,6 +1975,29 @@ impl SessionRuntime {
     }
 }
 
+fn is_browser_command(command: &str) -> bool {
+    command == "/browser"
+        || command
+            .strip_prefix("/browser")
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(char::is_whitespace)
+}
+
+fn obscura_status_from_installation(
+    paths: &ObscuraPaths,
+    installation: ObscuraInstallationStatus,
+) -> ObscuraStatus {
+    ObscuraStatus {
+        installed: installation.installed,
+        active: false,
+        healthy: false,
+        expected_version: paths.artifact().version.to_owned(),
+        installed_version: installation.installed_version,
+        mcp_protocol_version: None,
+        profile_id: paths.profile_id().to_owned(),
+    }
+}
+
 fn clean_model(model: Option<String>) -> Option<String> {
     model.filter(|value| {
         !value.trim().is_empty()
@@ -1735,6 +2028,7 @@ fn command_items() -> Vec<SelectorItem<String>> {
         ("/resume", "Resume", "Pick and restore a local session"),
         ("/doctor", "Doctor", "Run offline diagnostics"),
         ("/update", "Update", "Update AETHER Fx and leave the shell"),
+        ("/browser", "Browser", "Install/start Obscura or run read-only web research"),
         ("/help", "Help", "Show local commands"),
         ("/clear", "Clear", "Finish this session and start a fresh one"),
         ("/exit", "Exit", "Finish this session and leave the shell"),
@@ -1946,11 +2240,20 @@ fn report_shutdown_failure(report: &ProcessShutdownReport) {
     );
 }
 
-async fn new_tool_registry(root: PathBuf) -> Result<ToolRegistry, AppError> {
-    tokio::task::spawn_blocking(move || ToolRegistry::new(root))
-        .await
-        .map_err(|error| AppError::Message(format!("tool registry worker failed: {error}")))?
-        .map_err(AppError::Message)
+async fn new_tool_registry(
+    root: PathBuf,
+    obscura: Option<Arc<ObscuraSupervisor>>,
+) -> Result<ToolRegistry, AppError> {
+    tokio::task::spawn_blocking(move || {
+        let workspace = aether_tools::Workspace::new(root).map_err(|error| error.to_string())?;
+        Ok::<_, String>(match obscura {
+            Some(obscura) => ToolRegistry::with_obscura(workspace, obscura),
+            None => ToolRegistry::with_workspace(workspace),
+        })
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("tool registry worker failed: {error}")))?
+    .map_err(AppError::Message)
 }
 
 fn configured_model_from(
@@ -2188,6 +2491,15 @@ mod tests {
         assert_eq!(configured_model_from(None, Some("env-model".to_owned())).unwrap(), "env-model");
         let error = configured_model_from(None, None).unwrap_err().to_string();
         assert!(error.contains("--model") && error.contains("AETHER_MODEL"));
+    }
+
+    #[test]
+    fn browser_commands_are_local_and_do_not_match_similar_prompt_text() {
+        assert!(is_browser_command("/browser"));
+        assert!(is_browser_command("/browser status"));
+        assert!(is_browser_command("/browser investigate the docs"));
+        assert!(!is_browser_command("/browsering"));
+        assert!(!is_browser_command("tell me /browser status"));
     }
 
     #[test]

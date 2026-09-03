@@ -22,7 +22,7 @@ mod verification;
 mod working_set;
 
 pub use aether_core::{CommandClass, CommandEffects};
-pub use agent::{Agent, AgentError, AgentMetrics, AgentRequest, AgentRunResult};
+pub use agent::{Agent, AgentError, AgentMetrics, AgentRequest, AgentRunResult, TurnMode};
 pub use backend::{BackendError, BackendFuture, BackendStream, ModelBackend, ModelCatalogItem};
 pub use cancellation::CancellationToken;
 pub use context::{ContextEngine, capture_git_snapshot};

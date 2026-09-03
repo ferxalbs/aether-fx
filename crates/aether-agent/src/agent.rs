@@ -24,6 +24,17 @@ use crate::{
 };
 
 /// A user-requested agent turn.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnMode {
+    /// Repository-aware coding workflow with the normal mutation and verification barriers.
+    #[default]
+    Repository,
+    /// Read-only external research with browser and local inspection tools.
+    ExternalResearch,
+}
+
+/// A user-requested agent turn.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentRequest {
     /// Local session identity.
@@ -53,6 +64,9 @@ pub struct AgentRequest {
     /// Enable deterministic local planning and redundant-observation suppression.
     #[serde(default = "default_true")]
     pub optimize: bool,
+    /// Select the completion and tool-surface policy for this turn.
+    #[serde(default)]
+    pub mode: TurnMode,
 }
 
 const fn default_true() -> bool {
@@ -74,6 +88,7 @@ impl AgentRequest {
             context_seed: None,
             metrics: false,
             optimize: true,
+            mode: TurnMode::Repository,
         }
     }
 }
@@ -272,7 +287,9 @@ where
         let mut continuation = request.continuation.clone();
         let mut policy = AutonomousCodingPolicy::new();
         policy.set_optimizations_enabled(request.optimize);
-        self.with_context(|engine| policy.refresh_candidates(engine));
+        if request.mode == TurnMode::Repository {
+            self.with_context(|engine| policy.refresh_candidates(engine));
+        }
         let user_content =
             assemble_user_content(&request.prompt, self.context_packet(continuation.is_some()));
         let mut input = assemble_user_input_content(&user_content);
@@ -320,8 +337,12 @@ where
             let step_id = StepId::new(format!("{}.{}", request.turn_id, steps))
                 .map_err(|error| AgentError::Tool(error.to_string()))?;
             let current_snapshot = self.current_context();
-            let active_tools = if request.optimize {
-                Arc::new(policy.select_tool_surface(&current_snapshot, &self.tool_definitions))
+            let active_tools = if request.mode == TurnMode::ExternalResearch || request.optimize {
+                Arc::new(policy.select_tool_surface_for_mode(
+                    &current_snapshot,
+                    &self.tool_definitions,
+                    request.mode,
+                ))
             } else {
                 Arc::clone(&self.tool_definitions)
             };
@@ -504,27 +525,46 @@ where
                 });
             }
 
-            let prepared_calls = tool_calls
+            let mut prepared_calls = tool_calls
                 .into_iter()
                 .map(|(call_id, name, input)| {
                     self.tools.prepare(ToolInvocation { call_id, name, input })
                 })
                 .collect::<Vec<_>>();
 
-            if prepared_calls.is_empty() {
-                self.refresh_before_completion(&cancellation).await?;
-                if self.with_context(|engine| {
-                    engine.snapshot().workspace_changed
-                        || engine.snapshot().inspected.iter().any(|file| file.stale)
-                }) && let Some(metrics) = &mut metrics
-                {
-                    metrics.value.stale_evidence_violations =
-                        metrics.value.stale_evidence_violations.saturating_add(1);
+            if request.mode == TurnMode::ExternalResearch {
+                // Do not prompt for an operation that this mode will reject anyway. The gate
+                // below remains the hard boundary; removing the permission request only keeps a
+                // model-invented mutation from becoming a misleading user approval prompt.
+                for action in &mut prepared_calls {
+                    if !is_external_research_tool(&action.tool) {
+                        action.permission_request = None;
+                        action.requirements.user_authorization = false;
+                    }
                 }
-                let complete = self.with_context(|engine| {
-                    engine.set_continuation(continuation.clone());
-                    policy.finish_turn(engine)
-                });
+            }
+
+            if prepared_calls.is_empty() {
+                let complete = if request.mode == TurnMode::ExternalResearch {
+                    self.with_context(|engine| {
+                        engine.set_continuation(continuation.clone());
+                        policy.finish_external_research(engine)
+                    })
+                } else {
+                    self.refresh_before_completion(&cancellation).await?;
+                    if self.with_context(|engine| {
+                        engine.snapshot().workspace_changed
+                            || engine.snapshot().inspected.iter().any(|file| file.stale)
+                    }) && let Some(metrics) = &mut metrics
+                    {
+                        metrics.value.stale_evidence_violations =
+                            metrics.value.stale_evidence_violations.saturating_add(1);
+                    }
+                    self.with_context(|engine| {
+                        engine.set_continuation(continuation.clone());
+                        policy.finish_turn(engine)
+                    })
+                };
                 if !complete {
                     blocked_completions = blocked_completions.saturating_add(1);
                     let feedback = self.with_context(|engine| {
@@ -567,14 +607,15 @@ where
             blocked_completions = 0;
 
             let snapshot = self.current_context();
-            let planner_plan =
-                if prepared_calls.iter().all(|action| action.permission_request.is_none()) {
-                    self.with_context(|engine| {
-                        policy.repository_plan_for_actions(engine.snapshot(), &prepared_calls)
-                    })
-                } else {
-                    None
-                };
+            let planner_plan = if request.mode == TurnMode::Repository
+                && prepared_calls.iter().all(|action| action.permission_request.is_none())
+            {
+                self.with_context(|engine| {
+                    policy.repository_plan_for_actions(engine.snapshot(), &prepared_calls)
+                })
+            } else {
+                None
+            };
             if planner_plan.is_some()
                 && let Some(metrics) = &mut metrics
             {
@@ -587,6 +628,7 @@ where
             let gate = AgentToolGate {
                 workflow: WorkflowMutationGate { snapshot: snapshot.clone() },
                 policy: &policy,
+                mode: request.mode,
             };
             let completed = if planner_plan.as_ref().is_some_and(RepositoryActionPlan::is_usable) {
                 let plan = planner_plan.expect("usable planner plan is present");
@@ -638,7 +680,7 @@ where
                     false,
                 );
             }
-            if request.optimize && mutation_executed {
+            if request.mode == TurnMode::Repository && request.optimize && mutation_executed {
                 self.execute_pending_verifications(
                     &mut policy,
                     &request.turn_id,
@@ -865,7 +907,11 @@ where
                 break;
             }
             let snapshot = self.current_context();
-            let gate = AgentToolGate { workflow: WorkflowMutationGate { snapshot }, policy };
+            let gate = AgentToolGate {
+                workflow: WorkflowMutationGate { snapshot },
+                policy,
+                mode: TurnMode::Repository,
+            };
             let completed = crate::scheduler::execute_prepared_tool_calls_with_gate(
                 self.tools.as_ref(),
                 vec![action],
@@ -1199,10 +1245,35 @@ struct WorkflowMutationGate {
 struct AgentToolGate<'a> {
     workflow: WorkflowMutationGate,
     policy: &'a AutonomousCodingPolicy,
+    mode: TurnMode,
 }
 
 impl ToolCallGate for AgentToolGate<'_> {
     fn preflight(&self, action: &aether_core::PreparedAction) -> Option<ToolResult> {
+        if self.mode == TurnMode::ExternalResearch
+            && !matches!(
+                action.tool.as_str(),
+                "read"
+                    | "list"
+                    | "find"
+                    | "search"
+                    | "git"
+                    | "browser.tabs"
+                    | "browser.navigate"
+                    | "browser.snapshot"
+                    | "browser.find"
+                    | "browser.wait"
+                    | "browser.performance_audit"
+            )
+        {
+            return Some(ToolResult::failure(
+                action.call_id.clone(),
+                "research_tool_blocked",
+                "this read-only research turn cannot mutate the workspace or run arbitrary tools",
+                false,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ));
+        }
         self.policy
             .preflight_prepared(&self.workflow.snapshot, action)
             .or_else(|| self.workflow.preflight(action))
@@ -1339,6 +1410,23 @@ fn extract_work_update(text: &str) -> Option<serde_json::Value> {
     }
     let value: serde_json::Value = serde_json::from_str(text[start..end].trim()).ok()?;
     value.is_object().then_some(value)
+}
+
+fn is_external_research_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "list"
+            | "find"
+            | "search"
+            | "git"
+            | "browser.tabs"
+            | "browser.navigate"
+            | "browser.snapshot"
+            | "browser.find"
+            | "browser.wait"
+            | "browser.performance_audit"
+    )
 }
 
 #[cfg(test)]

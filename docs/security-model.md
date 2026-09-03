@@ -6,7 +6,7 @@ Filesystem tools accept a canonical workspace root. User paths are rejected when
 
 ## Permissions
 
-The typed permission classes are `ReadOnly`, `WorkspaceWrite`, `ProcessExecute`, `ProcessPersistent`, `GitMutate`, `OutsideWorkspace`, and `NetworkMutation`. Read-only calls receive an automatic permit. Other calls produce a structured request and are resolved as allow once, allow for the current session, or deny. Session grants are keyed by tool name plus permission class; a shell grant cannot authorize `write` or `git`.
+The typed permission classes are `ReadOnly`, `WorkspaceWrite`, `ProcessExecute`, `ProcessPersistent`, `GitMutate`, `OutsideWorkspace`, `NetworkMutation`, `BrowserRead`, and `BrowserAction`. Ordinary read-only calls receive an automatic permit; `BrowserRead` is separately gated on first browser use. Other calls produce a structured request and are resolved as allow once, allow for the current session, or deny. Session grants are keyed by tool name plus permission class; a shell grant cannot authorize `write` or `git`, and a future sensitive browser action cannot receive a session grant.
 
 The agent passes an `ExecutionPermit` into every tool. The tool validates the exact `call_id`, tool name, and permission class before mutation or process execution, so a terminal prompt is not the only authorization boundary. Interactive approval is fail-closed when stdin is not an interactive terminal.
 
@@ -158,3 +158,61 @@ helper output, or other credential material.
 ## Dangerous operations
 
 The v0.1 Git contract exposes status, diff, show, log, and branch inspection. Push, remote mutation, hard reset, rebase, filter-branch, and automatic commit are absent. Shell execution is direct argv by default and is permission-gated.
+
+## External Obscura provider
+
+Obscura is a separately distributed process, not a library linked into the AETHER browser or
+workspace path. The adapter accepts only the exact v0.2.1 artifact selected by the compiled target
+manifest. It shows the release metadata and requires explicit interactive consent before any
+download; `--yolo` is deliberately not part of that decision. The installer follows only HTTPS
+redirects from the fixed GitHub asset URL, enforces the embedded size and SHA-256, extracts exactly
+the expected binary and worker, rejects symlinks/reparse points and unsafe archive members,
+validates the exact `obscura --version` output, and activates the version directory atomically.
+No package manager, sudo, UAC, environment-provided replacement binary, or remote `latest` lookup
+is used. A download or validation failure does not replace a previous installation. The upstream
+Obscura v0.2.1 project and release binary are Apache-2.0; direct adapter dependency notices are
+listed in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
+
+The process is spawned from an absolute validated path without a shell, with a private working
+directory, cleared inherited environment, and piped stdio. `RAINY_API_KEY`, proxy credentials, and
+unrelated host variables are not inherited. One MCP channel is serialized per AETHER session;
+frames, results, stderr, and request duration are capped. The handshake requires MCP
+`2024-11-05`, `notifications/initialized`, and a compatible `tools/list`. Extra tools are ignored,
+provider descriptions are never used as model instructions, and `tools/list_changed` or any
+unsupported server message fails closed. Timeout/cancellation and process failure invalidate the
+supervisor, so a crash cannot trigger a silent restart or download. Shutdown closes stdin, waits a
+bounded interval, then terminates the parent as a fallback.
+
+## Browser network and page-content boundary
+
+AETHER rejects `file:`, `data:`, `javascript:`, `chrome:`, and `devtools:` URLs, embedded
+credentials, and literal private, metadata, unique-local, link-local, multicast, unspecified,
+documentation, and reserved addresses. The provider's resolver and redirect checks must reject a
+public hostname that resolves or redirects to a forbidden destination; URL parsing in AETHER
+cannot by itself prove the effective destination. AETHER never passes Obscura's broad
+`--allow-private-network` option or its environment equivalent.
+
+The published v0.2.1 provider blocks loopback together with private addresses when its safe default
+is active. Because that release has no loopback-only option, AETHER rejects `localhost`,
+`127.0.0.0/8`, and `::1` rather than weakening the policy. The effective v1 surface is therefore
+public HTTP/HTTPS only until a future Obscura release publishes a narrow loopback contract. No
+existing Chrome profile is opened, and no workspace file is exposed through `file:`.
+
+The model-visible allowlist is exactly six read-oriented operations. `browser.snapshot` is bounded
+visible text, `browser.find` is bounded search, and `browser.performance_audit` invokes only an
+adapter-owned fixed expression. Click, type, submit, arbitrary JavaScript, downloads, screenshots,
+PDFs, and generic MCP passthrough are not registered. Each call requires `BrowserRead` on first
+use and carries an exclusive `BrowserSession(id)` footprint. `BrowserAction` exists as a reserved
+class only; it is disabled in v1 and cannot be converted into an `AllowSession` grant.
+
+External research is a distinct agent mode. It exposes browser tools and local read-only
+inspection, rejects mutating or process tools even when a model invents their names, and completes
+without repository evidence requirements. Page content is data, not user authorization or system
+instructions. Durable session state keeps only status summaries such as `browser.snapshot ok`;
+cookies/storage state is private provider state, while page bodies, HTML, authorization headers,
+complete MCP payloads, request/process IDs, and page instructions are not persisted.
+
+WebMCP is not dynamically enabled by this integration. A future page-tool adapter must validate
+origin, tab, document, and schema identity, invalidate page tools after navigation, and treat
+page-provided descriptions as untrusted content. It must not add a private OpenAI API dependency
+or let a page, Obscura, or the model grant its own permissions.

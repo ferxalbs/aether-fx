@@ -78,7 +78,11 @@ pub fn prompt_permission(request: &PermissionRequest) -> io::Result<PermissionPr
         let details = serde_json::to_string(&request.details).unwrap_or_else(|_| "{}".to_owned());
         write!(stdout, "\n  {}", truncate_display(&sanitize_terminal_text(&details), 1024))?;
     }
-    stdout.write_all(b"\n\n[y] allow once\n[s] allow session\n[n] deny\n")?;
+    if request.class == aether_core::PermissionClass::BrowserAction {
+        stdout.write_all(b"\n\n[y] allow once\n[n] deny\n")?;
+    } else {
+        stdout.write_all(b"\n\n[y] allow once\n[s] allow session\n[n] deny\n")?;
+    }
     stdout.flush()?;
     let decision = read_permission_outcome(&mut io::stdin().lock())?;
     stdout.write_all(b"\n")?;

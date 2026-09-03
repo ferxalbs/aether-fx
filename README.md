@@ -154,6 +154,24 @@ The default `aether doctor` is offline and reports whether the local executable 
 it never contacts GitHub. `aether models` explicitly retrieves the live Rainy catalog, while
 `aether doctor --network` adds an explicit catalog/reachability probe.
 
+### Optional browser provider
+
+Obscura is an optional external provider. Use `/browser` to install the exact pinned release after
+an explicit consent prompt, or `/browser <task>` for bounded, read-only web research. Installation
+shows the target, asset size, source URL, SHA-256, and MCP protocol; it never resolves `latest`,
+uses a package manager/elevation, or treats `--yolo` as download consent. The verified provider
+state and workspace-isolated browser storage live outside the repository. `/browser status`,
+`/browser stop`, and `/browser update` manage the process and fixed pin; `stop`, `/clear`, and
+session exit retain the private profile but do not retain the process or active tabs.
+
+The active model surface contains only `browser.tabs`, `browser.navigate`, `browser.snapshot`,
+`browser.find`, `browser.wait`, and `browser.performance_audit`. It does not expose clicks, typing,
+submits, arbitrary JavaScript, downloads, screenshots, or generic MCP passthrough. A normal coding
+turn can reuse an already healthy provider, while the inactive path adds no Obscura process,
+browser profile, socket, or release-catalog request. The current upstream v0.2.1 binary blocks
+loopback as part of its broad private-network policy, so AETHER supports public HTTP/HTTPS only
+until a narrow loopback contract exists. See [`docs/obscura-provider.md`](docs/obscura-provider.md).
+
 ## Resume
 
 Sessions are stored in private OS application-state storage outside the repository:

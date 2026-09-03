@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 aether-core.workspace = true
+aether-obscura.workspace = true
 blake3.workspace = true
 globset.workspace = true
 grep-regex.workspace = true

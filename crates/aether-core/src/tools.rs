@@ -113,7 +113,7 @@ impl PreparedAction {
     pub fn fallback(invocation: ToolInvocation, permission: PermissionClass) -> Self {
         let fingerprint = fingerprint(&invocation.name, &invocation.input);
         let classification = match permission {
-            PermissionClass::ReadOnly => ActionClassification::Read,
+            PermissionClass::ReadOnly | PermissionClass::BrowserRead => ActionClassification::Read,
             _ => ActionClassification::Mutation,
         };
         let paths = fallback_paths(&invocation.input);
@@ -246,6 +246,8 @@ pub enum ToolResource {
     Workspace,
     /// A process or process registry resource.
     Process(u64),
+    /// One externally supervised browser session.
+    BrowserSession(u64),
     /// A resource that cannot be narrowed safely.
     Global,
 }
@@ -349,6 +351,7 @@ fn resources_overlap(left: &ToolResource, right: &ToolResource) -> bool {
         (ToolResource::Global, _) | (_, ToolResource::Global) => true,
         (ToolResource::Workspace, _) | (_, ToolResource::Workspace) => true,
         (ToolResource::Process(left), ToolResource::Process(right)) => left == right,
+        (ToolResource::BrowserSession(left), ToolResource::BrowserSession(right)) => left == right,
         (ToolResource::WorkspacePath(left), ToolResource::WorkspacePath(right)) => {
             let left = std::path::Path::new(left);
             let right = std::path::Path::new(right);
@@ -609,5 +612,20 @@ mod tests {
         );
         assert!(permit.validate(&call_id, "shell", PermissionClass::ProcessExecute).is_err());
         assert!(permit.validate(&call_id, "write", PermissionClass::ProcessExecute).is_err());
+    }
+
+    #[test]
+    fn one_browser_session_serializes_all_browser_operations() {
+        let read =
+            ToolFootprint::from_effects(vec![ToolEffect::Read(ToolResource::BrowserSession(7))]);
+        let exclusive = ToolFootprint::from_effects(vec![ToolEffect::Exclusive(
+            ToolResource::BrowserSession(7),
+        )]);
+        let other_session = ToolFootprint::from_effects(vec![ToolEffect::Exclusive(
+            ToolResource::BrowserSession(8),
+        )]);
+        assert!(read.conflicts(&exclusive));
+        assert!(exclusive.conflicts(&exclusive));
+        assert!(!exclusive.conflicts(&other_session));
     }
 }

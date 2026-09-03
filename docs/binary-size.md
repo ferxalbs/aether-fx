@@ -95,3 +95,13 @@ small differences directional rather than precise:
 
 `benches/startup.sh` provides the matching Linux fresh-process method with 30 samples by default,
 GNU `time`, separate version/help/minimal-agent results, and the exact stripped artifact size.
+
+## Optional Obscura accounting
+
+The `aether-obscura` adapter is compiled into AETHER, so its protocol, installer, URL validation,
+and fixed tool definitions belong in the AETHER binary-size and startup measurements. The Obscura
+v0.2.1 no-render archive, browser engine, worker, provider process, and page-memory cost are
+external to that binary and must be reported separately. Inactive `--version`, help, startup, and
+ordinary repository turns do not spawn the provider or open a browser profile. Active measurements
+should report AETHER RSS and Obscura/browser RSS as separate processes; combining them would make
+the provider appear to be an AETHER idle-cost regression.
