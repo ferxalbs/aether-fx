@@ -557,6 +557,13 @@ fn piped_shell_has_no_banner_prompt_or_ansi_and_keeps_slash_commands_local() {
     let _ = fs::remove_dir_all(state_root(&root));
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
+    all(target_os = "windows", target_arch = "x86_64"),
+))]
 #[test]
 fn browser_status_is_offline_and_does_not_create_provider_state() {
     let root = temp_root("browser-status");
@@ -569,6 +576,13 @@ fn browser_status_is_offline_and_does_not_create_provider_state() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
+    all(target_os = "windows", target_arch = "x86_64"),
+))]
 #[test]
 fn browser_install_requires_interactive_consent_even_with_yolo() {
     let root = temp_root("browser-consent");
