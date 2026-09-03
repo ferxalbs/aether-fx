@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed Windows compilation of the optional Obscura installer under the workspace's denied-warning
+  policy.
 - Models without confirmed tool support remain visible but cannot be selected for the coding
   shell.
 - Rainy `TOOLS_NOT_ALLOWED` responses are treated as non-retryable model incompatibilities,
