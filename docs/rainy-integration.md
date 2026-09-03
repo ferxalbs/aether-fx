@@ -1,6 +1,6 @@
 # Rainy integration
 
-The only provider boundary is `aether-rainy`. It depends on the exact `rainy-sdk 0.6.50` crate and uses its `RainyClient`, `ResponsesRequest`, `OpenAIChatCompletionRequest`, both typed streaming APIs, and `get_models_catalog`. The adapter consumes the SDK's typed public Responses and OpenAI-compatible Chat Completions streams and maps them into AETHER `ModelEvent` values without leaking SDK types.
+The only provider boundary is `aether-rainy`. It depends on the exact `rainy-sdk 0.6.51` crate and uses its `RainyClient`, `ResponsesRequest`, `OpenAIChatCompletionRequest`, both typed streaming APIs, and `get_models_catalog`. The adapter consumes the SDK's typed public Responses and OpenAI-compatible Chat Completions streams and maps them into AETHER `ModelEvent` values without leaking SDK types.
 
 The manifest keeps Rainy's minimal feature set with `default-features = false`; no account/session,
 legacy, rate-limiting, or tracing surface is enabled. AETHER keeps its own environment-key,
@@ -53,7 +53,7 @@ to the agent; raw chain-of-thought is never rendered or exposed as a tool result
 
 ## Protocol routing and Chat Completions history
 
-The catalog in `rainy-sdk 0.6.50` reports model capabilities but does not report a per-model wire
+The catalog in `rainy-sdk 0.6.51` reports model capabilities but does not report a per-model wire
 protocol. AETHER therefore applies one centralized routing rule: a provider-qualified `openai/*`
 model, or a recognized unqualified OpenAI model ID such as `gpt-*` or `o1`/`o3`/`o4`, uses
 Responses; every other model ID uses the OpenAI-compatible Chat Completions endpoint. The chosen
@@ -77,7 +77,7 @@ continuation is rejected once and the agent reconstructs the turn from local bou
 
 ## Continuation invalidation and typed recovery
 
-`rainy-sdk 0.6.50` has no continuation-specific error type. AETHER maps to
+`rainy-sdk 0.6.51` has no continuation-specific error type. AETHER maps to
 `BackendError::InvalidContinuation` only with structured protocol evidence:
 
 - locally, a continuation object is present but has no non-empty `previous_response_id` string;

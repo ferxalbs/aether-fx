@@ -50,7 +50,7 @@ Rust `cfg(test)` code is not compiled into the production target.
 
 Workspace dependencies already disable default features for BLAKE3, Futures, Globset, Rainy SDK,
 Regex Automata, Rustix, Tokio, and Windows bindings. Rainy SDK default features are disabled, which
-excludes its rate-limiting and tracing surfaces. Rainy SDK 0.6.50 still requires Reqwest JSON,
+excludes its rate-limiting and tracing surfaces. Rainy SDK 0.6.51 still requires Reqwest JSON,
 streaming, HTTP/2, and Rustls; Reqwest 0.13 selects AWS-LC through its `rustls` feature. Removing
 HTTP/2, TLS 1.2, platform certificate verification, streaming, Unicode URL processing, or provider
 cryptography would change provider compatibility or security and was rejected.

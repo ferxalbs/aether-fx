@@ -1,6 +1,6 @@
 # Toolchain and dependency baseline
 
-Verified on 2026-09-01 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.50` crate, and the official Rainy SDK documentation. Versions below are exact manifest selections, not floating requirements. Cargo.lock is authoritative for the transitive graph.
+Verified on 2026-09-02 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.51` crate, and the official Rainy SDK documentation. Versions below are exact manifest selections, not floating requirements. Cargo.lock is authoritative for the transitive graph.
 
 | Component | Resolved version | License | Why it exists | Hot path? |
 | --- | --- | --- | --- | --- |
@@ -25,10 +25,10 @@ Verified on 2026-09-01 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.5
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | Preconditions and content identity | Tool hot path |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | Streaming SHA-256 verification against the release `SHA256SUMS` manifest | Update command only |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Consume the Rainy SDK stream without async-trait | Rainy stream |
-| rainy-sdk | 0.6.50 | Apache-2.0 | Official Rainy API boundary; typed Responses and Chat Completions streams, catalog, reasoning, and error APIs | Network path |
+| rainy-sdk | 0.6.51 | Apache-2.0 | Official Rainy API boundary; typed Responses and Chat Completions streams, catalog, reasoning, and error APIs | Network path |
 | criterion | 0.8.2 | Apache-2.0 OR MIT | Reproducible local benchmarks | Benchmark only |
 
-The verified Rainy SDK is exactly `rainy-sdk 0.6.50`, declared with `default-features = false`. Its
+The verified Rainy SDK is exactly `rainy-sdk 0.6.51`, declared with `default-features = false`. Its
 minimal default feature set leaves account/session, legacy, rate-limiting, and tracing surfaces
 disabled. The adapter consumes the public typed Responses and OpenAI-compatible Chat Completions
 streams and leaves SSE framing, redirect blocking, authentication, request/response bounds, and
