@@ -150,12 +150,28 @@ to Obscura.
 ## WebMCP boundary
 
 WebMCP is not dynamically implemented in this release and AETHER has no dependency on a private
-OpenAI API. If Obscura later discovers page-provided tools, the adapter must receive validated
-capabilities rather than raw page messages. A future dynamic tool identity will include origin,
-tab, document, and schema version; navigation invalidates the old page surface; a list-change
-event triggers capability validation instead of silently extending the registry. Page-provided
-descriptions and instructions remain untrusted content and can never authorize the user or
-change AETHER policy.
+OpenAI API. The future boundary follows the experimental [WebMCP proposal](https://github.com/webmachinelearning/webmcp),
+whose page-side model uses `document.modelContext` to register, discover, and execute structured
+tools. That is a page/document capability surface, not a reason to expose arbitrary MCP operations
+from Obscura to Rainy.
+
+If Obscura later discovers page-provided tools, the adapter must receive validated capabilities
+rather than raw page messages. A future dynamic tool identity will include origin, tab, document,
+and schema version; navigation invalidates the old page surface; a WebMCP tool-change event
+triggers capability validation instead of silently extending the registry. Page-provided
+descriptions, schemas, results, and instructions remain untrusted content and can never authorize
+the user or change AETHER policy.
+
+The [official Model Context Protocol Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)
+was evaluated for the external client boundary. Its generic RMCP client and child-process
+transport are useful when AETHER needs broad MCP interoperability, but v1 needs a narrower
+provider-specific adapter: Obscura v0.2.1 is pinned to `2024-11-05`, while AETHER must reject
+unsupported server messages, enforce its own frame/result/time limits, keep the model surface
+static, and own process/environment/stderr handling. The direct `tokio`/`serde_json` adapter is
+therefore intentional and keeps the SDK, its generic service layer, and its extra dependency
+surface out of both the idle path and the optional provider build. A future WebMCP-capable adapter
+may revisit RMCP after a compatibility and binary/RSS benchmark, without changing this trust
+boundary.
 
 ## Upstream licensing
 
