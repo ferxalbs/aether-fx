@@ -3,3 +3,6 @@
 .codebase-memory/*
 
 evals/__pycache__
+.vercel
+.env*
+node_modules
