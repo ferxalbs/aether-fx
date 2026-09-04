@@ -31,6 +31,7 @@ pub struct SelectorItem<T> {
     /// Disabled items remain visible but cannot be selected.
     pub disabled: bool,
     search_text: String,
+    display_value: String,
 }
 
 impl<T> SelectorItem<T> {
@@ -47,7 +48,7 @@ impl<T> SelectorItem<T> {
             MAX_SELECTOR_TEXT_BYTES.saturating_mul(2),
         )
         .to_lowercase();
-        Self { value, label, detail, disabled: false, search_text }
+        Self { value, label, detail, disabled: false, search_text, display_value: value_text }
     }
 
     /// Mark this item as visible but unavailable.
@@ -79,11 +80,8 @@ impl<T> SelectorItem<T> {
         &self.search_text
     }
 
-    pub(crate) fn display_value(&self) -> String
-    where
-        T: fmt::Display,
-    {
-        bounded_display(&self.value, MAX_SELECTOR_TEXT_BYTES)
+    pub(crate) fn display_value(&self) -> &str {
+        &self.display_value
     }
 }
 

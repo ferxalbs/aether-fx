@@ -1,6 +1,6 @@
 # AETHER WebMCP vertical slice
 
-AETHER Fx `v0.1.0-alpha-06` includes a small, public-facing browser surface for the WebMCP
+AETHER Fx `v0.1.0-alpha-07` includes a small, public-facing browser surface for the WebMCP
 challenge. It is an experimental vertical slice, not a browser IDE and not a replacement for the
 native CLI. The page runs a deterministic four-file demo repository entirely in the browser. It
 has no backend, account, API key, repository upload, shell, filesystem, network, or arbitrary
@@ -107,7 +107,7 @@ so the page is safe to run against the AETHER source tree. The Vercel configurat
 
 Before this extension, AETHER Fx was a native Rust terminal coding agent with bounded local tools,
 evidence-gated workflow state, an isolated Rainy adapter, and an optional consent-gated Obscura
-browser provider. Those native safeguards remain the product's primary surface. The alpha-06
+browser provider. Those native safeguards remain the product's primary surface. The alpha-07
 challenge extension adds only the `aether-web` WASM crate, a static browser UI, provider-side
 WebMCP registration, and a deterministic in-memory task so the human/agent workflow can be tried
 without granting a web page native authority.

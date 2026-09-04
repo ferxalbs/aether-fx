@@ -212,7 +212,7 @@ instructions. Durable session state keeps only status summaries such as `browser
 cookies/storage state is private provider state, while page bodies, HTML, authorization headers,
 complete MCP payloads, request/process IDs, and page instructions are not persisted.
 
-The native Obscura integration does not dynamically import page tools. Separately, alpha-06 ships a
+The native Obscura integration does not dynamically import page tools. Separately, alpha-07 ships a
 public `aether-web` WASM demo whose own page registers six explicit WebMCP tools when the host
 supports `document.modelContext.registerTool`. That page uses only a deterministic in-memory
 fixture: it cannot access the native checkout, invoke a process, contact Rainy/Obscura, read a

@@ -1,7 +1,7 @@
 # WebMCP challenge submission kit
 
 This file is the handoff material for the AETHER Fx WebMCP challenge entry. The repository and
-native CLI are Apache-2.0 licensed. The browser surface is the `alpha-06` extension documented in
+native CLI are Apache-2.0 licensed. The browser surface is the `alpha-07` extension documented in
 [`webmcp.md`](webmcp.md); it is not a separate hosted product.
 
 ## Submission fields

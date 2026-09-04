@@ -13,6 +13,8 @@ pub struct Renderer {
     last_render: Instant,
     render_interval: Duration,
     interactive: bool,
+    rendered_line_count: usize,
+    rendered_last_line_bytes: usize,
 }
 
 impl Default for Renderer {
@@ -34,6 +36,8 @@ impl Renderer {
             last_render: Instant::now() - INITIAL_RENDER_INTERVAL,
             render_interval: INITIAL_RENDER_INTERVAL,
             interactive,
+            rendered_line_count: 0,
+            rendered_last_line_bytes: 0,
         }
     }
 
@@ -47,7 +51,7 @@ impl Renderer {
         match event {
             AgentEvent::TextDelta { text } => append_safe(&mut self.buffer, text.as_str()),
             AgentEvent::ToolStarted { name, .. } => {
-                self.buffer.newline();
+                start_event_line(&mut self.buffer);
                 let label = format!("[tool {}]", sanitize_terminal_text(name));
                 if self.interactive {
                     self.buffer.append(&Style::new(crate::Intensity::Secondary).paint(&label));
@@ -56,25 +60,25 @@ impl Renderer {
                 }
             }
             AgentEvent::ToolOutput { output, .. } => {
-                self.buffer.newline();
+                start_event_line(&mut self.buffer);
                 append_safe(&mut self.buffer, output.as_str());
             }
             AgentEvent::ToolFinished { ok, .. } => {
-                self.buffer.newline();
+                start_event_line(&mut self.buffer);
                 self.buffer.append(if *ok { "[tool done]" } else { "[tool failed]" });
             }
             AgentEvent::PermissionRequested { .. } | AgentEvent::PermissionResolved { .. } => {}
             AgentEvent::Usage { .. } => {}
             AgentEvent::Warning { message } => {
-                self.buffer.newline();
+                start_event_line(&mut self.buffer);
                 append_safe(&mut self.buffer, message.as_str());
             }
             AgentEvent::Error { message } => {
-                self.buffer.newline();
+                start_event_line(&mut self.buffer);
                 append_safe(&mut self.buffer, message.as_str());
             }
             AgentEvent::Done => {
-                self.buffer.newline();
+                start_event_line(&mut self.buffer);
             }
         }
     }
@@ -101,17 +105,45 @@ impl Renderer {
         if !force && self.last_render.elapsed() < self.render_interval {
             return Ok(());
         }
-        let dirty = self.buffer.take_dirty();
-        for index in dirty {
-            if let Some(line) = self.buffer.lines().get(index) {
-                writer.write_all(b"\r\x1b[2K")?;
-                writer.write_all(line.as_bytes())?;
-                if index + 1 < self.buffer.lines().len() {
-                    writer.write_all(b"\n")?;
+        if self.buffer.take_dirty().is_empty() {
+            self.last_render = Instant::now();
+            return Ok(());
+        }
+
+        // Agent output is append-only: text extends the last line, while tool
+        // and diagnostic events add new lines. Emit only the new suffix instead
+        // of repainting each accumulated line on every streamed delta.
+        let lines = self.buffer.lines();
+        let line_count = lines.len();
+        let last_line_bytes = lines.last().map_or(0, String::len);
+        let mut frame = Vec::new();
+        if self.rendered_line_count == 0 {
+            if !(lines.len() == 1 && lines[0].is_empty()) {
+                for (index, line) in lines.iter().enumerate() {
+                    if index > 0 {
+                        frame.extend_from_slice(b"\n\r");
+                    }
+                    frame.extend_from_slice(line.as_bytes());
                 }
             }
+        } else {
+            if let Some(line) = lines.get(self.rendered_line_count - 1)
+                && line.len() > self.rendered_last_line_bytes
+            {
+                frame.extend_from_slice(&line.as_bytes()[self.rendered_last_line_bytes..]);
+            }
+            for line in lines.iter().skip(self.rendered_line_count) {
+                frame.extend_from_slice(b"\n\r");
+                frame.extend_from_slice(line.as_bytes());
+            }
         }
-        writer.flush()?;
+
+        if !frame.is_empty() {
+            writer.write_all(&frame)?;
+            writer.flush()?;
+            self.rendered_line_count = line_count;
+            self.rendered_last_line_bytes = last_line_bytes;
+        }
         self.last_render = Instant::now();
         Ok(())
     }
@@ -128,6 +160,12 @@ fn append_safe(buffer: &mut TerminalBuffer, text: &str) {
             buffer.newline();
         }
         buffer.append(&sanitize_terminal_text(line));
+    }
+}
+
+fn start_event_line(buffer: &mut TerminalBuffer) {
+    if buffer.lines().last().is_some_and(|line| !line.is_empty()) {
+        buffer.newline();
     }
 }
 
@@ -180,7 +218,35 @@ mod tests {
         renderer.handle(&event, &mut second).unwrap();
         assert!(second.is_empty());
         renderer.render_if_due(&mut second, true).unwrap();
-        assert!(!second.is_empty());
+        assert_eq!(String::from_utf8(second).unwrap(), "hello");
+    }
+
+    #[test]
+    fn renderer_appends_only_the_new_streaming_suffix() {
+        let mut renderer = Renderer::new();
+        let first_event = AgentEvent::TextDelta { text: BoundedText::new("hello", 64) };
+        let mut output = Vec::new();
+        renderer.handle(&first_event, &mut output).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "hello");
+
+        renderer.apply(&AgentEvent::TextDelta { text: BoundedText::new(" world", 64) });
+        let mut suffix = Vec::new();
+        renderer.render_if_due(&mut suffix, true).unwrap();
+        assert_eq!(String::from_utf8(suffix).unwrap(), " world");
+    }
+
+    #[test]
+    fn renderer_advances_to_new_event_lines_without_repainting_prior_text() {
+        let mut renderer = Renderer::new();
+        let mut output = Vec::new();
+        renderer
+            .handle(&AgentEvent::TextDelta { text: BoundedText::new("answer", 64) }, &mut output)
+            .unwrap();
+
+        renderer.apply(&AgentEvent::Warning { message: BoundedText::new("warning", 64) });
+        let mut next_line = Vec::new();
+        renderer.render_if_due(&mut next_line, true).unwrap();
+        assert_eq!(String::from_utf8(next_line).unwrap(), "\n\rwarning");
     }
 
     #[test]

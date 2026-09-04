@@ -433,12 +433,13 @@ jobs:
           cat > release-notes.md <<EOF
           AETHER Fx ${GITHUB_REF_NAME} is an alpha preview and is not stable or production-ready software.
 
-          This alpha keeps the native terminal and optional Obscura provider intact while adding an experimental WebMCP browser surface.
+          This alpha keeps the native terminal and optional Obscura provider intact while adding responsive streamed terminal rendering and the experimental WebMCP browser surface.
 
           Highlights:
 
           - Adaptive context and tool surfaces reduce agent overhead while progress-aware execution preserves evidence-gated completion.
           - Native interactive shell with local slash-command discovery, including /model, /status, /context, /config, /auth, /sessions, /resume, /doctor, /update, /help, /clear, and /exit.
+          - Interactive streamed responses append only new terminal text with cursor-safe tool and diagnostic transitions instead of repainting the full accumulated line.
           - Model-first selection keeps each model name, stable ID, and capability summary visible before the next turn is committed.
           - Concurrent workspace initialization remains safe on Windows, including collision retries for temporary metadata files.
           - Explicit \`aether update\` checks the highest public stable or prerelease SemVer, verifies the direct target binary with HTTPS plus SHA-256, and replaces it atomically without elevation.

@@ -184,7 +184,7 @@ where
                 .paint(&name);
             lines.push(format!("{prefix}{name}{status}"));
 
-            let mut identity = item.display_value();
+            let mut identity = item.display_value().to_owned();
             if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
                 identity.push_str(" · ");
                 identity.push_str(detail);

@@ -5,9 +5,10 @@ bounded set of filesystem, process, search, patch, and Git tools.
 
 ## Alpha status
 
-`v0.1.0-alpha-06` is an alpha preview. It is not stable or production-ready software. This
-release is distributed through GitHub Releases for the six native platforms listed below and adds
-an experimental static WebMCP browser vertical slice.
+`v0.1.0-alpha-07` is an alpha preview. It is not stable or production-ready software. This
+release is distributed through GitHub Releases for the six native platforms listed below, improves
+interactive streamed terminal rendering, and includes the experimental static WebMCP browser
+vertical slice.
 
 ### Experimental WebMCP browser surface
 
@@ -28,8 +29,8 @@ archive with `SHA256SUMS`, installs to `$HOME/.local/bin`, and does not edit she
 
 ```sh
 curl -fsSL \
-  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-06/install.sh \
-  | sh -s -- --version v0.1.0-alpha-06
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-07/install.sh \
+  | sh -s -- --version v0.1.0-alpha-07
 ```
 
 Use `--dir <path>` to choose another user-owned installation directory.
@@ -41,10 +42,10 @@ Download the tagged installer, then run it with the explicit prerelease version.
 
 ```powershell
 Invoke-WebRequest `
-  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-06/install.ps1 `
+  https://raw.githubusercontent.com/ferxalbs/aether-fx/v0.1.0-alpha-07/install.ps1 `
   -OutFile install.ps1
 
-.\install.ps1 -Version v0.1.0-alpha-06
+.\install.ps1 -Version v0.1.0-alpha-07
 ```
 
 Use `-Dir <path>` to choose another user-owned installation directory.
@@ -52,7 +53,7 @@ Use `-Dir <path>` to choose another user-owned installation directory.
 ### Manual archive installation
 
 Download the archive for your platform and `SHA256SUMS` from the
-[v0.1.0-alpha-06 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-06).
+[v0.1.0-alpha-07 GitHub Release](https://github.com/ferxalbs/aether-fx/releases/tag/v0.1.0-alpha-07).
 Verify the archive before extracting it, then place `aether` or `aether.exe` in a user-owned
 directory on your PATH. Each archive contains only the executable, its CycloneDX SBOM, `LICENSE`,
 `NOTICE`, and `THIRD_PARTY_NOTICES.md`.
@@ -213,7 +214,7 @@ against the same release manifest before replacement. `sha256sum` or `shasum -a 
 the Unix installer. GitHub CLI users may additionally verify an archive's build attestation:
 
 ```sh
-gh attestation verify aether-v0.1.0-alpha-06-linux-x86_64-gnu.tar.gz \
+gh attestation verify aether-v0.1.0-alpha-07-linux-x86_64-gnu.tar.gz \
   --repo ferxalbs/aether-fx
 ```
 

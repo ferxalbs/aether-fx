@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased - 2026-09-03 (3) - Follow-up terminal improvements
+
+## v0.1.0-alpha-07 - 2026-09-03 (2) - Responsive streamed terminal output
+
+### Fixed
+
+- Fixed interactive streamed output repainting the full accumulated line and losing the cursor
+  position when a tool or diagnostic line starts.
+
+### Performance
+
+- Interactive rendering now writes only new text and line transitions once per coalesced frame;
+  model picker redraws reuse each item's bounded display ID instead of formatting it repeatedly.
+
 ## v0.1.0-alpha-06 - 2026-09-03 (1) - Inspectable WebMCP browser workflow
 
 ### Added

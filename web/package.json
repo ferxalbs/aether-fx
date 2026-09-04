@@ -1,7 +1,7 @@
 {
   "name": "aether-web",
   "private": true,
-  "version": "0.1.0-alpha-06",
+  "version": "0.1.0-alpha-07",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
