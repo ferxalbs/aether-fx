@@ -14,7 +14,7 @@ function Fail([string] $Message) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    Fail 'an explicit release version is required; use -Version v0.1.0-alpha-07'
+    Fail 'an explicit release version is required; use -Version v0.1.0-alpha-08'
 }
 if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
     Fail "invalid release version: $Version"
