@@ -8,14 +8,14 @@ use std::{
 use std::sync::{Arc, Mutex};
 
 use aether_agent::{
-    Agent, AgentError, AgentRequest, AgentRunResult, AllowAllPermissionBroker, CancellationToken,
-    ModelBackend, NoPermissionBroker, PermissionBroker, PersistCheckpoint, PersistTurn,
-    ResumableSession, SessionPermissionBroker, SessionStore, SessionStoreError, TurnMode,
-    persist_checkpoint, persist_turn,
+    Agent, AgentError, AgentRequest, AgentRunResult, AllowAllPermissionBroker, CalendarAdapter,
+    CancellationToken, LocalCalendarAdapter, ModelBackend, NoPermissionBroker, PermissionBroker,
+    PersistCheckpoint, PersistTurn, ResumableSession, SessionPermissionBroker, SessionStore,
+    SessionStoreError, TurnMode, persist_checkpoint, persist_turn,
 };
 use aether_core::{
     AgentEvent, BoundedText, ContextSnapshot, OpaqueContinuation, PermissionRequest, SessionId,
-    SessionRecord, ToolExecutor, TurnId,
+    SessionRecord, ToolCallId, ToolExecutor, TranscriptCell, TurnId,
 };
 use aether_obscura::{
     ObscuraError, ObscuraInstallationStatus, ObscuraPaths, ObscuraStatus, ObscuraSupervisor,
@@ -24,6 +24,7 @@ use aether_obscura::{
 use aether_rainy::{ModelView, RainyBackend};
 use aether_terminal::{ModelSelectionItem, Renderer, SelectorItem, SelectorOutcome};
 use aether_tools::{ProcessShutdownReport, ToolRegistry};
+use aether_tui::{PickerItem, TuiAction, TuiConfig, TuiEvent, TuiSession};
 use thiserror::Error;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
@@ -180,6 +181,9 @@ fn run() -> Result<(), AppError> {
             ))
         }),
         Command::Prompt(prompt) => with_runtime(|runtime| {
+            if prompt.trim() == "/schedule" {
+                return Err(AppError::Message("interactive TTY required for /schedule".to_owned()));
+            }
             runtime.block_on(run_session(
                 cli.model,
                 cli.root,
@@ -356,6 +360,12 @@ fn print_help(topic: Option<&str>) {
         Some("browser") => println!(
             "aether /browser [task|status|stop|update]\n\nInstall or start the pinned Obscura MCP browser after explicit consent. Browser research is read-only; the provider remains active until /browser stop, /clear, /exit, or normal session close."
         ),
+        Some("schedule") => println!(
+            "aether /schedule\n\nOpen the interactive appointment form. It requires a TTY, validates an explicit local date, time, and UTC offset, and saves only after review confirmation."
+        ),
+        Some("transcript") => println!(
+            "aether /transcript\n\nBrowse the safe semantic transcript restored for the current interactive session. Raw tool output, arguments, and credentials are never persisted."
+        ),
         Some(topic) => println!("no help topic named {}; run aether help", safe_message(topic)),
         None => {
             println!(
@@ -366,6 +376,11 @@ fn print_help(topic: Option<&str>) {
              Sessions are stored as bounded JSONL in private OS application-state storage."
             );
             println!("  /browser   Install/start Obscura or run read-only web research");
+            println!("  /schedule  Create a confirmed local appointment");
+            println!("  /transcript Browse the safe session transcript");
+            println!(
+                "  TUI keys: Enter submit/confirm · Ctrl-J newline · Esc close/interrupt · Ctrl-C cancel · ?/F1 shortcuts · F2 transcript · / command palette"
+            );
         }
     }
 }
@@ -379,6 +394,8 @@ fn print_help_json(topic: Option<&str>) -> Result<(), AppError> {
         ("/auth", "Show credential status or enter a key"),
         ("/sessions", "Pick a local session"),
         ("/resume", "Pick and restore a local session"),
+        ("/schedule", "Create a confirmed local appointment"),
+        ("/transcript", "Browse the safe session transcript"),
         ("/doctor", "Run offline diagnostics"),
         ("/update", "Update AETHER Fx and leave the shell"),
         ("/browser", "Install/start Obscura or run read-only web research"),
@@ -859,13 +876,15 @@ struct SessionRuntime {
     model_view: Option<ModelView>,
     model_name: Option<String>,
     backend: Option<RainyBackend>,
-    agent: Option<Agent<RainyBackend, ToolRegistry>>,
+    agent: Option<Arc<Agent<RainyBackend, ToolRegistry>>>,
     workspace: Option<Arc<aether_tools::Workspace>>,
     obscura: Option<Arc<ObscuraSupervisor>>,
     store: Option<Arc<Mutex<SessionStore>>>,
     session_id: Option<SessionId>,
     continuation: Option<OpaqueContinuation>,
     context_seed: Option<ContextSnapshot>,
+    resume_transcript: Vec<TranscriptCell>,
+    resume_warnings: Vec<String>,
     turn_number: u64,
     session_started: bool,
     broker: SessionPermissionBroker,
@@ -878,6 +897,20 @@ struct SessionRuntime {
 enum ShellControl {
     Continue,
     Exit,
+}
+
+struct TuiTurn {
+    turn_id: TurnId,
+    cancellation: CancellationToken,
+    events: Option<mpsc::Receiver<AgentEvent>>,
+    pending_permission: Option<ToolCallId>,
+    task: tokio::task::JoinHandle<Result<AgentRunResult, AgentError>>,
+}
+
+enum TuiWait {
+    Ui(io::Result<Option<TuiEvent>>),
+    Agent(Option<AgentEvent>),
+    Done(Box<Result<Result<AgentRunResult, AgentError>, tokio::task::JoinError>>),
 }
 
 impl SessionRuntime {
@@ -938,6 +971,12 @@ impl SessionRuntime {
             session_id,
             continuation,
             context_seed,
+            resume_transcript: resume
+                .as_ref()
+                .map_or_else(Vec::new, |session| session.transcript.clone()),
+            resume_warnings: resume
+                .as_ref()
+                .map_or_else(Vec::new, |session| session.warnings.clone()),
             turn_number: 0,
             session_started,
             broker: SessionPermissionBroker::new(),
@@ -953,6 +992,9 @@ impl SessionRuntime {
         initial_prompt: Option<String>,
         single_pass: bool,
     ) -> Result<(), AppError> {
+        if self.interactive_ui && !single_pass {
+            return self.run_tui(initial_prompt).await;
+        }
         if let Some(prompt) = initial_prompt
             && !prompt.trim().is_empty()
         {
@@ -988,6 +1030,590 @@ impl SessionRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn run_tui(&mut self, initial_prompt: Option<String>) -> Result<(), AppError> {
+        let mut tui = TuiSession::enter(TuiConfig {
+            version: VERSION.to_owned(),
+            workspace: compact_path(&self.root),
+            model: self.model.clone(),
+            reasoning: self.model_view.as_ref().map(|view| view.reasoning.as_str().to_owned()),
+            session_id: self.session_id.clone(),
+            yolo: self.yolo,
+            resumed: self.session_started,
+            initial_status: None,
+        })?;
+        tui.state_mut().restore_transcript(&self.resume_transcript);
+        if self.session_started && self.resume_transcript.is_empty() {
+            tui.state_mut().push_notice("Transcript unavailable for this session");
+        }
+        for warning in &self.resume_warnings {
+            tui.state_mut().push_notice(warning);
+        }
+
+        let mut active = None;
+        if let Some(prompt) = initial_prompt
+            && !prompt.trim().is_empty()
+        {
+            if self.model.is_some() {
+                active = Some(self.start_tui_turn(prompt, &mut tui).await?);
+            } else {
+                tui.state_mut().set_composer(prompt);
+                tui.state_mut().push_notice(
+                    "No model is selected; choose /model before submitting the pending prompt",
+                );
+            }
+        } else if self.model.is_none() {
+            tui.state_mut().push_notice("No model selected; choose /model to begin");
+        }
+
+        let mut loop_error = None;
+        'event_loop: loop {
+            if let Err(error) = tui.draw() {
+                loop_error = Some(AppError::Io(error));
+                break;
+            }
+            match wait_for_tui(&mut tui, &mut active).await {
+                TuiWait::Ui(Ok(Some(event))) => {
+                    if let Some(action) = tui.state_mut().handle_event(event) {
+                        match self.handle_tui_action(action, &mut tui, &mut active).await {
+                            Ok(ShellControl::Continue) => {}
+                            Ok(ShellControl::Exit) => break 'event_loop,
+                            Err(error) => {
+                                if matches!(error, AppError::Update(_)) {
+                                    loop_error = Some(error);
+                                    break 'event_loop;
+                                }
+                                tui.state_mut().push_notice(safe_message(&error.to_string()));
+                            }
+                        }
+                    }
+                }
+                TuiWait::Ui(Ok(None)) => break,
+                TuiWait::Ui(Err(error)) => {
+                    loop_error = Some(AppError::Io(error));
+                    break;
+                }
+                TuiWait::Agent(event) => {
+                    if let Some(event) = event {
+                        if let Some(turn) = active.as_mut() {
+                            match &event {
+                                AgentEvent::PermissionRequested { request } => {
+                                    turn.pending_permission = Some(request.call_id.clone());
+                                }
+                                AgentEvent::PermissionResolved { call_id, .. }
+                                    if turn.pending_permission.as_ref() == Some(call_id) =>
+                                {
+                                    turn.pending_permission = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        tui.state_mut().apply_agent_event(&event);
+                    } else if let Some(turn) = active.as_mut() {
+                        turn.events = None;
+                    }
+                }
+                TuiWait::Done(result) => {
+                    let Some(mut turn) = active.take() else { continue };
+                    if let Some(events) = turn.events.as_mut() {
+                        while let Ok(event) = events.try_recv() {
+                            tui.state_mut().apply_agent_event(&event);
+                        }
+                    }
+                    if let Err(error) = self.finish_tui_turn(&mut tui, &turn.turn_id, *result).await
+                    {
+                        loop_error = Some(error);
+                        break;
+                    }
+                    if let Some(prompt) = tui.state_mut().pop_queued_prompt() {
+                        match self.start_tui_turn(prompt, &mut tui).await {
+                            Ok(next) => active = Some(next),
+                            Err(error) => {
+                                tui.state_mut().push_notice(safe_message(&error.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cleanup_error = None;
+        if let Some(mut turn) = active.take() {
+            turn.cancellation.cancel();
+            if let Some(call_id) = turn.pending_permission.as_ref() {
+                self.broker.cancel(call_id);
+            }
+            let result = turn.task.await;
+            if let Some(events) = turn.events.as_mut() {
+                while let Ok(event) = events.try_recv() {
+                    tui.state_mut().apply_agent_event(&event);
+                }
+            }
+            if let Err(error) = self.finish_tui_turn(&mut tui, &turn.turn_id, result).await {
+                cleanup_error = Some(error);
+            }
+        }
+        if let Some(error) = loop_error {
+            return Err(error);
+        }
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn start_tui_turn(
+        &mut self,
+        prompt: String,
+        tui: &mut TuiSession,
+    ) -> Result<TuiTurn, AppError> {
+        tui.suspend()?;
+        let ensure_result = self.ensure_agent().await;
+        let resume_result = tui.resume();
+        resume_result?;
+        ensure_result?;
+        self.turn_number = self.turn_number.saturating_add(1);
+        let session_id = self.session_id.clone().expect("session initialized");
+        let turn_id = TurnId::new(format!("turn-{}-{}", std::process::id(), self.turn_number))
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let model = self.model.clone().expect("model initialized");
+        let mut request = AgentRequest::new(session_id, turn_id.clone(), prompt.clone());
+        request.model = Some(model);
+        request.max_steps = configured_max_steps()?;
+        request.continuation = self.continuation.clone();
+        request.workspace_root = Some(self.root.display().to_string());
+        request.context_seed = self.context_seed.clone();
+        request.metrics = false;
+        request.mode = TurnMode::Repository;
+
+        let agent = Arc::clone(self.agent.as_ref().expect("agent initialized"));
+        let (sender, receiver) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let broker: Arc<dyn PermissionBroker> = if self.yolo {
+            Arc::new(AllowAllPermissionBroker)
+        } else {
+            Arc::new(self.broker.clone())
+        };
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            agent.run_with_broker(request, sender, task_cancellation, broker.as_ref()).await
+        });
+        tui.state_mut().set_model(self.model.clone());
+        tui.state_mut()
+            .set_reasoning(self.model_view.as_ref().map(|view| view.reasoning.as_str().to_owned()));
+        tui.state_mut().set_session(self.session_id.clone());
+        tui.state_mut().begin_turn(prompt);
+        Ok(TuiTurn {
+            turn_id,
+            cancellation,
+            events: Some(receiver),
+            pending_permission: None,
+            task,
+        })
+    }
+
+    async fn finish_tui_turn(
+        &mut self,
+        tui: &mut TuiSession,
+        turn_id: &TurnId,
+        result: Result<Result<AgentRunResult, AgentError>, tokio::task::JoinError>,
+    ) -> Result<(), AppError> {
+        let store = self
+            .store
+            .clone()
+            .ok_or_else(|| AppError::Message("TUI turn has no session store".to_owned()))?;
+        match result {
+            Ok(Ok(result)) => {
+                let summary = format!(
+                    "turn complete · {} steps · phase {} · verification {}",
+                    result.steps,
+                    result.context.workflow.phase.as_str(),
+                    result.context.workflow.verification.as_str()
+                );
+                tui.state_mut().finish_turn(turn_id.clone(), summary);
+                let transcript = tui.state().persistable_transcript();
+                persist_completed_turn(&store, turn_id, &result, &transcript).await?;
+                self.continuation = result.continuation.clone();
+                self.context_seed = Some(result.context);
+            }
+            Ok(Err(AgentError::Cancelled)) => {
+                tui.state_mut().cancel_turn();
+                let transcript = tui.state().persistable_transcript();
+                let agent = self.agent.as_ref().expect("agent initialized");
+                persist_incomplete_turn(&store, turn_id, agent, true, &transcript).await?;
+                self.context_seed = Some(agent.context_snapshot());
+                self.continuation =
+                    self.context_seed.as_ref().and_then(|context| context.continuation.clone());
+            }
+            Ok(Err(error)) => {
+                tui.state_mut().push_notice(error.to_string());
+                tui.state_mut().cancel_turn();
+                let transcript = tui.state().persistable_transcript();
+                let agent = self.agent.as_ref().expect("agent initialized");
+                persist_incomplete_turn(&store, turn_id, agent, false, &transcript).await?;
+                self.detach_unhealthy_obscura().await?;
+            }
+            Err(error) => {
+                let message = format!("agent task failed: {error}");
+                tui.state_mut().push_notice(message);
+                tui.state_mut().cancel_turn();
+                let transcript = tui.state().persistable_transcript();
+                let agent = self.agent.as_ref().expect("agent initialized");
+                persist_incomplete_turn(&store, turn_id, agent, false, &transcript).await?;
+                self.detach_unhealthy_obscura().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_tui_action(
+        &mut self,
+        action: TuiAction,
+        tui: &mut TuiSession,
+        active: &mut Option<TuiTurn>,
+    ) -> Result<ShellControl, AppError> {
+        match action {
+            TuiAction::SubmitPrompt(prompt) => {
+                if active.is_none() {
+                    if self.model.is_none() {
+                        tui.state_mut().set_composer(prompt);
+                        tui.state_mut().push_notice(
+                            "No model is selected; choose /model before submitting a prompt",
+                        );
+                    } else {
+                        *active = Some(self.start_tui_turn(prompt, tui).await?);
+                    }
+                }
+            }
+            TuiAction::Command(command) => {
+                if active.is_some() && !tui_command_allowed_during_turn(&command) {
+                    tui.state_mut().push_notice(
+                        "A turn is running; press Esc to interrupt before changing session state",
+                    );
+                    return Ok(ShellControl::Continue);
+                }
+                return self.run_tui_command(&command, tui).await;
+            }
+            TuiAction::Permission { call_id, decision } => {
+                if !self.broker.resolve(&call_id, decision) {
+                    tui.state_mut().push_notice("That approval request is no longer active");
+                }
+            }
+            TuiAction::CancelTurn => {
+                if let Some(turn) = active.as_ref() {
+                    turn.cancellation.cancel();
+                    if let Some(call_id) = turn.pending_permission.as_ref() {
+                        self.broker.cancel(call_id);
+                    }
+                }
+                tui.state_mut().cancel_turn();
+            }
+            TuiAction::SelectModel(model) if active.is_none() => {
+                self.tui_select_model(model, tui).await?
+            }
+            TuiAction::SelectSession(session) if active.is_none() => {
+                self.tui_select_session(session, tui).await?
+            }
+            TuiAction::Schedule(draft) if active.is_none() => {
+                self.tui_create_appointment(draft, tui).await?
+            }
+            TuiAction::SelectModel(_) | TuiAction::SelectSession(_) | TuiAction::Schedule(_) => {
+                tui.state_mut().push_notice(
+                    "A turn is running; press Esc to interrupt before changing session state",
+                )
+            }
+            TuiAction::Quit => return Ok(ShellControl::Exit),
+        }
+        Ok(ShellControl::Continue)
+    }
+
+    async fn run_tui_command(
+        &mut self,
+        command: &str,
+        tui: &mut TuiSession,
+    ) -> Result<ShellControl, AppError> {
+        match command {
+            "/model" => self.tui_open_models(tui).await?,
+            "/sessions" | "/resume" => self.tui_open_sessions(tui).await?,
+            "/schedule" => tui.state_mut().open_schedule(),
+            "/help" => tui.state_mut().open_help(),
+            "/transcript" => tui.state_mut().open_transcript(),
+            "/status" => self.push_tui_status(tui),
+            "/context" => self.push_tui_context(tui),
+            "/clear" => {
+                self.clear_session().await?;
+                tui.state_mut().reset_session();
+                tui.state_mut().set_model(self.model.clone());
+                tui.state_mut().set_reasoning(
+                    self.model_view.as_ref().map(|view| view.reasoning.as_str().to_owned()),
+                );
+            }
+            "/config" => {
+                tui.suspend()?;
+                let result = self.run_config_command();
+                let resume_result = tui.resume();
+                resume_result?;
+                result?;
+                tui.state_mut().push_notice("Config command completed");
+            }
+            "/auth" => {
+                tui.suspend()?;
+                let result = self.run_auth_command().await;
+                let resume_result = tui.resume();
+                resume_result?;
+                result?;
+                tui.state_mut().push_notice("Credential status checked");
+            }
+            "/doctor" => {
+                tui.suspend()?;
+                let result = doctor(&self.root, false, false);
+                let resume_result = tui.resume();
+                resume_result?;
+                result?;
+                tui.state_mut().push_notice("Offline diagnostics completed");
+            }
+            "/update" => {
+                tui.suspend()?;
+                let result = updater::run(false).await;
+                let resume_result = tui.resume();
+                resume_result?;
+                let result = result?;
+                tui.state_mut().push_notice(format!(
+                    "Update complete; leaving the shell · {}",
+                    safe_message(&result.json_line())
+                ));
+                return Ok(ShellControl::Exit);
+            }
+            value if is_browser_command(value) => {
+                tui.suspend()?;
+                let result = self.run_browser_command(value).await;
+                let resume_result = tui.resume();
+                resume_result?;
+                result?;
+                tui.state_mut().push_notice("Browser command completed");
+            }
+            value => {
+                let control = self.run_command(value).await?;
+                if matches!(control, ShellControl::Exit) {
+                    return Ok(control);
+                }
+            }
+        }
+        Ok(ShellControl::Continue)
+    }
+
+    async fn tui_open_models(&mut self, tui: &mut TuiSession) -> Result<(), AppError> {
+        tui.state_mut().push_notice("Loading model catalog…");
+        tui.draw()?;
+        tui.suspend()?;
+        let backend_result = self.ensure_backend().await.cloned();
+        let resume_result = tui.resume();
+        resume_result?;
+        let backend = backend_result?;
+        let views = backend
+            .discover_model_views()
+            .await
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let items = views
+            .iter()
+            .map(|view| {
+                let mut detail = safe_message(&view.detail());
+                let unavailable = !view.selectable();
+                if view.has_unknown_metadata() {
+                    detail.push_str(" · acknowledgement required");
+                }
+                let mut item = PickerItem::new(
+                    view.id.clone(),
+                    safe_message(&view.display_name),
+                    Some(detail),
+                );
+                item.unavailable = unavailable;
+                item
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            tui.state_mut().push_notice("Rainy returned no selectable models");
+        } else {
+            tui.state_mut().open_model_picker(items);
+        }
+        Ok(())
+    }
+
+    async fn tui_select_model(
+        &mut self,
+        selected: String,
+        tui: &mut TuiSession,
+    ) -> Result<(), AppError> {
+        tui.suspend()?;
+        let backend_result = self.ensure_backend().await.cloned();
+        let resume_result = tui.resume();
+        resume_result?;
+        let backend = backend_result?;
+        let views = backend
+            .discover_model_views()
+            .await
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let view = views.iter().find(|view| view.id == selected).ok_or_else(|| {
+            AppError::Message("selected model disappeared from catalog".to_owned())
+        })?;
+        if !view.selectable() {
+            return Err(AppError::Message(
+                "selected model is not available for the current access policy".to_owned(),
+            ));
+        }
+        if view.has_unknown_metadata() || view.disclosure_required {
+            let reason = if view.disclosure_required {
+                "Rainy requires a data-disclosure acknowledgement for this model"
+            } else {
+                "Rainy did not report complete capability or access metadata; verify before using this model"
+            };
+            let policy_detail = if view.disclosure_required {
+                format!(
+                    " policy={} training_with_inputs={} zdr={} retention_days={}{}",
+                    view.policy_status.as_deref().unwrap_or("unknown"),
+                    view.training_with_inputs
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    view.zdr_available
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    view.retention_days
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    view.policy_notice
+                        .as_deref()
+                        .map_or_else(String::new, |notice| format!(" notice={notice}")),
+                )
+            } else {
+                String::new()
+            };
+            let identity = format_model_identity(Some(view.id.as_str()), Some(view), None);
+            let prompt = format!("{reason}: {identity}.{} Continue?", policy_detail);
+            tui.suspend()?;
+            let confirmation =
+                tokio::task::spawn_blocking(move || aether_terminal::confirm(&prompt, false))
+                    .await
+                    .map_err(|error| {
+                        AppError::Message(format!("model disclosure worker failed: {error}"))
+                    })?
+                    .map_err(AppError::Io)?
+                    .unwrap_or(false);
+            let resume_result = tui.resume();
+            resume_result?;
+            if !confirmation {
+                tui.state_mut().push_notice("model selection not acknowledged");
+                return Ok(());
+            }
+        }
+        self.reset_agent_for_model_switch().await?;
+        self.model = Some(view.id.clone());
+        self.model_view = Some(view.clone());
+        self.model_name = Some(view.display_name.clone());
+        self.continuation = None;
+        if let Some(context) = self.context_seed.as_mut() {
+            context.continuation = None;
+            context.model = self.model.clone();
+        }
+        tui.state_mut().set_model(self.model.clone());
+        tui.state_mut()
+            .set_reasoning(self.model_view.as_ref().map(|view| view.reasoning.as_str().to_owned()));
+        tui.state_mut().push_notice(format!(
+            "model {} ({}) ready for the next turn",
+            safe_message(&view.display_name),
+            safe_message(&view.id)
+        ));
+        Ok(())
+    }
+
+    async fn tui_open_sessions(&mut self, tui: &mut TuiSession) -> Result<(), AppError> {
+        let root = self.root.clone();
+        let (summaries, issues) =
+            tokio::task::spawn_blocking(move || SessionStore::summaries(root)).await.map_err(
+                |error| AppError::Message(format!("session summary worker failed: {error}")),
+            )??;
+        for issue in issues {
+            tui.state_mut()
+                .push_notice(format!("Skipped corrupt session: {}", safe_message(&issue)));
+        }
+        let items = summaries
+            .iter()
+            .map(|summary| {
+                PickerItem::new(
+                    summary.session_id.to_string(),
+                    safe_message(summary.session_id.as_str()),
+                    Some(format!(
+                        "{} · {}",
+                        summary.model.as_deref().map_or("model ?".to_owned(), safe_message),
+                        summary.last_turn.as_ref().map_or("no turns", TurnId::as_str)
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+        tui.state_mut().open_session_picker(items);
+        if summaries.is_empty() {
+            tui.state_mut().push_notice("No resumable sessions");
+        }
+        Ok(())
+    }
+
+    async fn tui_select_session(
+        &mut self,
+        selected: String,
+        tui: &mut TuiSession,
+    ) -> Result<(), AppError> {
+        let restored = self.load_session_record(selected).await?;
+        self.activate_restored_session(restored).await?;
+        tui.state_mut().restore_transcript(&self.resume_transcript);
+        if self.resume_transcript.is_empty() {
+            tui.state_mut().push_notice("Transcript unavailable for this session");
+        }
+        tui.state_mut().set_model(self.model.clone());
+        tui.state_mut()
+            .set_reasoning(self.model_view.as_ref().map(|view| view.reasoning.as_str().to_owned()));
+        tui.state_mut().set_session(self.session_id.clone());
+        for warning in &self.resume_warnings {
+            tui.state_mut().push_notice(warning);
+        }
+        tui.state_mut().push_notice(format!(
+            "Resumed session {}",
+            self.session_id.as_ref().expect("restored session set")
+        ));
+        Ok(())
+    }
+
+    async fn tui_create_appointment(
+        &mut self,
+        draft: aether_core::AppointmentDraft,
+        tui: &mut TuiSession,
+    ) -> Result<(), AppError> {
+        let adapter = LocalCalendarAdapter::open(&self.root)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        match adapter.create(draft.clone()).await {
+            Ok(appointment) => tui.state_mut().appointment_created(appointment),
+            Err(error) => tui.state_mut().appointment_failed(draft, error.to_string()),
+        }
+        Ok(())
+    }
+
+    fn push_tui_status(&self, tui: &mut TuiSession) {
+        tui.state_mut().push_notice(format!(
+            "workspace: {}\nsession: {}\nmodel: {}\npermissions: {}\nbackend: {}",
+            safe_path(&self.root),
+            self.session_id.as_ref().map_or("pending", SessionId::as_str),
+            safe_message(&self.model_identity()),
+            if self.yolo { "yolo" } else { "prompt" },
+            if self.backend.is_some() { "ready" } else { "deferred" }
+        ));
+    }
+
+    fn push_tui_context(&self, tui: &mut TuiSession) {
+        let context = self.current_context();
+        tui.state_mut().push_notice(format!(
+            "workflow: {} / {}\nverification: {}\ninspected: {} · modified: {} · failures: {}",
+            context.workflow.phase.as_str(),
+            context.workflow.director.phase.as_str(),
+            context.workflow.verification.as_str(),
+            context.inspected.len(),
+            context.modified.len(),
+            context.workflow.unresolved_failures.len()
+        ));
     }
 
     async fn run_turn_or_report(&mut self, prompt: String) -> Result<(), AppError> {
@@ -1047,6 +1673,14 @@ impl SessionRuntime {
             "/auth" => self.run_auth_command().await?,
             "/model" => self.choose_model(false).await?,
             "/sessions" | "/resume" => self.choose_session().await?,
+            "/schedule" => {
+                return Err(AppError::Message("interactive TTY required for /schedule".to_owned()));
+            }
+            "/transcript" => {
+                return Err(AppError::Message(
+                    "interactive TTY required for /transcript".to_owned(),
+                ));
+            }
             "/doctor" => doctor(&self.root, self.json_output, false)?,
             "/update" => {
                 let result = updater::run(self.json_output).await?;
@@ -1485,7 +2119,7 @@ impl SessionRuntime {
         let backend = self.ensure_backend().await?.clone();
         let tools = new_tool_registry(self.root.clone(), self.obscura.clone()).await?;
         self.workspace = Some(Arc::new(tools.workspace().clone()));
-        self.agent = Some(Agent::new(backend, tools));
+        self.agent = Some(Arc::new(Agent::new(backend, tools)));
         let session_id = self.session_id.clone().unwrap_or(new_session_id()?);
         let store = open_session_store(&self.root, &session_id).await?;
         if !self.session_started {
@@ -1555,20 +2189,20 @@ impl SessionRuntime {
                     let model_identity = self.model_identity();
                     print_turn_summary(&turn_id, &result.context, &model_identity);
                 }
-                persist_completed_turn(store, &turn_id, &result).await?;
+                persist_completed_turn(store, &turn_id, &result, &[]).await?;
                 self.continuation = result.continuation.clone();
                 self.context_seed = Some(result.context);
             }
             Ok(None) => {
                 let agent = self.agent.as_ref().expect("agent initialized");
-                persist_incomplete_turn(store, &turn_id, agent, true).await?;
+                persist_incomplete_turn(store, &turn_id, agent, true, &[]).await?;
                 self.context_seed = Some(agent.context_snapshot());
                 self.continuation =
                     self.context_seed.as_ref().and_then(|context| context.continuation.clone());
             }
             Err(error) => {
                 let agent = self.agent.as_ref().expect("agent initialized");
-                persist_incomplete_turn(store, &turn_id, agent, false).await?;
+                persist_incomplete_turn(store, &turn_id, agent, false, &[]).await?;
                 self.detach_unhealthy_obscura().await?;
                 return Err(error);
             }
@@ -1730,7 +2364,7 @@ impl SessionRuntime {
     fn current_context(&self) -> ContextSnapshot {
         self.agent
             .as_ref()
-            .map(Agent::context_snapshot)
+            .map(|agent| agent.context_snapshot())
             .or_else(|| self.context_seed.clone())
             .unwrap_or_else(|| {
                 ContextSnapshot::new(self.root.display().to_string(), self.model.clone())
@@ -1847,6 +2481,37 @@ impl SessionRuntime {
         Ok(())
     }
 
+    async fn load_session_record(&self, selected: String) -> Result<ResumableSession, AppError> {
+        let session_id =
+            SessionId::new(selected).map_err(|error| AppError::Message(error.to_string()))?;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || SessionStore::restore(root, session_id))
+            .await
+            .map_err(|error| AppError::Message(format!("session restore worker failed: {error}")))?
+            .map_err(AppError::from)
+    }
+
+    async fn activate_restored_session(
+        &mut self,
+        restored: ResumableSession,
+    ) -> Result<(), AppError> {
+        self.close_current().await?;
+        self.root = SessionStore::canonical_workspace(restored.workspace_root.clone())?;
+        self.config = config::load(&self.root)?.config;
+        self.backend = None;
+        self.model = clean_model(restored.model.clone()).or_else(|| self.model.clone());
+        self.model_view = None;
+        self.model_name = None;
+        self.resume_transcript = restored.transcript.clone();
+        self.resume_warnings = restored.warnings.clone();
+        self.context_seed = Some(restored.context);
+        self.continuation = restored.continuation;
+        self.session_id = Some(restored.session_id);
+        self.turn_number = 0;
+        self.session_started = true;
+        Ok(())
+    }
+
     async fn choose_session(&mut self) -> Result<(), AppError> {
         if !self.interactive_ui {
             return Err(AppError::Message(
@@ -1887,28 +2552,10 @@ impl SessionRuntime {
             | SelectorOutcome::EndOfInput
             | SelectorOutcome::NoSelection => return Ok(()),
         };
-        let session_id =
-            SessionId::new(selected).map_err(|error| AppError::Message(error.to_string()))?;
-        let restored = tokio::task::spawn_blocking({
-            let root = self.root.clone();
-            let session_id = session_id.clone();
-            move || SessionStore::restore(root, session_id)
-        })
-        .await
-        .map_err(|error| AppError::Message(format!("session restore worker failed: {error}")))??;
-        self.close_current().await?;
-        self.root = SessionStore::canonical_workspace(restored.workspace_root.clone())?;
-        self.config = config::load(&self.root)?.config;
-        self.backend = None;
-        self.model = clean_model(restored.model.clone()).or_else(|| self.model.clone());
-        self.model_view = None;
-        self.model_name = None;
-        self.context_seed = Some(restored.context);
-        self.continuation = restored.continuation;
-        self.session_id = Some(restored.session_id);
-        self.turn_number = 0;
-        self.session_started = true;
-        for warning in restored.warnings {
+        let restored = self.load_session_record(selected).await?;
+        let warnings = restored.warnings.clone();
+        self.activate_restored_session(restored).await?;
+        for warning in warnings {
             eprintln!("AETHER Fx: {}", safe_message(&warning));
         }
         println!("resumed session {}", self.session_id.as_ref().expect("session set"));
@@ -1920,9 +2567,11 @@ impl SessionRuntime {
         self.session_id = None;
         self.context_seed = None;
         self.continuation = None;
+        self.resume_transcript.clear();
+        self.resume_warnings.clear();
         self.turn_number = 0;
         self.session_started = false;
-        if !self.json_output {
+        if !self.json_output && !self.interactive_ui {
             println!("started a fresh local session; model selection is preserved");
         }
         Ok(())
@@ -1975,12 +2624,37 @@ impl SessionRuntime {
     }
 }
 
+async fn wait_for_tui(tui: &mut TuiSession, active: &mut Option<TuiTurn>) -> TuiWait {
+    if let Some(turn) = active.as_mut() {
+        tokio::select! {
+            result = tui.next_event() => TuiWait::Ui(result),
+            event = async {
+                if let Some(receiver) = turn.events.as_mut() {
+                    receiver.recv().await
+                } else {
+                    std::future::pending::<Option<AgentEvent>>().await
+                }
+            } => TuiWait::Agent(event),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                TuiWait::Ui(Ok(Some(TuiEvent::Timer)))
+            },
+            result = &mut turn.task => TuiWait::Done(Box::new(result)),
+        }
+    } else {
+        TuiWait::Ui(tui.next_event().await)
+    }
+}
+
 fn is_browser_command(command: &str) -> bool {
     command == "/browser"
         || command
             .strip_prefix("/browser")
             .and_then(|rest| rest.chars().next())
             .is_some_and(char::is_whitespace)
+}
+
+fn tui_command_allowed_during_turn(command: &str) -> bool {
+    matches!(command, "/help" | "/status" | "/context" | "/transcript" | "/exit" | "/quit")
 }
 
 fn obscura_status_from_installation(
@@ -2026,6 +2700,8 @@ fn command_items() -> Vec<SelectorItem<String>> {
         ("/auth", "Auth", "Show credential status or enter a key"),
         ("/sessions", "Sessions", "Pick a local session"),
         ("/resume", "Resume", "Pick and restore a local session"),
+        ("/schedule", "Schedule", "Create a confirmed local appointment"),
+        ("/transcript", "Transcript", "Open the current transcript overlay"),
         ("/doctor", "Doctor", "Run offline diagnostics"),
         ("/update", "Update", "Update AETHER Fx and leave the shell"),
         ("/browser", "Browser", "Install/start Obscura or run read-only web research"),
@@ -2051,20 +2727,6 @@ fn print_turn_summary(turn_id: &TurnId, context: &ContextSnapshot, model: &str) 
         context.inspected.len(),
         context.modified.len()
     );
-}
-
-fn print_identity(state: &SessionRuntime) {
-    println!(
-        "AETHER Fx {VERSION} · workspace {} · branch {}",
-        safe_message(&compact_path(&state.root)),
-        git_branch(&state.root).as_deref().unwrap_or("none")
-    );
-    println!(
-        "model: {} · permissions: {} · change model: /model",
-        state.model_identity(),
-        if state.yolo { "yolo" } else { "prompt" }
-    );
-    println!("type / for local commands; startup is offline");
 }
 
 fn format_model_identity(
@@ -2136,14 +2798,6 @@ async fn run_session(
     }
     if resume.is_some() && !state.interactive_ui && initial_prompt.is_none() {
         let _ = state.ensure_backend().await?;
-    }
-    if !options.json_output && state.interactive_ui {
-        print_identity(&state);
-        if let Some(resume) = resume.as_ref() {
-            for warning in &resume.warnings {
-                eprintln!("AETHER Fx: {}", safe_message(warning));
-            }
-        }
     }
     let result = state.run(initial_prompt, single_pass).await;
     let cleanup = state.close_current().await;
@@ -2312,6 +2966,7 @@ async fn persist_completed_turn(
     store: &Arc<Mutex<SessionStore>>,
     turn_id: &TurnId,
     result: &AgentRunResult,
+    transcript: &[TranscriptCell],
 ) -> Result<(), AppError> {
     let store = Arc::clone(store);
     let turn_id = turn_id.clone();
@@ -2319,10 +2974,18 @@ async fn persist_completed_turn(
     let cancelled = result.cancelled;
     let context = result.context.clone();
     let continuation = result.continuation.clone();
+    let transcript = transcript.to_vec();
     tokio::task::spawn_blocking(move || {
         persist_turn(
             &mut store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-            PersistTurn { turn_id: &turn_id, steps, cancelled, context: &context, continuation },
+            PersistTurn {
+                turn_id: &turn_id,
+                steps,
+                cancelled,
+                context: &context,
+                continuation,
+                transcript: &transcript,
+            },
         )
     })
     .await
@@ -2335,6 +2998,7 @@ async fn persist_incomplete_turn<B, T>(
     turn_id: &TurnId,
     agent: &Agent<B, T>,
     cancelled: bool,
+    transcript: &[TranscriptCell],
 ) -> Result<(), AppError>
 where
     B: ModelBackend + 'static,
@@ -2344,6 +3008,7 @@ where
     let turn_id = turn_id.clone();
     let context = agent.context_snapshot();
     let continuation = context.continuation.clone();
+    let transcript = transcript.to_vec();
     tokio::task::spawn_blocking(move || {
         persist_checkpoint(
             &mut store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
@@ -2353,6 +3018,7 @@ where
                 cancelled,
                 context: &context,
                 continuation,
+                transcript: &transcript,
             },
         )
     })
@@ -2512,6 +3178,7 @@ mod tests {
                 "previous_response_id": "response-old"
             }))),
             context: ContextSnapshot::new("/workspace", Some("old-model".to_owned())),
+            transcript: Vec::new(),
             workspace_changed: false,
             warnings: Vec::new(),
         };

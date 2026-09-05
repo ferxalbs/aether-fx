@@ -4,6 +4,7 @@
 
 mod agent;
 mod backend;
+mod calendar;
 mod cancellation;
 mod context;
 mod context_selection;
@@ -24,6 +25,7 @@ mod working_set;
 pub use aether_core::{CommandClass, CommandEffects};
 pub use agent::{Agent, AgentError, AgentMetrics, AgentRequest, AgentRunResult, TurnMode};
 pub use backend::{BackendError, BackendFuture, BackendStream, ModelBackend, ModelCatalogItem};
+pub use calendar::{AppointmentStore, CalendarAdapter, CalendarError, LocalCalendarAdapter};
 pub use cancellation::CancellationToken;
 pub use context::{ContextEngine, capture_git_snapshot};
 pub use context_selection::{

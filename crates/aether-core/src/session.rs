@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextSnapshot, OpaqueContinuation, SessionId, TurnId, persistable_continuation};
+use crate::{
+    ContextSnapshot, OpaqueContinuation, SessionId, TranscriptCell, TurnId,
+    persistable_continuation, sanitize_transcript,
+};
 
 /// Version of the append-friendly local JSONL schema.
-pub const SESSION_SCHEMA_VERSION: u32 = 5;
+pub const SESSION_SCHEMA_VERSION: u32 = 6;
 /// The immediately previous session schema remains readable after adding workflow defaults.
 pub const MIN_SUPPORTED_SESSION_SCHEMA_VERSION: u32 = 3;
 
@@ -35,6 +38,24 @@ pub struct TurnSnapshot {
     pub context: ContextSnapshot,
     /// Sanitized Rainy continuation identity, if any.
     pub continuation: Option<OpaqueContinuation>,
+    /// Safe semantic transcript cells restored by the interactive TUI.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_transcript",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub transcript: Vec<TranscriptCell>,
+}
+
+fn deserialize_transcript<'de, D>(deserializer: D) -> Result<Vec<TranscriptCell>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<TranscriptCell>(value).ok())
+        .collect())
 }
 
 /// Append-only local session records.
@@ -66,6 +87,7 @@ impl SessionRecord {
     fn snapshot(mut snapshot: TurnSnapshot, checkpoint: bool) -> Self {
         snapshot.context = snapshot.context.persistable();
         snapshot.continuation = snapshot.continuation.as_ref().and_then(persistable_continuation);
+        snapshot.transcript = sanitize_transcript(snapshot.transcript);
         if checkpoint {
             Self::Checkpoint { snapshot: Box::new(snapshot) }
         } else {

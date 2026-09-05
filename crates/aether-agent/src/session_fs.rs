@@ -141,6 +141,22 @@ pub(crate) fn session_directory(workspace: impl AsRef<Path>) -> Result<PathBuf, 
     Ok(state_root.join(state::WORKSPACES_DIR).join(workspace_id).join(state::SESSION_DIR))
 }
 
+pub(crate) fn workspace_directory(
+    workspace: impl AsRef<Path>,
+) -> Result<PathBuf, SessionStoreError> {
+    let layout = WorkspaceLayout::resolve(workspace.as_ref(), true)?.ok_or_else(|| {
+        SessionStoreError::Invalid("workspace state directory is unavailable".to_owned())
+    })?;
+    Ok(layout.workspace_dir)
+}
+
+pub(crate) fn reject_indirect_file_for_calendar(
+    path: &Path,
+    what: &str,
+) -> Result<(), SessionStoreError> {
+    reject_indirect_file(path, what)
+}
+
 pub(crate) fn canonical_workspace(path: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
     state::canonical_workspace(path.as_ref())
 }

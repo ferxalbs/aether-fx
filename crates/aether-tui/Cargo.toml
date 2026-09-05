@@ -1,0 +1,23 @@
+[package]
+name = "aether-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AETHER Fx stateful terminal user interface"
+
+[lints]
+workspace = true
+
+[dependencies]
+aether-core.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+time.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

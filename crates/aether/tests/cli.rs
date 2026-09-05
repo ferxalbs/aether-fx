@@ -151,6 +151,7 @@ fn write_session_at(root: &Path, name: &str, path: &Path) {
                 Some("test-model".to_owned()),
             ),
             continuation: None,
+            transcript: Vec::new(),
         }),
     );
     fs::write(
@@ -555,6 +556,24 @@ fn piped_shell_has_no_banner_prompt_or_ansi_and_keeps_slash_commands_local() {
     assert!(!stdout.contains("›"), "{stdout:?}");
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(state_root(&root));
+}
+
+#[test]
+fn noninteractive_schedule_is_rejected_without_creating_appointment_state() {
+    let root = temp_root("schedule-noninteractive");
+    let state = state_root(&root);
+    let output = run_piped(&root, &[], &state, b"/schedule\n/exit\n");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("interactive TTY required for /schedule"), "{combined}");
+    assert!(!state.exists());
+    assert!(!root.join("appointments.json").exists());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(state);
 }
 
 #[cfg(any(

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use aether_core::{
     ContextSnapshot, MAX_SESSION_FILE_BYTES, MAX_SESSION_LINE_BYTES, MAX_SESSION_LINES,
     MAX_STORED_TURNS, MIN_SUPPORTED_SESSION_SCHEMA_VERSION, OpaqueContinuation,
-    SESSION_SCHEMA_VERSION, SessionId, SessionLine, SessionRecord, TurnId, TurnSnapshot,
-    payload_contains_secrets, persistable_continuation,
+    SESSION_SCHEMA_VERSION, SessionId, SessionLine, SessionRecord, TranscriptCell, TurnId,
+    TurnSnapshot, payload_contains_secrets, persistable_continuation,
 };
 use thiserror::Error;
 
@@ -51,6 +51,8 @@ pub struct ResumableSession {
     pub continuation: Option<OpaqueContinuation>,
     /// Working context after stale-file refresh.
     pub context: ContextSnapshot,
+    /// Safe semantic transcript restored for the interactive UI.
+    pub transcript: Vec<TranscriptCell>,
     /// Whether the live workspace differed from persisted hashes/paths.
     pub workspace_changed: bool,
     /// Human-readable resume notes.
@@ -238,6 +240,11 @@ impl SessionStore {
         session_fs::session_directory(workspace)
     }
 
+    /// Return the resolved private workspace state directory.
+    pub fn workspace_directory(workspace: impl AsRef<Path>) -> Result<PathBuf, SessionStoreError> {
+        session_fs::workspace_directory(workspace)
+    }
+
     /// Open or create a session file inside a workspace and recover its next sequence.
     pub fn open(
         workspace: impl AsRef<Path>,
@@ -397,6 +404,7 @@ impl SessionStore {
         let mut model = None;
         let mut continuation = None;
         let mut context = None;
+        let mut transcript = None;
         for line in &lines {
             match &line.record {
                 SessionRecord::Started { workspace_root: stored, model: stored_model } => {
@@ -408,6 +416,9 @@ impl SessionStore {
                     context = Some(snapshot.context.clone());
                     continuation =
                         snapshot.continuation.as_ref().and_then(persistable_continuation);
+                    if !snapshot.transcript.is_empty() {
+                        transcript = Some(snapshot.transcript.clone());
+                    }
                     if snapshot.context.model.is_some() {
                         model.clone_from(&snapshot.context.model);
                     }
@@ -464,6 +475,7 @@ impl SessionStore {
             model: context.model.clone(),
             continuation,
             workspace_changed,
+            transcript: transcript.unwrap_or_default(),
             context,
             warnings,
         })
@@ -544,6 +556,8 @@ pub struct PersistTurn<'a> {
     pub context: &'a ContextSnapshot,
     /// Sanitized Rainy continuation.
     pub continuation: Option<OpaqueContinuation>,
+    /// Safe semantic transcript cells to restore in the TUI.
+    pub transcript: &'a [TranscriptCell],
 }
 
 /// Persist one completed turn as a single committed JSONL record.
@@ -559,6 +573,7 @@ pub fn persist_turn(
             cancelled: turn.cancelled,
             context: turn.context.clone(),
             continuation: turn.continuation,
+            transcript: turn.transcript.to_vec(),
         }),
     )?;
     Ok(())
@@ -576,6 +591,8 @@ pub struct PersistCheckpoint<'a> {
     pub context: &'a ContextSnapshot,
     /// Sanitized provider continuation, if one is still usable.
     pub continuation: Option<OpaqueContinuation>,
+    /// Safe semantic transcript cells to restore in the TUI.
+    pub transcript: &'a [TranscriptCell],
 }
 
 /// Persist resumable work state without presenting it as a completed turn.
@@ -591,6 +608,7 @@ pub fn persist_checkpoint(
             cancelled: checkpoint.cancelled,
             context: checkpoint.context.clone(),
             continuation: checkpoint.continuation,
+            transcript: checkpoint.transcript.to_vec(),
         }),
     )?;
     Ok(())
@@ -600,8 +618,8 @@ pub fn persist_checkpoint(
 mod tests {
     use super::*;
     use aether_core::{
-        CompactToolSummary, ContextSnapshot, InspectedFile, LineRange, ObservedFileState,
-        SESSION_SCHEMA_VERSION, TurnId, WorkflowPhase,
+        BoundedText, CompactToolSummary, ContextSnapshot, InspectedFile, LineRange,
+        ObservedFileState, SESSION_SCHEMA_VERSION, TranscriptCell, TurnId, WorkflowPhase,
     };
 
     fn temp_session(label: &str) -> (PathBuf, PathBuf, SessionId) {
@@ -765,6 +783,7 @@ mod tests {
                 cancelled: false,
                 context: &context,
                 continuation,
+                transcript: &[],
             },
         )
         .unwrap();
@@ -823,6 +842,7 @@ mod tests {
                 cancelled: true,
                 context: &context,
                 continuation: None,
+                transcript: &[],
             },
         )
         .unwrap();
@@ -891,6 +911,86 @@ mod tests {
     }
 
     #[test]
+    fn latest_transcript_is_restored_with_the_session_context() {
+        let (root, _path, session) = temp_session("transcript-resume");
+        let context = ContextSnapshot::new(root.display().to_string(), Some("model-a".to_owned()));
+        let cells = vec![
+            TranscriptCell::User { text: BoundedText::new("schedule a design review", 1024) },
+            TranscriptCell::Assistant { text: BoundedText::new("I can help with that.", 1024) },
+            TranscriptCell::Tool { name: BoundedText::new("read_file", 1024), ok: Some(true) },
+        ];
+        let mut store = SessionStore::open(&root, session.clone()).unwrap();
+        store
+            .append(
+                None,
+                SessionRecord::Started {
+                    workspace_root: root.display().to_string(),
+                    model: Some("model-a".to_owned()),
+                },
+            )
+            .unwrap();
+        persist_turn(
+            &mut store,
+            PersistTurn {
+                turn_id: &TurnId::new("turn-transcript").unwrap(),
+                steps: 1,
+                cancelled: false,
+                context: &context,
+                continuation: None,
+                transcript: &cells,
+            },
+        )
+        .unwrap();
+        let restored = SessionStore::restore(&root, session).unwrap();
+        assert_eq!(restored.transcript, cells);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_five_snapshot_without_transcript_remains_readable() {
+        let (root, path, session) = temp_session("schema-five");
+        let _store = SessionStore::open(&root, session.clone()).unwrap();
+        let turn_id = TurnId::new("turn-schema-five").unwrap();
+        let started = SessionLine::new(
+            1,
+            session.clone(),
+            None,
+            SessionRecord::Started {
+                workspace_root: root.display().to_string(),
+                model: Some("model-a".to_owned()),
+            },
+        );
+        let turn = SessionLine::new(
+            2,
+            session.clone(),
+            Some(turn_id.clone()),
+            SessionRecord::turn_snapshot(TurnSnapshot {
+                turn_id,
+                steps: 1,
+                cancelled: false,
+                context: ContextSnapshot::new(
+                    root.display().to_string(),
+                    Some("model-a".to_owned()),
+                ),
+                continuation: None,
+                transcript: Vec::new(),
+            }),
+        );
+        let mut turn_value = serde_json::to_value(turn).unwrap();
+        turn_value["schema_version"] = serde_json::json!(5);
+        turn_value["record"]["snapshot"].as_object_mut().unwrap().remove("transcript");
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&started).unwrap(),
+            serde_json::to_string(&turn_value).unwrap()
+        );
+        fs::write(&path, body).unwrap();
+        let restored = SessionStore::restore(&root, session).unwrap();
+        assert!(restored.transcript.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn truncated_final_record_is_ignored_and_previous_turn_remains() {
         let (root, path, session) = temp_session("truncated");
         let mut store = SessionStore::open(&root, session.clone()).unwrap();
@@ -943,6 +1043,7 @@ mod tests {
                     Some("model-a".to_owned()),
                 ),
                 continuation: None,
+                transcript: Vec::new(),
             }),
         ))
         .unwrap();

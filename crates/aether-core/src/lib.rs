@@ -2,6 +2,7 @@
 
 //! Domain primitives shared by the AETHER Fx workspace.
 
+pub mod appointments;
 pub mod cancellation;
 pub mod command;
 pub mod context;
@@ -15,9 +16,15 @@ pub mod path;
 pub mod permissions;
 pub mod session;
 pub mod tools;
+pub mod transcript;
 pub mod work;
 pub mod workflow;
 
+pub use appointments::{
+    Appointment, AppointmentDraft, MAX_APPOINTMENT_ATTENDEE_BYTES, MAX_APPOINTMENT_ATTENDEES,
+    MAX_APPOINTMENT_DURATION_MINUTES, MAX_APPOINTMENT_LOCATION_BYTES, MAX_APPOINTMENT_NOTES_BYTES,
+    MAX_APPOINTMENT_TITLE_BYTES, MIN_APPOINTMENT_DURATION_MINUTES,
+};
 pub use cancellation::CancellationFlag;
 pub use command::{
     CommandClass, CommandEffects, MAX_COMMAND_ARGS, MAX_COMMAND_BYTES, MAX_COMMAND_FIELD_BYTES,
@@ -41,7 +48,7 @@ pub use decision::{
 };
 pub use error::{CoreError, CoreResult};
 pub use events::{AgentEvent, EventSequence, UsageMetadata};
-pub use ids::{SessionId, StepId, ToolCallId, TurnId};
+pub use ids::{AppointmentId, SessionId, StepId, ToolCallId, TurnId};
 pub use limits::{BoundedText, DEFAULT_MAX_OUTPUT_BYTES, OutputLimit};
 pub use model::{ModelEvent, ModelMessage, ModelRequest, ModelToolCall, OpaqueContinuation};
 pub use path::{WorkspacePath, WorkspaceRoot};
@@ -56,6 +63,10 @@ pub use tools::{
     ActionClassification, ActionRequirements, EvidenceProvenance, ExecutionPermit,
     MAX_TOOL_FOOTPRINT_RESOURCES, PreparedAction, ToolDefinition, ToolEffect, ToolExecutionContext,
     ToolExecutor, ToolFootprint, ToolInvocation, ToolResource, ToolResult,
+};
+pub use transcript::{
+    MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_CELLS, MAX_TRANSCRIPT_TEXT_BYTES, TranscriptCell,
+    sanitize_transcript,
 };
 pub use work::{
     MAX_WORK_ACCEPTANCE_CRITERIA, MAX_WORK_BLOCKERS, MAX_WORK_EVIDENCE, MAX_WORK_FIELD_BYTES,

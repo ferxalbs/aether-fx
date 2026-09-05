@@ -153,15 +153,29 @@ For one-shot use:
 aether --model <id> "inspect this repository and explain the highest-risk issue"
 ```
 
-The bare `aether` command opens the stateful shell only when stdin and stdout are terminals. A
-leading `/` opens the local command palette; slash commands such as `/model`, `/status`,
-`/context`, `/config`, `/auth`, `/sessions`, `/resume`, `/doctor`, `/update`, `/help`, `/clear`, and `/exit`
-are handled locally and are never sent to Rainy. Natural text containing `/` remains ordinary
-prompt text. Arrow keys or `j`/`k` navigate selectors, Enter confirms, and Escape or Ctrl-C
-cancels.
+The bare `aether` command opens the AETHER TUI only when stdin and stdout are
+terminals. It provides a structured transcript, multiline composer, responsive header/footer,
+working and queued-prompt status, in-app approval cards, model/session pickers, transcript
+navigation, and resize-safe rendering. Enter submits; Ctrl-J inserts a newline; bracketed paste
+keeps multiline text; Escape cancels an overlay or interrupts the active turn; and Ctrl-C cancels
+the current input/turn. `?`, F1, or `/help` opens shortcuts, F2 opens `/transcript`, and `/` at
+the start of an empty composer opens the local command palette. Arrow keys or `j`/`k` navigate
+pickers, Enter confirms, and the palette filters as the command grows.
+
+Slash commands such as `/model`, `/status`, `/context`, `/config`, `/auth`, `/sessions`,
+`/resume`, `/doctor`, `/update`, `/help`, `/transcript`, `/clear`, and `/exit` are handled locally
+and are never sent to Rainy. `/schedule` opens a bounded form for a title, `YYYY-MM-DD` date,
+`HH:MM` time, explicit `+HH:MM`/`-HH:MM` offset, duration, and optional location, notes, and
+attendees. A valid draft is shown as a review card and is written to private local application
+state only after an explicit confirmation; it is not a model-visible tool or network calendar
+integration. Natural text containing `/` remains ordinary prompt text. Up to eight prompts may be
+queued in memory while a turn is running; queued text is not persisted until submitted.
 
 For scripts and CI, use `--non-interactive` or a pipe. `--json` emits structured records without
 a startup banner, prompt, selector, or ANSI decoration; local slash commands still remain local.
+These paths never initialize the TUI or create appointment state; receiving `/schedule` returns
+the stable `interactive TTY required for /schedule` error. `--single-pass` also stays on the
+existing non-TUI path.
 The default `aether doctor` is offline and reports whether the local executable can be updated;
 it never contacts GitHub. `aether models` explicitly retrieves the live Rainy catalog, while
 `aether doctor --network` adds an explicit catalog/reachability probe.
@@ -193,6 +207,12 @@ aether sessions
 aether resume <session-id>
 aether resume --latest
 ```
+
+Session resume restores the newest bounded safe transcript cells when available. Older sessions
+remain readable; if they predate transcript persistence, the interactive TUI shows
+`transcript unavailable for this session` while restoring the agent context normally. Raw tool
+output, command arguments, process output, permission request details, file contents, credentials,
+and hidden reasoning are never placed in the persisted transcript.
 
 ## Supported platforms
 

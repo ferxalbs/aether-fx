@@ -17,6 +17,8 @@ aether
   ├── aether-tools
   │     ├── aether-core
   │     └── aether-obscura
+  ├── aether-tui
+  │     └── aether-core
   └── aether-terminal
         └── aether-core
 ```
@@ -24,25 +26,39 @@ aether
 The runtime path is:
 
 ```text
-terminal input → aether-agent → ModelBackend → aether-rainy → Rainy SDK → Rainy API
+terminal input → aether-tui → aether-agent → ModelBackend → aether-rainy → Rainy SDK → Rainy API
                          └────── ToolExecutor → aether-tools
                                                    └────── optional stdio MCP → Obscura → browser engine
-agent events ───────────────────────────────────────→ aether-terminal
+agent events ───────────────────────────────────────→ aether-tui → ratatui frame
+legacy/headless input and output ───────────────────→ aether-terminal
 ```
 
 ## Interactive boundary and model presentation
 
-The binary has one stateful shell path and one headless path. The shell is enabled only when both
-standard streams are TTYs and the invocation is not JSON, one-shot, or explicitly
-`--non-interactive`. It prints a compact identity line without contacting Rainy, then reuses the
-same bounded terminal substrate for the prompt, slash-command palette, model/session selectors,
-confirmations, secret input, permission decisions, and incremental event rendering. Pipe, JSON,
-and one-shot paths use plain newline-delimited input/output and a fail-closed permission broker;
-they never inherit selector or raw-mode behavior.
+The binary has one stateful TUI shell path and one headless/legacy path. The TUI is enabled only
+when both standard streams are TTYs and the invocation is not JSON, one-shot, or explicitly
+`--non-interactive`. `aether-tui` owns the state machine and ratatui presentation: its header,
+structured transcript, multiline composer, footer, slash palette, model/session pickers,
+transcript navigation, schedule form/review, and approval overlays emit typed `TuiAction` values.
+The binary remains responsible for constructing agent requests, selecting the existing permission
+broker, starting/cancelling turns, loading catalogs and sessions, calling the local calendar
+adapter, and persisting bounded state. Pipe, JSON, and one-shot paths use plain newline-delimited
+input/output and retain the existing permission and renderer behavior; they never inherit selector
+or raw-mode behavior.
 
-Leading slash input is recognized only at the beginning of a shell line. The palette is local and
-does not become model input. `/status`, `/context`, `/config`, `/doctor`, `/help`, `/clear`, and
-`/exit` remain offline/local operations; `/model` is the explicit live catalog boundary.
+`TuiSession` is the TUI's RAII terminal owner. It consumes crossterm events, enters raw mode and
+bracketed paste, draws the inline transcript viewport, temporarily uses the alternate screen for
+pickers and overlays, and restores cursor, wrapping, paste, screen, and raw-mode state on normal
+return, cancellation, error, or unwind. Overlay closure returns to the inline shell without
+creating a second agent or persistence path. The interactive event pump multiplexes TUI events,
+agent events, cancellation, and turn completion through bounded channels; queued prompts are
+memory-only and capped at eight.
+
+Leading slash input is recognized only at the beginning of a TUI composer. The palette is local
+and does not become model input. `/status`, `/context`, `/config`, `/doctor`, `/help`, `/clear`,
+`/exit`, and `/transcript` remain local operations; `/model` and `/sessions` load the existing
+catalog/session boundaries. `/schedule` opens a TUI-only form and review card, then emits a typed
+draft for the binary's local calendar adapter only after explicit confirmation.
 
 `aether-rainy` owns one normalized `ModelView` projection of each SDK catalog entry. It preserves
 unknowns instead of guessing from model names, records the SDK's model context,
@@ -80,6 +96,9 @@ agent runtime
   ├── stable SessionId / TurnId and opaque continuation
   ├── bounded context engine + JSONL SessionStore
   └── one RainyBackend instance per session
+local calendar boundary
+  ├── provider-neutral CalendarAdapter
+  └── LocalCalendarAdapter → private OS state `workspaces/<workspace-id>/appointments.json`
 tool executor
   ├── execution permit bound to call_id + tool + permission class
   ├── cooperative cancellation
@@ -171,10 +190,16 @@ Git index and fallback `git ls-files` stream are capped at 64 MiB, with stderr r
 4 KiB, so malformed or unusually large repository metadata cannot create unbounded inventory
 memory.
 
-`aether-terminal` owns raw input, restoration, ANSI/VT presentation, incremental buffer rendering, and platform modules. Tools and agent code never write ANSI.
+`aether-tui` owns interactive presentation and state transitions but never authorizes tools, starts
+agent turns, persists sessions, or contacts a provider. It depends only on `aether-core` and the
+terminal/UI stack. `aether-agent` owns the provider-neutral `CalendarAdapter` boundary and its
+bounded local implementation; it performs no network work for `/schedule`. `aether-terminal`
+continues to own raw input, restoration, ANSI/VT presentation, incremental buffer rendering, and
+platform modules for legacy/headless compatibility. Tools and agent code never write ANSI.
 
-There is no RPC, daemon, database, plugin system, WebView, TUI framework, or alternate allocator in
-the native bootstrap. Alpha-06 adds `aether-web` as a separately built `cdylib`/`rlib` for a static
+There is no RPC, daemon, database, plugin system, or WebView in the native bootstrap. The focused
+`aether-tui` crate is the only native presentation framework; it is not a provider, tool runtime,
+or native bridge. Alpha-06 adds `aether-web` as a separately built `cdylib`/`rlib` for a static
 browser demo; it is not linked into the `aether` binary and has no native bridge.
 
 ## Hosted WebMCP vertical slice
@@ -210,7 +235,7 @@ state, evidence, verification, blockers, and user-owned paths, and fails closed 
 fact is missing or stale. None of these freshness or completion controls bypasses the existing
 permission, canonical-path, containment, permit, or expected-hash checks.
 
-Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json` plus `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 5 stores `Started`, committed `TurnSnapshot` records, resumable `Checkpoint` records, and `Finished`. Each turn record contains only bounded metadata, minimized context (paths/hashes/ranges, structured work state, and safe tool summaries), and sanitized continuation. Raw prompts, assistant text, excerpt bodies, and command output are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the latest committed turn or checkpoint, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
+Repositories contain user/project data. AETHER Fx persistent application and session state lives outside repositories in private OS application-state storage. The resolver honors `AETHER_FX_STATE_DIR`; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. State is grouped as `workspaces/<BLAKE3(canonical-native-workspace-path)>/workspace.json`, `workspaces/<BLAKE3(canonical-native-workspace-path)>/sessions/<session-id>.jsonl`, and the local-only `appointments.json` in the same workspace bucket. `workspace.json` binds the bucket to the canonical workspace path, and session discovery is scoped to that bucket. Schema version 6 stores `Started`, committed `TurnSnapshot` records, resumable `Checkpoint` records, and `Finished`; schemas 3–5 remain readable. Each turn record contains only bounded metadata, minimized context (paths/hashes/ranges, structured work state, and safe tool summaries), sanitized continuation, and an optional bounded safe semantic transcript. Raw tool output, command arguments, process output, file contents, permission details, and credentials are not persisted. State directories and files are created and opened without following symlinks or Windows reparse points; session JSONL, appointment state, and compaction temps remain contained under the OS state root. `aether resume <session-id>` restores the latest committed turn or checkpoint, re-hashes inspected files, and discards Rainy continuation when the workspace root or inspected files have changed. Unsupported older schemas fail closed. Truncated trailing records are ignored; corrupt replay never compact-overwrites the original file.
 
 The Obscura profile is a separate child of that same private state root, keyed by the canonical
 workspace ID. It contains only adapter-managed provider storage state; it is not part of the

@@ -25,7 +25,10 @@ cargo run -p aether -- --version
 cargo bench -p aether-tools --bench tools
 ```
 
-Run formatting, check, clippy, and tests before opening a PR. CI also runs
+The commands above are available development checks. During implementation, run
+the narrowest relevant checks. Before opening a PR, run the listed formatting,
+check, clippy, and cargo test commands. Benchmarks and alternate test runners
+are required only when relevant or explicitly requested. CI also runs
 `cargo deny check`, `cargo audit`, and `cargo llvm-cov` to produce `lcov.info`.
 
 ## Coding Style & Naming Conventions

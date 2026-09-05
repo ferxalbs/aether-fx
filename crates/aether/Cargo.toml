@@ -15,6 +15,7 @@ aether-core.workspace = true
 aether-obscura.workspace = true
 aether-rainy.workspace = true
 aether-terminal.workspace = true
+aether-tui.workspace = true
 aether-tools.workspace = true
 lexopt.workspace = true
 reqwest.workspace = true
@@ -23,4 +24,5 @@ serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "signal", "sync", "time"] }

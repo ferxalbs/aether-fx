@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased - 2026-09-03 (3) - Follow-up terminal improvements
 
+### Added
+
+- Added the AETHER-branded `aether-tui` interactive shell with a structured transcript,
+  responsive header/footer, multiline grapheme-safe composer, slash-command palette, model and
+  session pickers, transcript navigation, in-app permission approvals, resize-safe rendering, and
+  inline/alternate-screen overlay lifecycle management.
+- Added the interactive-only `/schedule` workflow for strict local date/time and explicit UTC
+  offset entry, review, explicit confirmation, and provider-neutral local appointment records.
+- Added bounded, safe semantic transcript cells to resumable session snapshots while keeping raw
+  tool output, command output, file contents, permission details, credentials, and reasoning out
+  of persistence.
+
+### Changed
+
+- Interactive TTY turns now feed the existing `SessionRuntime` through typed TUI actions and agent
+  events; the existing agent, Rainy, tool, permission, workspace, and process semantics remain
+  the owners of execution.
+- Session persistence is now schema version 6 with backward-readable schema 3–5 records and
+  optional transcript restoration. Piped, JSON, one-shot, and noninteractive invocations retain
+  their legacy output and do not initialize the TUI or appointment state.
+
+### Security
+
+- Added fail-closed local appointment state containment, bounded versioned records, restrictive
+  permissions, symlink/reparse rejection, same-directory sync-and-atomic replacement, and local
+  BLAKE3 appointment IDs. Appointment creation never makes a provider, browser, credential, or
+  network request.
+- Added transcript sanitization, fixed cell/byte ceilings, secret-like cell omission, and RAII
+  restoration of raw mode, cursor, bracketed paste, line wrapping, and screen state.
+
+### Documentation
+
+- Clarified contributor checks and local skill instructions to continue routine diagnosis,
+  preserve prior authorization, and retain explicit approval and verification safeguards.
+- Documented the TUI boundary and event flow, exact UI dependency baseline, interactive keyboard
+  behavior, `/schedule` privacy and confirmation model, and the expanded session transcript
+  persistence boundary.
+
 ## v0.1.0-alpha-07 - 2026-09-03 (2) - Responsive streamed terminal output
 
 ### Fixed

@@ -17,6 +17,10 @@ Verified on 2026-09-03 using Rust/Cargo `1.98.0`, the published `rainy-sdk 0.6.5
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 | Narrow Windows console, `ReplaceFileW`, `MoveFileExW`, and session reparse-point flags | Terminal/filesystem hot path |
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 | Terminal cell width | Renderer hot path |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | Grapheme-safe input/rendering boundaries | Renderer/input |
+| ratatui | 0.30.2 | MIT | AETHER-branded interactive TUI layout, widgets, test buffers, and frame rendering; `default-features = false`, `crossterm` enabled | Interactive render hot path |
+| crossterm | 0.29.0 | MIT | Cross-platform terminal events and raw-mode lifecycle; `default-features = false`, `bracketed-paste` and `event-stream` enabled | Interactive input/render hot path |
+| time | 0.3.47 | MIT OR Apache-2.0 | Strict appointment date/time/offset parsing and canonical RFC 3339 formatting; `formatting`, `parsing`, and `local-offset` enabled | Appointment control path |
+| insta | 1.46.3 | Apache-2.0 | Deterministic ratatui buffer snapshots for the TUI crate; development dependency only | Test only |
 | ignore | 0.4.33 | Unlicense OR MIT | `.gitignore`-aware walking | Tool hot path |
 | globset | 0.4.20 | Unlicense OR MIT | Bounded path glob matching | Tool hot path |
 | grep-searcher | 0.1.17 | Unlicense OR MIT | Ripgrep search execution and context | Tool hot path |
@@ -42,7 +46,9 @@ SDK-owned safe-operation retries to Rainy.
 
 The AETHER updater uses the direct `reqwest 0.13.4`, `semver 1.0.28`, and `sha2 0.10.9` dependencies. The optional `aether-obscura` installer reuses the workspace `reqwest` and `sha2` boundary and adds `url 2.5.8`, `zip 2.4.2`, `tar 0.4.46`, and `flate2 1.1.10` only for URL validation and verified archive installation. `reqwest` is compiled with `default-features = false` plus `rustls` and `system-proxy`; neither updater nor Obscura installer constructs a client for `--version`, `--help`, `doctor`, `sessions`, or normal shell startup. The archive parsers are not loaded by the inactive browser path at runtime beyond their compiled code; they are exercised only after explicit installation consent. `aether-agent` continues to use `blake3` for stale-file refresh and, on Unix, rustix `fs` for no-follow session directory/file opens. Windows session containment uses existing `windows-sys 0.61.2` `Win32_Storage_FileSystem` reparse flags. Unix `aether-tools` enables rustix `fs` for exclusive rename. No Git dependency, SQLite, vector store, MCP SDK, WebMCP/OpenAI dependency, or unpublished Rainy SDK version is used. This is an intentional v1 decision: the official [RMCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) was reviewed, but its generic client/service layer is broader than the fixed, bounded Obscura adapter; RMCP remains a future option if a measured WebMCP integration justifies its additional surface.
 
-The interactive shell/model work adds no further package beyond the optional Obscura boundary. The alpha-07 browser
+The interactive shell adds the focused `aether-tui` crate and the pinned `ratatui`, `crossterm`, and `time`
+dependencies listed above. Ratatui owns presentation only; it does not add an agent runtime, provider,
+calendar network client, or tool adapter. `insta` is loaded only by TUI snapshot tests. The alpha-07 browser
 vertical slice adds only `wasm-bindgen 0.2.127` for its Rust/WASM export; it does not compile a browser agent,
 network client, MCP SDK, or native tool adapter. The prior Rainy 0.6.50
 migration removed its former `eventsource-stream`/`nom` parser path and added only the rand 0.9 family

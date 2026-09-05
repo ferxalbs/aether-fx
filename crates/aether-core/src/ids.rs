@@ -61,6 +61,7 @@ id_type!(SessionId, "session id");
 id_type!(TurnId, "turn id");
 id_type!(StepId, "step id");
 id_type!(ToolCallId, "tool call id");
+id_type!(AppointmentId, "appointment id");
 
 #[cfg(test)]
 mod tests {

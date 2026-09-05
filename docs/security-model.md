@@ -75,7 +75,7 @@ provenance attestations remain optional for clients.
 
 ## Session persistence
 
-Repositories contain user/project data. AETHER Fx persistent application and session state is private OS application-state storage, not workspace storage. The state root is selected by `AETHER_FX_STATE_DIR` when set; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. The final layout is `workspaces/<workspace-id>/workspace.json` plus `workspaces/<workspace-id>/sessions/<session-id>.jsonl`, where the workspace ID is lowercase BLAKE3 hex over the canonical path's native bytes. Persistence is minimized by construction, not by scanning for secrets. A session file stores:
+Repositories contain user/project data. AETHER Fx persistent application and session state is private OS application-state storage, not workspace storage. The state root is selected by `AETHER_FX_STATE_DIR` when set; otherwise Linux/Unix uses `$XDG_STATE_HOME/aether-fx` or `$HOME/.local/state/aether-fx`, macOS uses `$HOME/Library/Application Support/aether-fx`, and Windows uses `%LOCALAPPDATA%\\aether-fx`. The final layout is `workspaces/<workspace-id>/workspace.json`, `workspaces/<workspace-id>/sessions/<session-id>.jsonl`, and the separate local appointment file described below, where the workspace ID is lowercase BLAKE3 hex over the canonical path's native bytes. Persistence is minimized by construction, not by scanning for secrets. A session file stores:
 
 - session identity, workspace root, and model
 - committed turn metadata (`turn_id`, step count, cancelled)
@@ -84,21 +84,32 @@ Repositories contain user/project data. AETHER Fx persistent application and ses
 - safe tool summaries (path/hash/count metadata; shell/process/git persist only `ok`/`failed`)
 - git branch availability without status/diff text
 - sanitized continuation identity (`previous_response_id` or the test `fake_step` key)
+- an optional bounded semantic transcript: user/assistant text, tool name and outcome, diagnostics,
+  turn summaries, and appointment confirmation summaries
 
-It does not store raw prompts, assistant text, file excerpt bodies, shell/process stdout or stderr, environment content, credentials, authorization headers, private keys, or tokens. `payload_contains_secrets` is defense-in-depth after that minimization and is not complete secret detection.
+It does not store unsanitized prompts or assistant text, file excerpt bodies, tool output, command
+arguments, shell/process stdout or stderr, environment content, permission request details,
+credentials, authorization headers, private keys, or tokens. Transcript cells are sanitized,
+bounded to the newest fixed cell/byte budget, and passed through the existing secret heuristic;
+secret-like cells are omitted rather than aborting the session write. `payload_contains_secrets` is
+defense-in-depth after that minimization and is not complete secret detection.
 
 On Unix, the state root, `workspaces`, each workspace bucket, and `sessions` are created and kept at mode `0700`; `workspace.json`, session JSONL files, and compaction temps are `0600`. Windows has no POSIX modes; the same state objects are created without Unix permission bits.
 
 There are two independent boundaries. Workspace tools remain contained by the canonical workspace root. Session storage is contained by the resolved AETHER state root: AETHER canonicalizes the workspace, derives a path-safe hash bucket, atomically creates or validates `workspace.json`, and creates/opens state directories, metadata, session JSONL, and compaction temps without following symbolic links or Windows reparse points. Existing state directories must be real directories and existing state files must be regular files; a link or reparse point is rejected. Unix uses `openat`/`mkdirat` with `O_NOFOLLOW` (and `O_EXCL` for metadata and temps). Windows inspects `FILE_ATTRIBUTE_REPARSE_POINT` and opens with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse name cannot redirect the write. Session IDs are validated before becoming file names, and workspace IDs are generated rather than accepted as paths. This is fail-closed containment, not a claim of perfect adversarial TOCTOU immunity: an external process can still mutate the namespace in the window after validation and before the OS create/open call. Session metadata and JSONL are never intentionally written inside a repository.
 
-Schema version 5 also permits a `Checkpoint` record for a cancelled, step-limited, or otherwise
-incomplete turn. A checkpoint is resumable state, never a completion claim; it contains the same
-minimized context and sanitized continuation as a normal turn. Each completed turn is one JSONL
-record. A truncated final record is an uncommitted crash window and is ignored; the previous
-committed turn or checkpoint remains valid. Corrupt middle records fail replay. Compaction never
-overwrites a file after a failed replay. The persisted work objective is normalized to a bounded
-first-line summary and obvious secret assignments are redacted; raw prompts and reasoning are not
-stored.
+Schema version 6 also permits a `Checkpoint` record for a cancelled, step-limited, or otherwise
+incomplete turn and carries the optional bounded transcript snapshot. Versions 3 through 5 remain
+readable; older records simply restore agent context without transcript cells and the TUI shows a
+clear transcript-unavailable marker. A checkpoint is resumable state, never a completion claim; it
+contains the same minimized context and sanitized continuation as a normal turn. Each completed
+turn is one JSONL record. A truncated final record is an uncommitted crash window and is ignored;
+the previous committed turn or checkpoint remains valid. Corrupt middle records fail replay.
+Malformed individual transcript cells are skipped so recoverable session context remains usable.
+Compaction retains the bounded transcript from retained snapshots and never overwrites a file after
+a failed replay. The persisted work objective is normalized to a bounded first-line summary and
+obvious secret assignments are redacted; raw prompts and reasoning are not stored outside the
+safe semantic transcript fields.
 
 Resume re-hashes inspected files before resumed actions and again before completion. If the live
 workspace root differs, or an inspected file is stale or missing, Rainy continuation is discarded,
@@ -121,17 +132,40 @@ intentional bounded cost for fail-closed evidence handling.
 ## Interactive, headless, and terminal-integrity boundaries
 
 Raw terminal mode is entered only after both standard streams have been identified as terminals.
-The RAII terminal guard restores modes on normal return and unwind. Pipe, JSON, one-shot, and
-`--non-interactive` invocations use bounded plain-line input, no prompt/banner/ANSI output, and a
-`NoPermissionBroker` unless the user explicitly selected the existing `--yolo` authority mode.
-Interactive selectors and the slash palette are presentation only: choosing an entry never
-authorizes a tool, bypasses expected-hash checks, or changes the typed permission policy.
+The `aether-tui` RAII session restores raw mode, cursor visibility, bracketed paste, line wrapping,
+and the inline/alternate-screen boundary on normal return, cancellation, error, or unwind. Its
+approval overlay resolves the existing permission broker; the overlay itself never authorizes a
+tool, bypasses expected-hash checks, or changes the typed permission policy. Pipe, JSON, one-shot,
+and `--non-interactive` invocations use bounded plain-line input, no prompt/banner/ANSI output,
+and a `NoPermissionBroker` unless the user explicitly selected the existing `--yolo` authority
+mode. They do not initialize the TUI or mutate appointment state.
 
 Catalog, session, and model strings are untrusted display data. They are bounded, sanitized for
 control characters, truncated by terminal display cells without splitting graphemes, and ordered
 deterministically before rendering. Catalog fields that are absent remain `unknown`; AETHER does
 not infer capabilities, access, context, tier, or reasoning support from a model name. Raw catalog
 JSON is not sent through the renderer.
+
+## Local appointment state
+
+`/schedule` exists only in the interactive TUI. It collects a title, strict local date/time,
+explicit UTC offset, duration, and bounded optional metadata; a valid draft is normalized with
+`time::OffsetDateTime` to a canonical UTC RFC 3339 instant and shown in a review card. The user
+must explicitly confirm that card before the binary calls `LocalCalendarAdapter`. No natural
+language turn, model-visible tool, Rainy request, browser action, credential lookup, network
+calendar provider, recurrence, reminder, conflict check, or remote identifier is involved.
+
+Appointments are stored outside the workspace at the private state root under
+`workspaces/<workspace-id>/appointments.json`. The file has a versioned top-level record and a
+bounded appointment array; the adapter rejects malformed, oversized, indirect, symlinked, or
+reparse-point state and refuses paths outside the validated AETHER state root. New state is
+serialized with bounded text and attendee limits, written to a same-directory temporary file,
+flushed and synced, and installed with an atomic replacement. Existing state remains untouched if
+validation, serialization, or commit fails. Unix directories/files use the same restrictive
+user-only permissions as session storage. Appointment IDs are generated locally from the
+canonical appointment payload and creation timestamp with BLAKE3; provider IDs are never
+synthesized. Appointment confirmation cells may be copied into a session's safe transcript, but
+the appointment file is not exposed as model context or tool output.
 
 ## Configuration and authentication
 

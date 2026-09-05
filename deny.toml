@@ -16,6 +16,7 @@ allow = [
     "MIT-0",
     "Unicode-3.0",
     "Unlicense",
+    "Zlib",
 ]
 exceptions = []
 
@@ -36,8 +37,8 @@ name = "libgit2-sys"
 [[bans.deny]]
 name = "async-trait"
 
-[[bans.deny]]
-name = "compact_str"
+# ratatui 0.30.2 uses compact_str 0.9.1 in its core buffer implementation.
+# It is intentionally allowed as part of the approved UI dependency stack.
 
 [[bans.deny]]
 name = "jemalloc-sys"
